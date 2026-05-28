@@ -44,6 +44,25 @@ tools:
   default_can_parallel: false
   default_requires_approval: false
   default_error_policy: "return_tool_result"
+  bash:
+    approval_mode: "all"
+    allowlist: []
+    blacklist: []
+    readonly_allowlist:
+      - ["pwd"]
+      - ["ls"]
+      - ["find"]
+      - ["rg"]
+      - ["cat"]
+      - ["sed"]
+      - ["head"]
+      - ["tail"]
+      - ["wc"]
+      - ["git", "status"]
+      - ["git", "diff"]
+      - ["git", "log"]
+      - ["git", "show"]
+    max_output_chars: 50000
 hooks:
   enabled: true
   default_timeout_seconds: 30

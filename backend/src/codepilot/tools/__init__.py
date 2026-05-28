@@ -1,5 +1,5 @@
-from .base import BaseTool, ToolExecutionContext, ToolSpec
-from .demo import EchoTool
+from .base import BaseTool, ToolExecutionContext, ToolPreflightResult, ToolSpec
+from .bash import BashTool
 from .dispatcher import ToolDispatcher, ToolExecutionBatch
 from .edit_file_tool import EditFileTool
 from .mcp import McpToolAdapter
@@ -10,13 +10,14 @@ from .write_plan_tool import WritePlanTool
 
 __all__ = [
     "BaseTool",
-    "EchoTool",
+    "BashTool",
     "EditFileTool",
     "McpToolAdapter",
     "ReadFileTool",
     "ToolDispatcher",
     "ToolExecutionBatch",
     "ToolExecutionContext",
+    "ToolPreflightResult",
     "ToolRegistry",
     "ToolSpec",
     "WriteFileTool",

@@ -66,10 +66,10 @@ def assistant_message(message_id: str, text: str, tool_output: dict[str, object]
         parts.append(
             ToolPart(
                 call_id=f"call_{message_id}",
-                tool="echo_tool",
+                tool="bash_tool",
                 state={
                     "status": "completed",
-                    "input": {"text": text},
+                    "input": {"command": text},
                     "output": tool_output,
                 },
             )
@@ -139,9 +139,9 @@ def test_tool_result_placeholder_keeps_latest_result() -> None:
         session = build_session(
             [
                 user_message("user_1", "第一轮需求"),
-                assistant_message("assistant_1", "第一轮回答", {"status": "ok", "tool_name": "echo_tool", "output": "旧结果"}),
+                assistant_message("assistant_1", "第一轮回答", {"status": "ok", "tool_name": "bash_tool", "output": "旧结果"}),
                 user_message("user_2", "第二轮需求"),
-                assistant_message("assistant_2", "第二轮回答", {"status": "ok", "tool_name": "echo_tool", "output": "新结果"}),
+                assistant_message("assistant_2", "第二轮回答", {"status": "ok", "tool_name": "bash_tool", "output": "新结果"}),
             ]
         )
         settings = compression_settings()
@@ -189,4 +189,3 @@ def test_session_compacted_record_replaces_replayed_messages(tmp_path: Path) -> 
         assert replay["session"]["data"]["metadata"]["context_compression"]["summary_message_id"] == "user_summary"
 
     asyncio.run(run_case())
-

@@ -420,7 +420,7 @@ class TurnExecutor:
                 session=session,
                 llm_state=llm_state,
                 provider_messages=provider_messages,
-                tools=self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools),
+                tools=self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools, agent_profile=agent_profile),
                 event_bus=runtime.event_bus,
             )
         except Exception as exc:  # noqa: BLE001

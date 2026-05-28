@@ -23,8 +23,25 @@ class ToolExecutionContext:
     agent: Any
 
 
+@dataclass(slots=True)
+class ToolPreflightResult:
+    status: str
+    reason: str | None = None
+    result: dict[str, Any] | None = None
+
+
 class BaseTool(ABC):
     spec: ToolSpec
+
+    def get_llm_description(self, *, agent_name: str | None = None) -> str:
+        return self.spec.description
+
+    async def preflight(
+        self,
+        args: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolPreflightResult:
+        return ToolPreflightResult(status="allow")
 
     @abstractmethod
     async def execute(

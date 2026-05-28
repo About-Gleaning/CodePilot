@@ -143,11 +143,12 @@ def test_write_plan_rejects_non_plan_agent(tmp_path: Path) -> None:
 def test_agent_tool_permissions_are_scoped() -> None:
     profiles = build_agent_profiles(max_iterations=3)
 
-    assert {"read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
+    assert {"bash_tool", "read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
     assert "write_plan" in profiles["plan"].allowed_tools
+    assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
-    assert profiles["explore"].allowed_tools == ["echo_tool", "read_file"]
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file"]
 
 
 def test_file_tool_descriptions_are_loaded_into_schema() -> None:

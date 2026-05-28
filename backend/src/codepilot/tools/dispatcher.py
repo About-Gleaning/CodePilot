@@ -119,6 +119,20 @@ class ToolDispatcher:
         if tool is None:
             return self._build_tool_part(tool_call_id, tool_name, self._missing_tool_result(tool_name)), None
 
+        tool_context = ToolExecutionContext(session=session, workspace=workspace, agent=agent)
+        if not skip_approval:
+            preflight = await tool.preflight(tool_args, tool_context)
+            if preflight.status == "blocked" and preflight.result is not None:
+                return self._build_tool_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None
+            if preflight.status == "requires_approval":
+                approval = ApprovalRequest(
+                    approval_id=f"approval_tool_{tool_call_id}",
+                    reason=preflight.reason or "该工具调用需要人工确认后才能执行",
+                    action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
+                    created_at=utc_now_iso(),
+                )
+                return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval
+
         if tool.spec.requires_approval and not skip_approval:
             approval = ApprovalRequest(
                 approval_id=f"approval_tool_{tool_call_id}",
@@ -152,7 +166,6 @@ class ToolDispatcher:
         )
 
         try:
-            tool_context = ToolExecutionContext(session=session, workspace=workspace, agent=agent)
             result = await asyncio.wait_for(
                 tool.execute(tool_args, context=tool_context),
                 timeout=tool.spec.timeout_seconds,

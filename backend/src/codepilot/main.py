@@ -31,7 +31,7 @@ from codepilot.logging import configure_logging
 from codepilot.memory import JsonlEventStore, JsonlSessionMemory
 from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
 from codepilot.tools import (
-    EchoTool,
+    BashTool,
     EditFileTool,
     McpToolAdapter,
     ReadFileTool,
@@ -81,7 +81,7 @@ def create_app() -> FastAPI:
 
     tool_registry = ToolRegistry()
     # 一期先注册内置工具与 MCP 占位适配器，后续再替换为真实 MCP 工具发现流程。
-    tool_registry.register(EchoTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(BashTool(settings=settings.tools.bash, timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(ReadFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(WriteFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(EditFileTool(timeout_seconds=settings.tools.default_timeout_seconds))

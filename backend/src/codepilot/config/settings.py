@@ -94,11 +94,36 @@ class ContextSettings(BaseModel):
         return self
 
 
+class BashToolSettings(BaseModel):
+    approval_mode: str = Field(default="all", pattern="^(all|allowlist|none)$")
+    allowlist: list[list[str]] = Field(default_factory=list)
+    blacklist: list[list[str]] = Field(default_factory=list)
+    readonly_allowlist: list[list[str]] = Field(
+        default_factory=lambda: [
+            ["pwd"],
+            ["ls"],
+            ["find"],
+            ["rg"],
+            ["cat"],
+            ["sed"],
+            ["head"],
+            ["tail"],
+            ["wc"],
+            ["git", "status"],
+            ["git", "diff"],
+            ["git", "log"],
+            ["git", "show"],
+        ]
+    )
+    max_output_chars: int = 50_000
+
+
 class ToolSettings(BaseModel):
     default_timeout_seconds: int = 120
     default_can_parallel: bool = False
     default_requires_approval: bool = False
     default_error_policy: str = "return_tool_result"
+    bash: BashToolSettings = Field(default_factory=BashToolSettings)
 
 
 class HookPluginPromptConfig(BaseModel):

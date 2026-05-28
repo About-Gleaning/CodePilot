@@ -146,7 +146,7 @@ class StubLLMAPIError(RuntimeError):
 
 
 class StubToolRegistry:
-    def get_llm_tool_schemas(self, allowed_tools: list[str]) -> list[dict[str, Any]]:
+    def get_llm_tool_schemas(self, allowed_tools: list[str], *, agent_profile: Any | None = None) -> list[dict[str, Any]]:
         return []
 
 
