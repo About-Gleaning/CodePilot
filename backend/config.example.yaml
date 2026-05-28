@@ -1,0 +1,69 @@
+server:
+  host: "127.0.0.1"
+  port: 8000
+storage:
+  codepilot_home: "~/codepilot"
+llm:
+  providers:
+    openai:
+      label: "OpenAI"
+      models:
+        - "gpt-5.3-codex"
+        - "gpt-4.1"
+      litellm_model_prefix: ""
+    qwen:
+      label: "Qwen"
+      models:
+        - "qwen-plus"
+        - "qwen-max"
+      litellm_model_prefix: "openai/"
+  max_tokens: 4096
+  temperature: 0
+  stream: true
+agent:
+  default_agent_name: "build"
+  max_loop_iterations: 50
+  subagent_max_depth: 1
+context:
+  compression_enabled: false
+  model_thresholds:
+    default:
+      trigger_tokens: 120000
+      trigger_ratio:
+      context_window_tokens:
+  latest_rounds_to_keep: 3
+  strategies:
+    llm_summary:
+      enabled: true
+      summary_max_tokens: 2048
+    tool_result_placeholder:
+      enabled: true
+      keep_latest_tool_results: 5
+tools:
+  default_timeout_seconds: 120
+  default_can_parallel: false
+  default_requires_approval: false
+  default_error_policy: "return_tool_result"
+hooks:
+  enabled: true
+  default_timeout_seconds: 30
+  plugins:
+    - hook_id: add_project_rule_prompt
+      hook_type: llm.before
+      plugin_type: prompt
+      order: 100
+      enabled: true
+      config:
+        role: system
+        content: "你必须优先复用已有代码风格，修改前先观察上下文。"
+memory:
+  type: "jsonl"
+sse:
+  heartbeat_seconds: 15
+  replay_on_connect: true
+human_in_the_loop:
+  enabled: true
+logging:
+  level: "INFO"
+  format: "json"
+  redact_secrets: true

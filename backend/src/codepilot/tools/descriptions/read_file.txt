@@ -1,0 +1,8 @@
+读取当前工作区内的本地 UTF-8 文本文件。
+
+使用规则：
+- file_path 支持真实系统绝对路径，例如 /Users/.../CodePilot/backend/config.yaml。
+- file_path 也支持仓库根目录绝对路径，例如 /backend/config.yaml 表示当前 workspace 下的 backend/config.yaml。
+- 可以传入 offset 和 limit 读取指定行范围；不传 limit 时返回 offset 之后的全部内容。
+- 文件存在但内容为空时会返回成功，并明确说明文件为空。
+- 文件不存在、路径越界、目录路径或编码不支持时会返回结构化错误。

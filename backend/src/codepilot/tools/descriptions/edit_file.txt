@@ -1,0 +1,8 @@
+对当前工作区内已有 UTF-8 文本文件做精准局部编辑。
+
+使用规则：
+- file_path 支持真实系统绝对路径，也支持仓库根目录绝对路径。
+- old_string 必须来自当前文件内容，建议携带前后文以保证唯一匹配。
+- 默认 replace_all=false，此时 old_string 必须唯一匹配。
+- replace_all=true 会替换全部匹配，仅在明确需要批量替换时使用。
+- old_string 为空表示追加到文件末尾；new_string 为空表示删除匹配内容。
