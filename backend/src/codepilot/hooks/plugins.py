@@ -1,9 +1,10 @@
-"""内置 Hook 插件实现。
+"""插件 Hook 基础类型。
 
-这里放置一期已接入或预留的插件 Hook：
+这里放置四类插件 Hook 的基础实现：
 - `PromptPluginHook` 用于向会话补充提示消息。
-- `ApprovalDemoHook` 用于演示人工审批链路。
-- 其余插件类型暂时保留统一入口，便于后续按配置扩展。
+- `CommandPluginHook` 预留命令类插件入口。
+- `HttpPluginHook` 预留 HTTP 类插件入口。
+- `AgentPluginHook` 预留 Agent 类插件入口。
 """
 
 from __future__ import annotations
@@ -12,10 +13,10 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from codepilot.hooks.base import BaseHook, HookType
+from codepilot.hooks.base import BaseHook
 from codepilot.hooks.contracts import HookContext, HookResult
-from codepilot.session import ApprovalRequest, Message, TextPart, build_assistant_message_info, build_user_message_info
-from codepilot.utils import utc_now_iso, utc_now_millis
+from codepilot.session import Message, TextPart, build_assistant_message_info, build_user_message_info
+from codepilot.utils import utc_now_millis
 
 
 class PromptPluginHook(BaseHook):
@@ -63,32 +64,6 @@ class PromptPluginHook(BaseHook):
             if message.info.role == "user":
                 return message.info.id
         raise ValueError("Hook 追加 assistant 消息时缺少用户父消息")
-
-
-class ApprovalDemoHook(BaseHook):
-    """在命中特定标记时触发一次人工审批，用于验证审批链路。"""
-
-    marker: str = "[[approve]]"
-
-    async def execute(self, ctx: HookContext) -> HookResult:
-        """检测当前消息是否命中审批标记，并按需返回审批请求。"""
-        if not ctx.current_message:
-            return HookResult()
-        if ctx.session.metadata.get("approval_demo_done"):
-            return HookResult()
-        text = ctx.current_message.text_content()
-        if self.marker not in text:
-            return HookResult()
-        return HookResult(
-            requires_human_input=True,
-            human_request=ApprovalRequest(
-                approval_id=f"approval_{uuid4().hex}",
-                reason="命中了审批演示 Hook，请确认是否继续执行。",
-                action={"type": "hook_gate", "marker": self.marker},
-                created_at=utc_now_iso(),
-            ),
-            context_patch={"approval_demo_done": True},
-        )
 
 
 class CommandPluginHook(BaseHook):

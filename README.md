@@ -193,7 +193,7 @@ llm:
 
 - 默认 agent 提供：`build`、`plan`、`subagent`
 - `build / plan` 共用同一个 `AgentLoop`
-- 若要体验审批演示，可以在任务文本中加入 `[[approve]]`
+- 若要触发人工审批，可以在任务文本中加入 `[[approve]]`
 - `echo_tool` 为无副作用示例工具，便于验证 LLM tool call 链路
 - `context.compression_enabled` 可开启上下文压缩，支持按模型配置 token 阈值、保留最新轮次、LLM 摘要压缩和旧 Tool Result 占位清理
 

@@ -106,6 +106,22 @@ def test_list_sessions_returns_summaries_sorted_by_latest_update(tmp_path) -> No
     asyncio.run(run_case())
 
 
+def test_list_sessions_returns_generated_title(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1")
+        session.title = "修复历史标题"
+
+        await persist_session(memory, session, [build_message("session_1", "msg_1", "用户输入很长")])
+
+        summaries = memory.list_sessions()
+
+        assert summaries[0]["title"] == "修复历史标题"
+        assert summaries[0]["preview"] == "用户输入很长"
+
+    asyncio.run(run_case())
+
+
 def test_list_sessions_merges_same_session_across_days(tmp_path) -> None:
     session = build_session("session_1")
     first_message = build_message("session_1", "msg_1", "第一天需求")

@@ -9,7 +9,7 @@ from codepilot.config import AppSettings, build_llm_runtime_settings
 from codepilot.config.settings import LLMProviderSettings, LLMSettings
 from codepilot.context import CompressionResult
 from codepilot.events import EventBus
-from codepilot.hooks import BaseHook, HookContext, HookManager, HookResult, HookType, RuntimeHandles
+from codepilot.hooks import BaseHook, HookContext, HookManager, HookResult, HookType, RuntimeHandles, SessionTitleHook
 from codepilot.session import (
     AgentLoop,
     ApprovalResult,
@@ -37,6 +37,27 @@ def build_settings() -> AppSettings:
     )
     settings = AppSettings(llm=llm_settings)
     runtime = build_llm_runtime_settings(settings.llm, environ={"OPENAI_API_KEY": "sk-openai"})
+    return settings.model_copy(update={"llm_runtime": runtime})
+
+
+def build_qwen_settings() -> AppSettings:
+    llm_settings = LLMSettings(
+        providers={
+            "qwen": LLMProviderSettings(
+                label="Qwen",
+                models=["qwen-plus"],
+                litellm_model_prefix="openai/",
+            )
+        }
+    )
+    settings = AppSettings(llm=llm_settings)
+    runtime = build_llm_runtime_settings(
+        settings.llm,
+        environ={
+            "QWEN_API_KEY": "sk-qwen",
+            "QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        },
+    )
     return settings.model_copy(update={"llm_runtime": runtime})
 
 
@@ -145,6 +166,31 @@ class StubLLMAPIError(RuntimeError):
         self.status_code = status_code
 
 
+class StubTitleLLMClient:
+    def __init__(self, *, response: str = "修复会话标题展示", error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.calls = 0
+
+    async def complete_text(self, **_kwargs: object) -> str:
+        self.calls += 1
+        if self.error:
+            raise self.error
+        return self.response
+
+
+class RecordingEventBus:
+    def __init__(self) -> None:
+        self.domain_events: list[Any] = []
+        self.stream_events: list[Any] = []
+
+    async def publish_domain_event(self, event: Any) -> None:
+        self.domain_events.append(event)
+
+    async def publish_stream_event(self, event: Any) -> None:
+        self.stream_events.append(event)
+
+
 class StubToolRegistry:
     def get_llm_tool_schemas(self, allowed_tools: list[str], *, agent_profile: Any | None = None) -> list[dict[str, Any]]:
         return []
@@ -156,6 +202,108 @@ class StubToolDispatcher:
 
     async def execute_approved_tool_call(self, **kwargs: Any) -> Any:
         raise AssertionError("当前测试不应执行审批后的工具调用")
+
+
+def build_title_hook_context(session: SessionState, event_bus: RecordingEventBus | None = None) -> HookContext:
+    return HookContext(
+        hook_type=HookType.SESSION_BEFORE.value,
+        session=session,
+        workspace=SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot")),
+        agent=SimpleNamespace(name="build"),
+        messages=session.messages,
+        current_message=session.messages[-1] if session.messages else None,
+        config=build_qwen_settings(),
+        runtime=RuntimeHandles(event_bus=event_bus or RecordingEventBus()),
+    )
+
+
+def test_session_title_hook_generates_title_for_first_user_message(monkeypatch: Any) -> None:
+    client = StubTitleLLMClient(response="《这是一个非常非常长的会话标题应该被截断并继续超过限制》")
+    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    session = build_session()
+    event_bus = RecordingEventBus()
+    hook = SessionTitleHook(
+        hook_id="session-title",
+        hook_type=HookType.SESSION_BEFORE,
+        name="session_title",
+    )
+
+    result = asyncio.run(hook.execute(build_title_hook_context(session, event_bus)))
+
+    assert result.status == "ok"
+    assert client.calls == 1
+    assert session.title == "这是一个非常非常长的会话标题应该被截断并"
+    assert len(session.title) == 20
+    assert event_bus.domain_events[0].data["title"] == "这是一个非常非常长的会话标题应该被截断并"
+    assert event_bus.stream_events[0].event_type == "session_title_updated"
+
+
+def test_session_title_hook_runs_only_on_first_user_message(monkeypatch: Any) -> None:
+    client = StubTitleLLMClient()
+    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    session = build_session()
+    session.messages.append(
+        Message(
+            info=build_user_message_info(
+                message_id="msg_user_2",
+                session_id="session_1",
+                created_at_ms=1_746_000_000_001,
+                agent="build",
+                provider_id="openai",
+                model_id="gpt-5.3-codex",
+            ),
+            parts=[TextPart(text="继续补充")],
+        )
+    )
+    hook = SessionTitleHook(
+        hook_id="session-title",
+        hook_type=HookType.SESSION_BEFORE,
+        name="session_title",
+    )
+
+    asyncio.run(hook.execute(build_title_hook_context(session)))
+
+    assert client.calls == 0
+    assert session.title is None
+
+
+def test_session_title_hook_failure_does_not_block_session(monkeypatch: Any) -> None:
+    client = StubTitleLLMClient(error=RuntimeError("title failed"))
+    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    session = build_session()
+    hook = SessionTitleHook(
+        hook_id="session-title",
+        hook_type=HookType.SESSION_BEFORE,
+        name="session_title",
+    )
+
+    result = asyncio.run(hook.execute(build_title_hook_context(session)))
+
+    assert result.status == "ok"
+    assert client.calls == 1
+    assert session.title is None
+    assert session.status == SessionStatus.RUNNING
+
+
+def test_session_title_hook_is_dispatched_once_per_session(monkeypatch: Any) -> None:
+    client = StubTitleLLMClient(error=RuntimeError("title failed"))
+    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    session = build_session()
+    manager = HookManager()
+    manager.register(
+        SessionTitleHook(
+            hook_id="session-title",
+            hook_type=HookType.SESSION_BEFORE,
+            name="session_title",
+            run_once_per_session=True,
+        )
+    )
+
+    asyncio.run(manager.run(HookType.SESSION_BEFORE, build_title_hook_context(session)))
+    asyncio.run(manager.run(HookType.SESSION_BEFORE, build_title_hook_context(session)))
+
+    assert client.calls == 1
+    assert session.metadata["hook_once"]["session-title"]
 
 
 def test_agent_loop_runs_session_hooks_around_loop() -> None:

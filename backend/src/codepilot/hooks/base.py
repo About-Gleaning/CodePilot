@@ -51,6 +51,7 @@ class BaseHook(BaseModel, ABC):
     allow_modify_context: bool = True
     allow_emit_message: bool = True
     allow_emit_event: bool = True
+    run_once_per_session: bool = False
     applies_to_agents: list[str] | None = None
     applies_to_modes: list[str] | None = None
     applies_to_tools: list[str] | None = None

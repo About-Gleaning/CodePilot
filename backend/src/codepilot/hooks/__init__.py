@@ -3,17 +3,18 @@
 from .base import BaseHook, HookErrorPolicy, HookType
 from .contracts import HookContext, HookError, HookResult, RuntimeHandles
 from .manager import HookManager
+from .approval import ApprovalHook
 from .plugins import (
     AgentPluginHook,
-    ApprovalDemoHook,
     CommandPluginHook,
     HttpPluginHook,
     PromptPluginHook,
 )
+from .session_title import SessionTitleHook
 
 __all__ = [
     "AgentPluginHook",
-    "ApprovalDemoHook",
+    "ApprovalHook",
     "BaseHook",
     "CommandPluginHook",
     "HookContext",
@@ -25,4 +26,5 @@ __all__ = [
     "HttpPluginHook",
     "PromptPluginHook",
     "RuntimeHandles",
+    "SessionTitleHook",
 ]

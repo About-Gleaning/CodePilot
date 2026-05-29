@@ -60,6 +60,7 @@ type ReplayResponse = {
 
 type SessionSummary = {
   session_id: string;
+  title?: string | null;
   created_at: string;
   updated_at: string;
   status: string;
@@ -101,6 +102,7 @@ type SelectOption = {
 
 const EVENT_LABELS: Record<string, string> = {
   session_started: '会话启动',
+  session_title_updated: '标题更新',
   session_status_changed: '状态变化',
   session_finished: '会话结束',
   session_failed: '会话失败',
@@ -119,6 +121,7 @@ const EVENT_LABELS: Record<string, string> = {
 
 const KEY_EVENT_TYPES = new Set([
   'session_started',
+  'session_title_updated',
   'session_status_changed',
   'session_finished',
   'session_failed',
@@ -265,6 +268,7 @@ function App() {
     }
     if (
       event.event_type === 'session_started' ||
+      event.event_type === 'session_title_updated' ||
       event.event_type === 'session_status_changed' ||
       event.event_type === 'session_finished' ||
       event.event_type === 'session_failed'
@@ -547,7 +551,7 @@ function App() {
           ) : (
             <textarea
               rows={4}
-              placeholder="输入任务。若要体验审批演示，可在文本中加入 [[approve]]。"
+              placeholder="输入任务。若要触发人工审批，可在文本中加入 [[approve]]。"
               value={task}
               onChange={(e) => setTask(e.target.value)}
             />
@@ -660,7 +664,7 @@ function SessionHistoryList({
             return (
               <article className={`session-item ${isCurrent ? 'is-current' : ''}`} key={session.session_id}>
                 <div className="session-item-main">
-                  <strong>{session.preview || session.session_id}</strong>
+                  <strong>{session.title || session.preview || session.session_id}</strong>
                   <span>{formatSessionTime(session.updated_at || session.created_at)}</span>
                 </div>
                 <div className="session-item-meta">

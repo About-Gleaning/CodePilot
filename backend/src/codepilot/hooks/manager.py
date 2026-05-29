@@ -41,6 +41,9 @@ class HookManager:
             if not self._matches(hook, ctx):
                 # 仅执行命中当前 Agent 或工具范围的 Hook，避免插件误作用到无关流程。
                 continue
+            if self._already_ran_once(hook, ctx):
+                continue
+            self._mark_once_if_needed(hook, ctx)
 
             await self._emit_event(ctx, "hook_started", {"hook_id": hook.hook_id, "hook_type": hook.hook_type.value})
             try:
@@ -97,6 +100,21 @@ class HookManager:
             if tool_name not in hook.applies_to_tools:
                 return False
         return True
+
+    def _already_ran_once(self, hook: BaseHook, ctx: HookContext) -> bool:
+        """检查一次性 Hook 是否已经在当前 session 中调度过。"""
+        if not hook.run_once_per_session:
+            return False
+        once_state = ctx.session.metadata.get("hook_once")
+        return isinstance(once_state, dict) and bool(once_state.get(hook.hook_id))
+
+    def _mark_once_if_needed(self, hook: BaseHook, ctx: HookContext) -> None:
+        """一次性 Hook 在调用前即标记，确保失败后也不会在后续用户消息重试。"""
+        if not hook.run_once_per_session:
+            return
+        once_state = ctx.session.metadata.setdefault("hook_once", {})
+        if isinstance(once_state, dict):
+            once_state[hook.hook_id] = utc_now_iso()
 
     def _merge_results(self, left: HookResult, right: HookResult) -> HookResult:
         """按既定优先级合并两个 HookResult，保留累计副作用。"""

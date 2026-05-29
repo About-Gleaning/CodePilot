@@ -20,6 +20,7 @@ class SessionStatus(str, Enum):
 
 class SessionState(BaseModel):
     session_id: str
+    title: str | None = None
     workspace_id: str
     workspace_path: str
     agent_name: str

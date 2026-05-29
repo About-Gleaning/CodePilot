@@ -226,6 +226,7 @@ class JsonlSessionMemory:
             return None
         return {
             "session_id": session_id,
+            "title": session_data.get("title"),
             "created_at": created_at,
             "updated_at": updated_at or created_at,
             "status": status or session_data.get("status") or "UNKNOWN",
