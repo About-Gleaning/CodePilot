@@ -69,6 +69,35 @@ class SessionRunner:
         """返回当前内存中持有的 session_id；没有会话时返回 None。"""
         return self._session.session_id if self._session else None
 
+    def load_session(self, session_id: str, replay: dict[str, Any]) -> SessionState:
+        """把已持久化的历史会话恢复为当前可继续对话的内存会话。"""
+        if self._session and self._session.status in {
+            SessionStatus.RUNNING,
+            SessionStatus.STOPPING,
+            SessionStatus.WAITING_HUMAN,
+        }:
+            raise ValueError("当前 session 仍在运行或等待确认，不能加载历史会话")
+        session_record = replay.get("session")
+        if not isinstance(session_record, dict):
+            raise ValueError(f"session `{session_id}` 不存在或无法回放")
+        session_data = session_record.get("data")
+        if not isinstance(session_data, dict):
+            raise ValueError(f"session `{session_id}` 缺少可恢复的状态快照")
+        messages = [Message.model_validate(message) for message in replay.get("messages") or []]
+        loaded = SessionState.model_validate({**session_data, "messages": messages})
+        if loaded.session_id != session_id:
+            raise ValueError(f"session `{session_id}` 与持久化数据不一致")
+        if loaded.status in {SessionStatus.RUNNING, SessionStatus.STOPPING, SessionStatus.WAITING_HUMAN}:
+            # 服务重启或手动加载历史时，磁盘上的运行中状态已经不再对应真实后台任务。
+            loaded.status = SessionStatus.CANCELLED
+            loaded.updated_at = utc_now_iso()
+        self._session = loaded
+        self._task = None
+        self._stop_event = asyncio.Event()
+        self._approval_event = asyncio.Event()
+        self._approval_result_holder = {"result": None}
+        return self._session
+
     async def shutdown(self) -> None:
         """在服务关闭时等待正在执行的会话安全结束。"""
         if self._task and not self._task.done():

@@ -7,10 +7,17 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput
 from codepilot.utils import utc_now_iso
+
+
+class LoadSessionRequest(BaseModel):
+    """加载历史会话的请求体。"""
+
+    session_id: str
 
 
 def build_api_router(app_state: Any) -> APIRouter:
@@ -56,6 +63,28 @@ def build_api_router(app_state: Any) -> APIRouter:
         snapshot = app_state.session_runner.get_status_snapshot()
         replay = await app_state.session_memory.replay(snapshot.get("session_id"))
         return JSONResponse(replay)
+
+    @router.get("/sessions")
+    async def get_sessions() -> JSONResponse:
+        """返回当前工作区的历史会话摘要列表。"""
+        return JSONResponse({"sessions": app_state.session_memory.list_sessions()})
+
+    @router.post("/session/load")
+    async def post_session_load(payload: LoadSessionRequest) -> JSONResponse:
+        """加载指定历史会话，让后续用户输入继续追加到该 session。"""
+        replay = await app_state.session_memory.replay(payload.session_id)
+        try:
+            session = app_state.session_runner.load_session(payload.session_id, replay)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "ok": True,
+                "session": session.model_dump(exclude={"messages"}),
+                "messages": replay.get("messages", []),
+                "records": replay.get("records", []),
+            }
+        )
 
     @router.get("/config")
     async def get_config() -> JSONResponse:
