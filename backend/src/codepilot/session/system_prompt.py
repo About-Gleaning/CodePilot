@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 from typing import Any
 
+from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.state import AgentState, LLMState, SessionState
 from codepilot.utils import utc_now_iso
@@ -15,13 +17,14 @@ def build_system_prompt(
     agent_state: AgentState,
     agent_profile: AgentProfile,
     llm_state: LLMState,
+    skill_registry: SkillRegistry | None = None,
 ) -> str:
     """按分层策略组装最终发送给模型的 system prompt。"""
     workspace_path = Path(workspace.workspace_path)
     sections = [
         _section("常驻层：Agent 角色说明", agent_profile.system_prompt),
         _section("常驻层：工作区 AGENTS.md", _read_workspace_agents(workspace_path)),
-        _section("按需加载层：Skills 与领域知识", _build_deferred_context_placeholder()),
+        _section("按需加载层：Skills 与领域知识", _build_skills_context(skill_registry)),
         _section(
             "运行时注入层：当前上下文",
             _build_runtime_context(session, workspace_path, agent_state, llm_state),
@@ -46,11 +49,28 @@ def _read_workspace_agents(workspace_path: Path) -> str | None:
         return None
 
 
-def _build_deferred_context_placeholder() -> str:
-    return (
-        "Skills 和领域知识采用按需加载策略：常驻层只保留能力描述；"
-        "完整内容将在后续实现触发条件后再注入。"
-    )
+def _build_skills_context(skill_registry: SkillRegistry | None) -> str:
+    if skill_registry is None or not skill_registry.skills:
+        return "Skills 和领域知识采用按需加载策略：当前没有可用 skills。"
+
+    lines = [
+        "Skills 和领域知识采用按需加载策略：这里只列出可用 skill 的名称和简短描述；"
+        "当任务匹配某个 skill 时，必须先调用 load_skill 加载完整 SKILL.md，再按其规范执行。",
+        "",
+        "<available_skills>",
+    ]
+    for skill in skill_registry.skills:
+        # 这里只暴露路由所需信息，不暴露本地路径，避免把运行时目录结构注入模型上下文。
+        lines.extend(
+            [
+                "  <skill>",
+                f"    <name>{escape(skill.name)}</name>",
+                f"    <description>{escape(skill.description)}</description>",
+                "  </skill>",
+            ]
+        )
+    lines.append("</available_skills>")
+    return "\n".join(lines)
 
 
 def _build_runtime_context(

@@ -1,0 +1,5 @@
+按名称加载一个 skill 的完整 SKILL.md 内容。
+
+可用 skill 的名称与简短描述已经在 system prompt 的“按需加载层：Skills 与领域知识”中列出。当当前任务匹配某个 skill 的描述时，先调用本工具加载该 skill 的完整规范，再按照规范执行。
+
+每次只加载一个 skill。工具只读取 SKILL.md，不执行 skill 附带脚本。

@@ -2,6 +2,7 @@ from .base import BaseTool, ToolExecutionContext, ToolPreflightResult, ToolSpec
 from .bash import BashTool
 from .dispatcher import ToolDispatcher, ToolExecutionBatch
 from .edit_file_tool import EditFileTool
+from .load_skill_tool import LoadSkillTool
 from .mcp import McpToolAdapter
 from .read_file_tool import ReadFileTool
 from .registry import ToolRegistry
@@ -12,6 +13,7 @@ __all__ = [
     "BaseTool",
     "BashTool",
     "EditFileTool",
+    "LoadSkillTool",
     "McpToolAdapter",
     "ReadFileTool",
     "ToolDispatcher",

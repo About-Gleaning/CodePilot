@@ -18,6 +18,7 @@ from codepilot.context import ContextCompressionError, ContextCompressor
 from codepilot.events import ApprovalEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookContext, HookManager, HookResult, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
+from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.message import (
     AssistantMessageError,
@@ -205,6 +206,7 @@ class TurnExecutor:
     tool_dispatcher: ToolDispatcher
     hook_manager: HookManager
     message_appender: SessionMessageAppender
+    skill_registry: SkillRegistry | None = None
     context_compressor: ContextCompressor = field(default_factory=ContextCompressor)
 
     async def execute(
@@ -402,6 +404,7 @@ class TurnExecutor:
             agent_state=agent_state,
             agent_profile=agent_profile,
             llm_state=llm_state,
+            skill_registry=self.skill_registry,
         )
         provider_messages = self.llm_client.build_provider_messages(
             session.messages,

@@ -27,7 +27,7 @@ def build_agent_profiles(max_iterations: int) -> dict[str, AgentProfile]:
         "build": AgentProfile(
             name="build",
             system_prompt=_load_system_prompt("build"),
-            allowed_tools=["bash_tool", "read_file", "write_file", "edit_file"],
+            allowed_tools=["bash_tool", "read_file", "write_file", "edit_file", "load_skill"],
             readonly=False,
             max_iterations=max_iterations,
             can_call_subagent=True,
@@ -35,7 +35,7 @@ def build_agent_profiles(max_iterations: int) -> dict[str, AgentProfile]:
         "plan": AgentProfile(
             name="plan",
             system_prompt=_load_system_prompt("plan"),
-            allowed_tools=["bash_tool", "read_file", "write_plan"],
+            allowed_tools=["bash_tool", "read_file", "write_plan", "load_skill"],
             readonly=True,
             max_iterations=max_iterations,
             can_call_subagent=True,
@@ -43,7 +43,7 @@ def build_agent_profiles(max_iterations: int) -> dict[str, AgentProfile]:
         "explore": AgentProfile(
             name="explore",
             system_prompt=_load_system_prompt("explore"),
-            allowed_tools=["bash_tool", "read_file"],
+            allowed_tools=["bash_tool", "read_file", "load_skill"],
             readonly=True,
             max_iterations=max_iterations,
             can_call_subagent=False,

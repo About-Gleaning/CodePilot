@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-本仓库是前后端分离的 CodePilot 原型。后端位于 `backend/`，核心包在 `backend/src/codepilot/`：`api/` 提供 FastAPI 路由，`session/` 管理 Agent 会话流，`tools/` 放内置工具，`llm/` 封装 LiteLLM，`memory/` 处理 jsonl 存储。后端测试位于 `backend/tests/`。前端位于 `frontend/`，React 入口为 `frontend/src/main.tsx`，主界面在 `frontend/src/App.tsx`，样式在 `frontend/src/styles.css`。运行期文件写入根目录 `.run/`，不要提交日志、PID、密钥或本地缓存。
+本仓库是前后端分离的 CodePilot 原型。后端位于 `backend/`，核心包在 `backend/src/codepilot/`：`api/` 提供 FastAPI 路由，`session/` 管理 Agent 会话流，`tools/` 放内置工具，`skills/` 管理按需加载的技能运行时，`llm/` 封装 LiteLLM，`memory/` 处理 jsonl 存储。后端测试位于 `backend/tests/`。前端位于 `frontend/`，React 入口为 `frontend/src/main.tsx`，主界面在 `frontend/src/App.tsx`，样式在 `frontend/src/styles.css`。运行期文件写入根目录 `.run/`，不要提交日志、PID、密钥或本地缓存。
 
 ## Build, Test, and Development Commands
 
@@ -28,6 +28,10 @@ Python 使用 4 空格缩进、类型标注和清晰的模块边界；文件、�
 Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要在 `execute()` 内通过 `context.agent.name` 做运行时校验，避免模型历史、手工构造请求或后续编排绕过 Agent 权限。可参考 `write_plan` 的 plan agent 限制方式。
 
 工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，禁止访问工作区外路径；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
+
+## Skill Development Guidelines
+
+运行期 skills 默认从 `storage.codepilot_home/skills` 扫描，每个 skill 是一个含 `SKILL.md` 的一级子目录。system prompt 只注册可用 skill 的名称和描述；完整规范必须通过 `load_skill` 工具按需加载。`load_skill` 只读取 `SKILL.md`，不执行附带脚本，也不把 skill 清单放入工具描述，避免 system prompt 与工具 schema 出现两套来源。
 
 ## Testing Guidelines
 

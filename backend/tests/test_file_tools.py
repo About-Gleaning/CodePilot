@@ -5,7 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from codepilot.session.agents import build_agent_profiles
-from codepilot.tools import EditFileTool, ReadFileTool, ToolRegistry, WriteFileTool, WritePlanTool
+from codepilot.skills import SkillRegistry
+from codepilot.tools import EditFileTool, LoadSkillTool, ReadFileTool, ToolRegistry, WriteFileTool, WritePlanTool
 from codepilot.tools.base import ToolExecutionContext
 
 
@@ -144,11 +145,13 @@ def test_agent_tool_permissions_are_scoped() -> None:
     profiles = build_agent_profiles(max_iterations=3)
 
     assert {"bash_tool", "read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
+    assert "load_skill" in profiles["build"].allowed_tools
     assert "write_plan" in profiles["plan"].allowed_tools
+    assert "load_skill" in profiles["plan"].allowed_tools
     assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
-    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file"]
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill"]
 
 
 def test_file_tool_descriptions_are_loaded_into_schema() -> None:
@@ -164,3 +167,60 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
     assert all(isinstance(description, str) and description for description in descriptions)
     assert any("读取当前工作区内" in description for description in descriptions)
     assert any("写入当前 plan 会话" in description for description in descriptions)
+
+
+def test_load_skill_loads_full_skill_content(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: demo\ndescription: 演示 skill\n---\n# Demo\n按规范执行。\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry(skills_root)
+    registry.discover()
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(LoadSkillTool(registry=registry, timeout_seconds=1), {"name": "DEMO"}, context)
+
+    assert result["status"] == "ok"
+    assert result["name"] == "demo"
+    assert "## Skill: demo" in str(result["output"])
+    assert "按规范执行" in str(result["output"])
+
+
+def test_load_skill_rejects_empty_name(tmp_path: Path) -> None:
+    registry = SkillRegistry(tmp_path / "skills")
+    registry.discover()
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(LoadSkillTool(registry=registry, timeout_seconds=1), {"name": ""}, context)
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "SkillNameInvalid"
+
+
+def test_load_skill_reports_missing_skill(tmp_path: Path) -> None:
+    registry = SkillRegistry(tmp_path / "skills")
+    registry.discover()
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(LoadSkillTool(registry=registry, timeout_seconds=1), {"name": "missing"}, context)
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "SkillNotFound"
+
+
+def test_load_skill_tool_description_does_not_embed_skill_catalog(tmp_path: Path) -> None:
+    skills_root = tmp_path / "skills"
+    skill_dir = skills_root / "demo"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: demo\ndescription: 演示 skill\n---\n# Demo\n",
+        encoding="utf-8",
+    )
+    registry = SkillRegistry(skills_root)
+    registry.discover()
+    tool = LoadSkillTool(registry=registry, timeout_seconds=1)
+
+    assert "演示 skill" not in tool.get_llm_description()

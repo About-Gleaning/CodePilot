@@ -14,6 +14,7 @@ from typing import Any
 from codepilot.events import SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookManager, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
+from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.flow import ApprovalCoordinator, SessionMessageAppender, TurnExecutor, TurnResult
 from codepilot.session.message import AssistantMessageInfo, ToolPart
@@ -55,6 +56,7 @@ class AgentLoop:
         tool_registry: ToolRegistry,
         tool_dispatcher: ToolDispatcher,
         hook_manager: HookManager,
+        skill_registry: SkillRegistry | None = None,
     ) -> None:
         """初始化会话循环依赖。
 
@@ -74,6 +76,7 @@ class AgentLoop:
             tool_dispatcher=tool_dispatcher,
             hook_manager=hook_manager,
             message_appender=self._message_appender,
+            skill_registry=skill_registry,
         )
 
     async def run(

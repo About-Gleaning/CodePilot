@@ -31,9 +31,11 @@ from codepilot.llm import LiteLLMClient
 from codepilot.logging import configure_logging
 from codepilot.memory import JsonlEventStore, JsonlSessionMemory
 from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
+from codepilot.skills import SkillRegistry
 from codepilot.tools import (
     BashTool,
     EditFileTool,
+    LoadSkillTool,
     McpToolAdapter,
     ReadFileTool,
     ToolDispatcher,
@@ -80,6 +82,9 @@ def create_app() -> FastAPI:
     event_bus.subscribe_domain(session_memory.handle_domain_event)
     event_bus.subscribe_stream(event_store.append)
 
+    skill_registry = SkillRegistry(workspace.codepilot_home / "skills")
+    skill_registry.discover()
+
     tool_registry = ToolRegistry()
     # 一期先注册内置工具与 MCP 占位适配器，后续再替换为真实 MCP 工具发现流程。
     tool_registry.register(BashTool(settings=settings.tools.bash, timeout_seconds=settings.tools.default_timeout_seconds))
@@ -87,6 +92,7 @@ def create_app() -> FastAPI:
     tool_registry.register(WriteFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(EditFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(WritePlanTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
 
     hook_manager = _build_hook_manager(settings)
@@ -94,7 +100,13 @@ def create_app() -> FastAPI:
     tool_dispatcher = ToolDispatcher(tool_registry, hook_manager)
     agent_profiles = build_agent_profiles(settings.agent.max_loop_iterations)
     # AgentLoop 负责单轮推理与工具调用；SessionRunner 负责面向会话编排整个执行生命周期。
-    agent_loop = AgentLoop(llm_client=llm_client, tool_registry=tool_registry, tool_dispatcher=tool_dispatcher, hook_manager=hook_manager)
+    agent_loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=tool_registry,
+        tool_dispatcher=tool_dispatcher,
+        hook_manager=hook_manager,
+        skill_registry=skill_registry,
+    )
     session_runner = SessionRunner(
         workspace=workspace,
         config=settings,
