@@ -13,8 +13,8 @@
 - 每个问题必须包含 `id`、`question` 和 `options`。
 - `id` 必须在本次调用内唯一，便于后续识别答案。
 - `multiple` 默认 false；需要多选时设为 true。
-- `custom` 默认 false；设为 true 时，系统会自动追加 `value="__custom__"`、`label="不是以上任何选项"` 的自由输入选项。
 - 每个 `options` 项必须包含 `value` 和 `label`，且同一问题内 `value` 不能重复。
+- `options` 会原样展示给用户；需要兜底选项时，应显式加入“不是以上任何选项”等选项。
 - 不要传入 `header`、`description` 等 schema 未定义字段。
 
 适合场景：
@@ -34,10 +34,10 @@
     {
       "id": "implementation_scope",
       "question": "这次希望采用哪种实现范围？",
-      "custom": true,
       "options": [
         {"value": "minimal", "label": "最小改动 (Recommended)"},
-        {"value": "refactor", "label": "顺带重构"}
+        {"value": "refactor", "label": "顺带重构"},
+        {"value": "none", "label": "不是以上任何选项"}
       ]
     }
   ]

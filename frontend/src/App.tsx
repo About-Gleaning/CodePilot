@@ -6,6 +6,7 @@ import {
   Bot,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   CircleDot,
   FileText,
@@ -104,7 +105,6 @@ type QuestionItem = {
   id: string;
   question: string;
   multiple?: boolean;
-  custom?: boolean;
   options: QuestionOption[];
 };
 
@@ -115,7 +115,7 @@ type QuestionRequest = {
 
 type QuestionAnswer = {
   values: string[];
-  custom: string;
+  note: string;
 };
 
 type SelectOption = {
@@ -207,6 +207,9 @@ function App() {
   const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
   const [questionRequest, setQuestionRequest] = useState<QuestionRequest | null>(null);
   const [questionAnswers, setQuestionAnswers] = useState<Record<string, QuestionAnswer>>({});
+  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
+  const [activeQuestionOptionIndex, setActiveQuestionOptionIndex] = useState(0);
+  const [questionError, setQuestionError] = useState('');
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
@@ -215,6 +218,9 @@ function App() {
   const [lastSeq, setLastSeq] = useState(0);
   const lastSeqRef = useRef(0);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const questionPanelRef = useRef<HTMLElement | null>(null);
+  const questionOptionsRef = useRef<HTMLDivElement | null>(null);
+  const questionNoteRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     void bootstrap();
@@ -228,6 +234,19 @@ function App() {
       return;
     }
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (isTextEntryTarget(event.target)) {
+        return;
+      }
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault();
+        moveActiveQuestion(-1);
+        return;
+      }
+      if (event.key === 'ArrowRight') {
+        event.preventDefault();
+        moveActiveQuestion(1);
+        return;
+      }
       if (event.key === 'Escape') {
         event.preventDefault();
         void handleQuestionDecline();
@@ -235,7 +254,19 @@ function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [questionRequest]);
+  }, [questionRequest, activeQuestionIndex]);
+
+  useEffect(() => {
+    const question = questionRequest?.questions[activeQuestionIndex];
+    if (!question) {
+      setActiveQuestionOptionIndex(0);
+      return;
+    }
+    const answer = questionAnswers[question.id] || { values: [], note: '' };
+    const selectedIndex = question.options.findIndex((option) => answer.values.includes(option.value));
+    setActiveQuestionOptionIndex(selectedIndex >= 0 ? selectedIndex : 0);
+    focusQuestionOptions();
+  }, [questionRequest, activeQuestionIndex]);
 
   async function bootstrap() {
     try {
@@ -313,10 +344,16 @@ function App() {
       const request = event.data as QuestionRequest;
       setQuestionRequest(request);
       setQuestionAnswers(initQuestionAnswers(request));
+      setActiveQuestionIndex(0);
+      setActiveQuestionOptionIndex(0);
+      setQuestionError('');
     }
     if (event.event_type === 'human_question_resolved') {
       setQuestionRequest(null);
       setQuestionAnswers({});
+      setActiveQuestionIndex(0);
+      setActiveQuestionOptionIndex(0);
+      setQuestionError('');
     }
     if (
       event.event_type === 'session_started' ||
@@ -409,6 +446,9 @@ function App() {
     setApprovalComment('');
     setQuestionRequest(null);
     setQuestionAnswers({});
+    setActiveQuestionIndex(0);
+    setActiveQuestionOptionIndex(0);
+    setQuestionError('');
     setFormError('');
   }
 
@@ -429,6 +469,9 @@ function App() {
       setApprovalComment('');
       setQuestionRequest(null);
       setQuestionAnswers({});
+      setActiveQuestionIndex(0);
+      setActiveQuestionOptionIndex(0);
+      setQuestionError('');
       setLastSeq(0);
       lastSeqRef.current = 0;
       connectStream(0);
@@ -469,12 +512,12 @@ function App() {
   }
 
   function initQuestionAnswers(request: QuestionRequest): Record<string, QuestionAnswer> {
-    return Object.fromEntries(request.questions.map((question) => [question.id, { values: [], custom: '' }]));
+    return Object.fromEntries(request.questions.map((question) => [question.id, { values: [], note: '' }]));
   }
 
   function updateQuestionChoice(question: QuestionItem, value: string, checked: boolean) {
     setQuestionAnswers((prev) => {
-      const current = prev[question.id] || { values: [], custom: '' };
+      const current = prev[question.id] || { values: [], note: '' };
       const values = question.multiple
         ? checked
           ? Array.from(new Set([...current.values, value]))
@@ -482,13 +525,121 @@ function App() {
         : [value];
       return { ...prev, [question.id]: { ...current, values } };
     });
+    setQuestionError('');
   }
 
-  function updateQuestionCustom(questionId: string, custom: string) {
+  function updateQuestionNote(questionId: string, note: string) {
     setQuestionAnswers((prev) => {
-      const current = prev[questionId] || { values: [], custom: '' };
-      return { ...prev, [questionId]: { ...current, custom } };
+      const current = prev[questionId] || { values: [], note: '' };
+      return { ...prev, [questionId]: { ...current, note } };
     });
+  }
+
+  function focusQuestionOptions() {
+    window.requestAnimationFrame(() => questionOptionsRef.current?.focus());
+  }
+
+  function focusQuestionNote() {
+    window.requestAnimationFrame(() => questionNoteRef.current?.focus());
+  }
+
+  function moveActiveQuestion(step: number) {
+    if (!questionRequest) {
+      return;
+    }
+    setActiveQuestionIndex((prev) => Math.min(Math.max(prev + step, 0), questionRequest.questions.length - 1));
+    setActiveQuestionOptionIndex(0);
+    setQuestionError('');
+    focusQuestionOptions();
+  }
+
+  function handleQuestionOptionsKeyDown(event: React.KeyboardEvent<HTMLDivElement>, question: QuestionItem) {
+    if (question.options.length === 0) {
+      return;
+    }
+    const lastIndex = question.options.length - 1;
+    const chooseIndex = (nextIndex: number, shouldSelect: boolean) => {
+      const boundedIndex = Math.min(Math.max(nextIndex, 0), lastIndex);
+      setActiveQuestionOptionIndex(boundedIndex);
+      const option = question.options[boundedIndex];
+      if (option && shouldSelect) {
+        updateQuestionChoice(question, option.value, true);
+      }
+    };
+
+    if (event.key === 'Tab') {
+      event.preventDefault();
+      focusQuestionNote();
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      chooseIndex(activeQuestionOptionIndex >= lastIndex ? 0 : activeQuestionOptionIndex + 1, !question.multiple);
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      chooseIndex(activeQuestionOptionIndex <= 0 ? lastIndex : activeQuestionOptionIndex - 1, !question.multiple);
+      return;
+    }
+    if (event.key === 'Home') {
+      event.preventDefault();
+      chooseIndex(0, !question.multiple);
+      return;
+    }
+    if (event.key === 'End') {
+      event.preventDefault();
+      chooseIndex(lastIndex, !question.multiple);
+      return;
+    }
+    if (event.key === ' ' || event.key === 'Enter') {
+      event.preventDefault();
+      const option = question.options[activeQuestionOptionIndex];
+      const current = questionAnswers[question.id] || { values: [], note: '' };
+      if (!option) {
+        return;
+      }
+      if (event.key === ' ') {
+        updateQuestionChoice(question, option.value, question.multiple ? !current.values.includes(option.value) : true);
+        return;
+      }
+      if (current.values.length === 0) {
+        updateQuestionChoice(question, option.value, true);
+        return;
+      }
+      void confirmActiveQuestion();
+    }
+  }
+
+  function handleQuestionNoteKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Tab') {
+      return;
+    }
+    event.preventDefault();
+    focusQuestionOptions();
+  }
+
+  async function confirmActiveQuestion() {
+    if (!questionRequest) {
+      return;
+    }
+    const question = questionRequest.questions[activeQuestionIndex];
+    if (!question) {
+      return;
+    }
+    const answer = questionAnswers[question.id] || { values: [], note: '' };
+    if (answer.values.length === 0) {
+      setQuestionError('请先选择一个选项。');
+      return;
+    }
+    setQuestionError('');
+    if (activeQuestionIndex < questionRequest.questions.length - 1) {
+      setActiveQuestionIndex((prev) => prev + 1);
+      setActiveQuestionOptionIndex(0);
+      focusQuestionOptions();
+      return;
+    }
+    await handleQuestionReply();
   }
 
   async function handleQuestionReply() {
@@ -520,6 +671,9 @@ function App() {
       });
       setQuestionRequest(null);
       setQuestionAnswers({});
+      setActiveQuestionIndex(0);
+      setActiveQuestionOptionIndex(0);
+      setQuestionError('');
       await refreshStatus();
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '退出回答失败');
@@ -529,6 +683,8 @@ function App() {
   const selectedProvider = findProviderOption(provider);
   const modelOptions = selectedProvider?.models || [];
   const statusText = status?.status || 'IDLE';
+  const activeQuestion = questionRequest?.questions[activeQuestionIndex] || null;
+  const activeAnswer = activeQuestion ? questionAnswers[activeQuestion.id] || { values: [], note: '' } : null;
 
   return (
     <div className="workspace-shell">
@@ -663,47 +819,86 @@ function App() {
               />
             </section>
           ) : questionRequest ? (
-            <section className="composer-question" aria-label="用户回答">
+            <section className="composer-question" aria-label="用户回答" ref={questionPanelRef}>
               <div className="approval-heading">
                 <MessageSquareText size={16} />
                 <strong>需要回答</strong>
                 <code>{questionRequest.question_id}</code>
               </div>
-              <div className="question-list">
-                {questionRequest.questions.map((question) => {
-                  const answer = questionAnswers[question.id] || { values: [], custom: '' };
-                  return (
-                    <fieldset className="question-fieldset" key={question.id}>
-                      <legend>{question.question}</legend>
-                      <div className="question-options">
-                        {question.options.map((option) => {
-                          const inputType = question.multiple ? 'checkbox' : 'radio';
-                          const checked = answer.values.includes(option.value);
-                          return (
-                            <label className="question-option" key={option.value}>
-                              <input
-                                type={inputType}
-                                name={question.id}
-                                checked={checked}
-                                onChange={(e) => updateQuestionChoice(question, option.value, e.target.checked)}
-                              />
-                              <span>{option.label}</span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                      {question.custom && answer.values.includes('__custom__') ? (
-                        <textarea
-                          rows={2}
-                          placeholder="补充说明"
-                          value={answer.custom}
-                          onChange={(e) => updateQuestionCustom(question.id, e.target.value)}
-                        />
-                      ) : null}
-                    </fieldset>
-                  );
-                })}
-              </div>
+              {activeQuestion && activeAnswer ? (
+                <div className="question-flow">
+                  <div className="question-progress" aria-label="问题进度">
+                    {questionRequest.questions.map((question, index) => {
+                      const answer = questionAnswers[question.id] || { values: [], note: '' };
+                      const isActive = index === activeQuestionIndex;
+                      const isDone = answer.values.length > 0;
+                      return (
+                        <button
+                          type="button"
+                          className={`question-step ${isActive ? 'is-active' : ''} ${isDone ? 'is-done' : ''}`}
+                          key={question.id}
+                          onClick={() => {
+                            setActiveQuestionIndex(index);
+                            setActiveQuestionOptionIndex(0);
+                            setQuestionError('');
+                            focusQuestionOptions();
+                          }}
+                          aria-current={isActive ? 'step' : undefined}
+                        >
+                          {index + 1}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <fieldset className="question-fieldset">
+                    <legend>
+                      <span>
+                        第 {activeQuestionIndex + 1} / {questionRequest.questions.length} 题
+                      </span>
+                      {activeQuestion.question}
+                    </legend>
+                    <div
+                      className="question-options"
+                      ref={questionOptionsRef}
+                      role={activeQuestion.multiple ? 'group' : 'radiogroup'}
+                      aria-label={activeQuestion.question}
+                      tabIndex={0}
+                      onKeyDown={(event) => handleQuestionOptionsKeyDown(event, activeQuestion)}
+                    >
+                      {activeQuestion.options.map((option, optionIndex) => {
+                        const inputType = activeQuestion.multiple ? 'checkbox' : 'radio';
+                        const checked = activeAnswer.values.includes(option.value);
+                        const isKeyboardActive = optionIndex === activeQuestionOptionIndex;
+                        return (
+                          <label className={`question-option ${isKeyboardActive ? 'is-keyboard-active' : ''}`} key={option.value}>
+                            <input
+                              type={inputType}
+                              name={activeQuestion.id}
+                              checked={checked}
+                              tabIndex={-1}
+                              onChange={(e) => {
+                                setActiveQuestionOptionIndex(optionIndex);
+                                updateQuestionChoice(activeQuestion, option.value, e.target.checked);
+                              }}
+                            />
+                            <span>{option.label}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <textarea
+                      ref={questionNoteRef}
+                      rows={2}
+                      placeholder="备注"
+                      value={activeAnswer.note}
+                      onChange={(e) => updateQuestionNote(activeQuestion.id, e.target.value)}
+                      onKeyDown={handleQuestionNoteKeyDown}
+                    />
+                    {questionError ? <p className="question-error">{questionError}</p> : null}
+                  </fieldset>
+                </div>
+              ) : null}
             </section>
           ) : (
             <textarea
@@ -732,9 +927,18 @@ function App() {
                   <X size={15} />
                   退出
                 </button>
-                <button type="button" className="button primary" onClick={handleQuestionReply}>
-                  <Check size={15} />
-                  提交
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => moveActiveQuestion(-1)}
+                  disabled={activeQuestionIndex === 0}
+                >
+                  <ChevronLeft size={15} />
+                  上一题
+                </button>
+                <button type="button" className="button primary" onClick={() => void confirmActiveQuestion()}>
+                  {activeQuestionIndex === questionRequest.questions.length - 1 ? <Check size={15} /> : <ChevronRight size={15} />}
+                  {activeQuestionIndex === questionRequest.questions.length - 1 ? '提交' : '下一题'}
                 </button>
               </>
             ) : (
@@ -1404,6 +1608,10 @@ function formatSessionTime(value: string) {
     hour: '2-digit',
     minute: '2-digit',
   });
+}
+
+function isTextEntryTarget(target: EventTarget | null) {
+  return target instanceof HTMLElement && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
 }
 
 async function fetchJson<T>(url: string): Promise<T> {

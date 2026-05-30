@@ -1338,11 +1338,6 @@ pre {
   margin-top: 10px;
 }
 
-.question-list {
-  display: grid;
-  gap: 10px;
-}
-
 .question-fieldset {
   min-width: 0;
   margin: 0;
@@ -1351,33 +1346,122 @@ pre {
 }
 
 .question-fieldset legend {
+  display: grid;
+  gap: 5px;
   margin-bottom: 8px;
   color: var(--text);
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.45;
+}
+
+.question-fieldset legend span {
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.question-flow {
+  display: grid;
+  gap: 10px;
+}
+
+.question-progress {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.question-step {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 24px;
+  min-height: 24px;
+  border: 1px solid rgba(38, 48, 44, 0.9);
+  border-radius: 6px;
+  color: var(--muted);
+  background: rgba(8, 13, 11, 0.72);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.question-step:hover,
+.question-step:focus-visible {
+  outline: 0;
+  border-color: rgba(88, 199, 217, 0.58);
+  color: var(--text);
+  background: rgba(88, 199, 217, 0.08);
+}
+
+.question-step.is-done {
+  border-color: rgba(118, 220, 145, 0.5);
+  color: var(--ok);
+}
+
+.question-step.is-active {
+  border-color: rgba(212, 255, 98, 0.66);
+  color: var(--accent);
+  background: rgba(212, 255, 98, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(212, 255, 98, 0.08);
 }
 
 .question-options {
   display: grid;
-  gap: 7px;
+  gap: 8px;
+  border-radius: 7px;
+  outline: none;
+}
+
+.question-options:focus-visible {
+  box-shadow: 0 0 0 3px rgba(212, 255, 98, 0.12);
 }
 
 .question-option {
   display: flex;
   align-items: center;
-  gap: 8px;
-  min-height: 26px;
+  gap: 9px;
+  min-height: 34px;
+  padding: 7px 9px;
+  border: 1px solid rgba(38, 48, 44, 0.78);
+  border-radius: 7px;
   color: #cedbd3;
   font-size: 13px;
   line-height: 1.35;
+  background: rgba(8, 13, 11, 0.56);
+  cursor: pointer;
+}
+
+.question-option:hover,
+.question-option:focus-within {
+  border-color: rgba(88, 199, 217, 0.54);
+  color: var(--text);
+  background: rgba(88, 199, 217, 0.06);
+}
+
+.question-option.is-keyboard-active {
+  border-color: rgba(212, 255, 98, 0.58);
+  color: var(--text);
+  background:
+    linear-gradient(90deg, rgba(212, 255, 98, 0.08), transparent 46%),
+    rgba(8, 13, 11, 0.72);
 }
 
 .question-option input {
   flex: 0 0 auto;
+  accent-color: var(--accent);
 }
 
 .question-fieldset textarea {
   margin-top: 8px;
+  min-height: 58px;
+}
+
+.question-error {
+  margin: 7px 0 0;
+  color: var(--danger);
+  font-size: 12px;
 }
 
 .workspace-strip {

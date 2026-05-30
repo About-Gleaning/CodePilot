@@ -24,6 +24,7 @@ from codepilot.session import (
 )
 from codepilot.session.agents import AgentProfile
 from codepilot.session.message import ToolPartState
+from codepilot.session.session import summarize_question_answers
 from codepilot.session.title import SessionTitleService
 from codepilot.tools import BaseTool, QuestionTool, ToolDispatcher, ToolRegistry, ToolSpec
 from codepilot.tools.base import ToolExecutionContext
@@ -68,6 +69,40 @@ def build_session() -> SessionState:
             )
         ],
     )
+
+
+def test_summarize_question_answers_uses_labels_and_notes() -> None:
+    questions = [
+        {
+            "id": "target",
+            "question": "请选择目标",
+            "multiple": False,
+            "options": [
+                {"value": "backend", "label": "后端"},
+                {"value": "none", "label": "不是以上任何选项"},
+            ],
+        },
+        {
+            "id": "compat",
+            "question": "是否需要兼容旧数据？",
+            "multiple": True,
+            "options": [
+                {"value": "yes", "label": "需要兼容"},
+                {"value": "docs", "label": "同步文档"},
+            ],
+        },
+    ]
+    answers = {
+        "target": {"values": ["none"], "note": ""},
+        "compat": {"values": ["yes", "docs"], "note": "保留历史字段读取"},
+    }
+
+    summary = summarize_question_answers(questions, answers)
+
+    assert '"values"' not in summary
+    assert "回答：不是以上任何选项。" in summary
+    assert "回答：需要兼容、同步文档。备注：保留历史字段读取。" in summary
+    assert "用户备注" not in summary
 
 
 class RecordingHook(BaseHook):
@@ -705,8 +740,10 @@ class QuestionToolCallLiteLLMClient(StubLiteLLMClient):
                                 {
                                     "id": "target",
                                     "question": "请选择目标",
-                                    "options": [{"value": "backend", "label": "后端"}],
-                                    "custom": True,
+                                    "options": [
+                                        {"value": "backend", "label": "后端"},
+                                        {"value": "none", "label": "不是以上任何选项"},
+                                    ],
                                 }
                             ]
                         },
@@ -924,7 +961,7 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
         request = next(event.data for event in stream_events if event.event_type == "human_question_required")
         question_result_holder["result"] = QuestionResult(
             question_id=request["question_id"],
-            answers={"target": {"values": ["backend"], "custom": ""}},
+            answers={"target": {"values": ["backend"], "note": ""}},
             created_at="2026-04-30T00:00:01Z",
         )
         question_event.set()

@@ -189,7 +189,7 @@ def test_todo_read_reports_empty_state(tmp_path: Path) -> None:
     assert "还没有 todo" in str(result["output"])
 
 
-def test_question_normalizes_custom_option(tmp_path: Path) -> None:
+def test_question_rejects_custom_field(tmp_path: Path) -> None:
     context = build_context(tmp_path, tmp_path / ".codepilot")
 
     result = run_tool(
@@ -207,8 +207,8 @@ def test_question_normalizes_custom_option(tmp_path: Path) -> None:
         context,
     )
 
-    assert result["status"] == "question_required"
-    assert result["questions"][0]["options"][-1] == {"value": "__custom__", "label": "不是以上任何选项"}
+    assert result["status"] == "error"
+    assert result["error_type"] == "QuestionUnknownField"
 
 
 def test_question_rejects_invalid_questions(tmp_path: Path) -> None:

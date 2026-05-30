@@ -8,7 +8,6 @@ from __future__ import annotations
 3. 把人工审批委托给 ApprovalCoordinator，统一审批事件与拒绝消息处理。
 """
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -471,7 +470,7 @@ class AgentLoop:
             "tool_name": "question",
             "question_id": result.question_id,
             "answers": result.answers,
-            "output": self._summarize_question_answers(result.answers),
+            "output": summarize_question_answers(question.request.questions, result.answers),
         }
         for index, part in enumerate(latest_message.parts):
             if isinstance(part, ToolPart) and part.call_id == call_id:
@@ -490,7 +489,47 @@ class AgentLoop:
                 latest_message.info.finish = "tool_completed"
                 return
 
-    def _summarize_question_answers(self, answers: dict[str, Any]) -> str:
-        if not answers:
-            return "用户未提供具体答案。"
-        return "用户已回答 question 工具提出的问题：" + json.dumps(answers, ensure_ascii=False)
+def summarize_question_answers(questions: list[dict[str, Any]], answers: dict[str, Any]) -> str:
+    """把结构化答案转成自然语言，避免 LLM 直接读取前端内部 JSON。"""
+    if not answers:
+        return "用户未提供具体答案。"
+
+    lines = ["用户已回答 question 工具提出的问题："]
+    for index, question in enumerate(questions, start=1):
+        question_id = str(question.get("id") or "")
+        question_text = str(question.get("question") or "").strip() or question_id or f"问题 {index}"
+        answer = answers.get(question_id)
+        answer_record = answer if isinstance(answer, dict) else {}
+        values = answer_record.get("values")
+        selected_values = [str(value) for value in values] if isinstance(values, list) else []
+        option_labels = _resolve_question_option_labels(question, selected_values)
+        note = str(answer_record.get("note") or "").strip()
+
+        lines.append("")
+        lines.append(f"{index}. {question_text}")
+        if option_labels:
+            response = f"回答：{'、'.join(option_labels)}。"
+        else:
+            response = "回答：未选择。"
+        if note:
+            response += f"备注：{_ensure_sentence_end(note)}"
+        lines.append(response)
+    return "\n".join(lines)
+
+
+def _resolve_question_option_labels(question: dict[str, Any], selected_values: list[str]) -> list[str]:
+    option_map: dict[str, str] = {}
+    raw_options = question.get("options")
+    if isinstance(raw_options, list):
+        for raw_option in raw_options:
+            if not isinstance(raw_option, dict):
+                continue
+            value = str(raw_option.get("value") or "")
+            label = str(raw_option.get("label") or "").strip()
+            if value and label:
+                option_map[value] = label
+    return [option_map.get(value, value) for value in selected_values]
+
+
+def _ensure_sentence_end(text: str) -> str:
+    return text if text.endswith(("。", "！", "？", ".", "!", "?")) else f"{text}。"

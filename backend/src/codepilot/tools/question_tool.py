@@ -7,9 +7,9 @@ from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
 from codepilot.tools.file_tool_common import FileToolError, build_tool_failure, load_tool_description
 
 
-DEFAULT_CUSTOM_LABEL = "不是以上任何选项"
 MAX_QUESTIONS = 3
 MAX_OPTIONS = 8
+QUESTION_FIELDS = {"id", "question", "multiple", "options"}
 
 
 class QuestionTool(BaseTool):
@@ -30,7 +30,6 @@ class QuestionTool(BaseTool):
                                 "id": {"type": "string"},
                                 "question": {"type": "string"},
                                 "multiple": {"type": "boolean"},
-                                "custom": {"type": "boolean"},
                                 "options": {
                                     "type": "array",
                                     "items": {
@@ -86,6 +85,12 @@ def _normalize_questions(raw_questions: Any) -> list[dict[str, Any]]:
     for index, raw in enumerate(raw_questions):
         if not isinstance(raw, dict):
             raise FileToolError(f"第 {index + 1} 个问题必须是对象。", error_type="QuestionItemInvalid")
+        unknown_fields = set(raw) - QUESTION_FIELDS
+        if unknown_fields:
+            raise FileToolError(
+                f"第 {index + 1} 个问题包含不支持的字段：{', '.join(sorted(unknown_fields))}。",
+                error_type="QuestionUnknownField",
+            )
         question_id = str(raw.get("id", "")).strip()
         question_text = str(raw.get("question", "")).strip()
         if not question_id:
@@ -95,16 +100,12 @@ def _normalize_questions(raw_questions: Any) -> list[dict[str, Any]]:
         if not question_text:
             raise FileToolError(f"第 {index + 1} 个问题内容不能为空。", error_type="QuestionTextEmpty")
         options = _normalize_options(raw.get("options"), question_index=index + 1)
-        if raw.get("custom") is True and not any(option["value"] == "__custom__" for option in options):
-            # custom 使用固定 value，便于前后端识别自由输入分支。
-            options.append({"value": "__custom__", "label": DEFAULT_CUSTOM_LABEL})
         seen_ids.add(question_id)
         questions.append(
             {
                 "id": question_id,
                 "question": question_text,
                 "multiple": bool(raw.get("multiple", False)),
-                "custom": bool(raw.get("custom", False)),
                 "options": options,
             }
         )
