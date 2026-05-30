@@ -249,8 +249,29 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
 
     descriptions = [schema["function"]["description"] for schema in schemas]  # type: ignore[index]
     assert all(isinstance(description, str) and description for description in descriptions)
-    assert any("读取当前工作区内" in description for description in descriptions)
-    assert any("写入当前 plan 会话" in description for description in descriptions)
+    assert any("读取 workspace 内" in description for description in descriptions)
+    assert any("写入当前 plan agent 会话" in description for description in descriptions)
+
+
+def test_tool_descriptions_do_not_reference_stale_schema_terms() -> None:
+    descriptions_dir = Path(__file__).resolve().parents[1] / "src" / "codepilot" / "tools" / "descriptions"
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in descriptions_dir.glob("*.txt"))
+
+    stale_terms = [
+        "filePath",
+        "oldString",
+        "newString",
+        "replaceAll",
+        "related_artifacts",
+        "list_artifacts",
+        "read_artifact",
+        '"header"',
+        '"description"',
+        "cancelled",
+        "行号前缀",
+    ]
+    for term in stale_terms:
+        assert term not in combined
 
 
 def test_load_skill_loads_full_skill_content(tmp_path: Path) -> None:
