@@ -30,6 +30,7 @@ class StreamEvent(BaseModel):
 class DomainEventType(str, Enum):
     """系统内部可发布的领域事件类型。"""
 
+    SESSION_META = "session_meta"
     MESSAGE_CREATED = "message_created"
     SESSION_LIFECYCLE = "session_lifecycle"
     APPROVAL = "approval"
@@ -50,6 +51,12 @@ class MessageCreatedEvent(DomainEvent):
 
     event_type: DomainEventType = DomainEventType.MESSAGE_CREATED
     message: Message
+
+
+class SessionMetaEvent(DomainEvent):
+    """会话全局索引信息创建或更新时发布的领域事件。"""
+
+    event_type: DomainEventType = DomainEventType.SESSION_META
 
 
 class SessionLifecycleEvent(DomainEvent):

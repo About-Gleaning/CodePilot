@@ -10,7 +10,6 @@ from .plugins import (
     HttpPluginHook,
     PromptPluginHook,
 )
-from .session_title import SessionTitleHook
 
 __all__ = [
     "AgentPluginHook",
@@ -26,5 +25,4 @@ __all__ = [
     "HttpPluginHook",
     "PromptPluginHook",
     "RuntimeHandles",
-    "SessionTitleHook",
 ]

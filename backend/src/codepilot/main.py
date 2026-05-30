@@ -25,7 +25,6 @@ from codepilot.hooks import (
     HookType,
     HttpPluginHook,
     PromptPluginHook,
-    SessionTitleHook,
 )
 from codepilot.llm import LiteLLMClient
 from codepilot.logging import configure_logging
@@ -40,8 +39,11 @@ from codepilot.tools import (
     ReadFileTool,
     ToolDispatcher,
     ToolRegistry,
+    TodoReadTool,
+    TodoWriteTool,
     WriteFileTool,
     WritePlanTool,
+    QuestionTool,
 )
 
 
@@ -92,6 +94,9 @@ def create_app() -> FastAPI:
     tool_registry.register(WriteFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(EditFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(WritePlanTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(TodoWriteTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(TodoReadTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(QuestionTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
 
@@ -194,17 +199,6 @@ def _build_workspace_state(repo_root: Path, settings: AppSettings) -> WorkspaceS
 def _build_hook_manager(settings: AppSettings) -> HookManager:
     """根据配置注册内置 Hook 与插件 Hook，生成运行期统一使用的 Hook 管理器。"""
     manager = HookManager()
-    manager.register(
-        SessionTitleHook(
-            hook_id="session-title-hook",
-            hook_type=HookType.SESSION_BEFORE,
-            name="session_title_hook",
-            description="使用 qwen3.5-flash 为首条用户消息生成会话标题。",
-            order=5,
-            timeout_seconds=min(settings.hooks.default_timeout_seconds, 10),
-            run_once_per_session=True,
-        )
-    )
     # 内置审批 Hook 始终注册，用于通过显式标记触发人工确认链路。
     manager.register(
         ApprovalHook(

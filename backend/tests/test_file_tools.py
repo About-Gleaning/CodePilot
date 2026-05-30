@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from codepilot.session.agents import build_agent_profiles
 from codepilot.skills import SkillRegistry
-from codepilot.tools import EditFileTool, LoadSkillTool, ReadFileTool, ToolRegistry, WriteFileTool, WritePlanTool
+from codepilot.tools import EditFileTool, LoadSkillTool, QuestionTool, ReadFileTool, TodoReadTool, TodoWriteTool, ToolRegistry, WriteFileTool, WritePlanTool
 from codepilot.tools.base import ToolExecutionContext
 
 
@@ -141,6 +141,85 @@ def test_write_plan_rejects_non_plan_agent(tmp_path: Path) -> None:
     assert result["error_type"] == "PlanToolAgentForbidden"
 
 
+def test_todo_write_and_read_use_session_runtime_file(tmp_path: Path) -> None:
+    workspace_dir = tmp_path / ".codepilot"
+    context = build_context(tmp_path, workspace_dir)
+    todos = [
+        {"content": "实现工具", "status": "in_progress", "priority": "high"},
+        {"content": "补充测试", "status": "pending", "priority": "medium"},
+    ]
+
+    written = run_tool(TodoWriteTool(timeout_seconds=1), {"todos": todos}, context)
+    read = run_tool(TodoReadTool(timeout_seconds=1), {}, context)
+
+    todo_path = workspace_dir / "todos" / "session_1.json"
+    assert written["status"] == "ok"
+    assert written["todo_path"] == str(todo_path)
+    assert read["todos"] == todos
+    assert todo_path.exists()
+    assert not (workspace_dir / "sessions" / "session_1.json").exists()
+    assert not (workspace_dir / "plans" / "session_1.md").exists()
+
+
+def test_todo_write_rejects_multiple_in_progress(tmp_path: Path) -> None:
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(
+        TodoWriteTool(timeout_seconds=1),
+        {
+            "todos": [
+                {"content": "a", "status": "in_progress", "priority": "high"},
+                {"content": "b", "status": "in_progress", "priority": "low"},
+            ]
+        },
+        context,
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "TodoInProgressConflict"
+
+
+def test_todo_read_reports_empty_state(tmp_path: Path) -> None:
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(TodoReadTool(timeout_seconds=1), {}, context)
+
+    assert result["status"] == "ok"
+    assert result["todos"] == []
+    assert "还没有 todo" in str(result["output"])
+
+
+def test_question_normalizes_custom_option(tmp_path: Path) -> None:
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(
+        QuestionTool(timeout_seconds=1),
+        {
+            "questions": [
+                {
+                    "id": "scope",
+                    "question": "选择范围",
+                    "options": [{"value": "backend", "label": "后端"}],
+                    "custom": True,
+                }
+            ]
+        },
+        context,
+    )
+
+    assert result["status"] == "question_required"
+    assert result["questions"][0]["options"][-1] == {"value": "__custom__", "label": "不是以上任何选项"}
+
+
+def test_question_rejects_invalid_questions(tmp_path: Path) -> None:
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(QuestionTool(timeout_seconds=1), {"questions": []}, context)
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "QuestionInputInvalid"
+
+
 def test_agent_tool_permissions_are_scoped() -> None:
     profiles = build_agent_profiles(max_iterations=3)
 
@@ -151,7 +230,9 @@ def test_agent_tool_permissions_are_scoped() -> None:
     assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
-    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill"]
+    assert {"todo_write", "todo_read", "question"}.issubset(profiles["build"].allowed_tools)
+    assert {"todo_write", "todo_read", "question"}.issubset(profiles["plan"].allowed_tools)
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "question"]
 
 
 def test_file_tool_descriptions_are_loaded_into_schema() -> None:
@@ -160,6 +241,9 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
     registry.register(WriteFileTool(timeout_seconds=1))
     registry.register(EditFileTool(timeout_seconds=1))
     registry.register(WritePlanTool(timeout_seconds=1))
+    registry.register(TodoWriteTool(timeout_seconds=1))
+    registry.register(TodoReadTool(timeout_seconds=1))
+    registry.register(QuestionTool(timeout_seconds=1))
 
     schemas = registry.get_llm_tool_schemas()
 

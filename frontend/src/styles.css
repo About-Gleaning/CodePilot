@@ -1273,6 +1273,15 @@ pre {
     #090d0c;
 }
 
+.composer-question {
+  padding: 11px;
+  border: 1px solid rgba(71, 183, 156, 0.45);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(71, 183, 156, 0.09), rgba(9, 13, 12, 0.82)),
+    #090d0c;
+}
+
 .composer.has-approval {
   box-shadow: inset 0 1px 0 rgba(242, 187, 85, 0.18);
 }
@@ -1327,6 +1336,48 @@ pre {
 
 .composer-approval textarea {
   margin-top: 10px;
+}
+
+.question-list {
+  display: grid;
+  gap: 10px;
+}
+
+.question-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.question-fieldset legend {
+  margin-bottom: 8px;
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.question-options {
+  display: grid;
+  gap: 7px;
+}
+
+.question-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  color: #cedbd3;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.question-option input {
+  flex: 0 0 auto;
+}
+
+.question-fieldset textarea {
+  margin-top: 8px;
 }
 
 .workspace-strip {

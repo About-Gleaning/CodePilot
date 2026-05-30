@@ -11,6 +11,8 @@ class GatewayInputType(str, Enum):
 
     USER_MESSAGE = "user_message"
     HUMAN_REPLY = "human_reply"
+    QUESTION_REPLY = "question_reply"
+    QUESTION_DECLINE = "question_decline"
     STOP = "stop"
 
 
@@ -29,6 +31,8 @@ class GatewayInput(BaseModel):
     model: str | None = Field(default=None, description="本次执行使用的模型 ID，仅 user_message 类型必填。")
     approval_id: str | None = Field(default=None, description="待处理的人工审批请求 ID，仅 human_reply 类型必填。")
     approved: bool | None = Field(default=None, description="人工审批结果；true 表示同意，false 表示拒绝。")
+    question_id: str | None = Field(default=None, description="待处理的用户问题请求 ID，仅 question_reply/question_decline 类型必填。")
+    answers: dict[str, Any] | None = Field(default=None, description="用户对 question 工具问题的回答。")
     comment: str | None = Field(default=None, description="人工审批备注，用于记录同意或拒绝的补充说明。")
     metadata: dict[str, Any] = Field(default_factory=dict, description="预留扩展元数据，传递非核心输入上下文。")
 
@@ -49,4 +53,11 @@ class GatewayInput(BaseModel):
                 raise ValueError("human_reply 必须提供 approval_id")
             if self.approved is None:
                 raise ValueError("human_reply 必须提供 approved")
+        if self.type == GatewayInputType.QUESTION_REPLY:
+            if not self.question_id:
+                raise ValueError("question_reply 必须提供 question_id")
+            if self.answers is None:
+                raise ValueError("question_reply 必须提供 answers")
+        if self.type == GatewayInputType.QUESTION_DECLINE and not self.question_id:
+            raise ValueError("question_decline 必须提供 question_id")
         return self

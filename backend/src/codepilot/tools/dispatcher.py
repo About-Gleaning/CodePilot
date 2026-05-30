@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from codepilot.events import StreamEvent
 from codepilot.hooks import HookContext, HookManager, HookType, RuntimeHandles
 from codepilot.logging import get_logger
-from codepilot.session import AgentState, ApprovalRequest, AssistantMessageError, PendingApproval, SessionState
+from codepilot.session import AgentState, ApprovalRequest, AssistantMessageError, PendingApproval, PendingQuestion, QuestionRequest, SessionState
 from codepilot.session.message import ToolPart, ToolPartState
 from codepilot.tools.base import BaseTool, ToolExecutionContext
 from codepilot.tools.registry import ToolRegistry
@@ -19,6 +19,7 @@ from codepilot.utils import utc_now_iso
 class ToolExecutionBatch:
     tool_parts: list[ToolPart] = field(default_factory=list)
     pending_approval: PendingApproval | None = None
+    pending_question: PendingQuestion | None = None
 
 
 class ToolDispatcher:
@@ -40,23 +41,33 @@ class ToolDispatcher:
         for group in self._group_tool_calls(tool_calls):
             if any(not item["spec"].can_parallel for item in group):
                 for item in group:
-                    part, approval = await self._execute_one(session, workspace, agent, item, runtime, config)
+                    part, approval, question = await self._execute_one(session, workspace, agent, item, runtime, config)
                     if approval:
                         return ToolExecutionBatch(
                             tool_parts=result_parts,
                             pending_approval=PendingApproval(request=approval, source="tool", resume_item=item),
+                        )
+                    if question:
+                        return ToolExecutionBatch(
+                            tool_parts=result_parts,
+                            pending_question=PendingQuestion(request=question, source="tool", resume_item=item),
                         )
                     result_parts.append(part)
             else:
                 group_results = await asyncio.gather(
                     *[self._execute_one(session, workspace, agent, item, runtime, config) for item in group]
                 )
-                for part, approval in group_results:
+                for item, (part, approval, question) in zip(group, group_results, strict=False):
                     if approval:
                         pending_item = next(call for call in group if call["tool_name"] == approval.action.get("tool_name"))
                         return ToolExecutionBatch(
                             tool_parts=result_parts,
                             pending_approval=PendingApproval(request=approval, source="tool", resume_item=pending_item),
+                        )
+                    if question:
+                        return ToolExecutionBatch(
+                            tool_parts=result_parts,
+                            pending_question=PendingQuestion(request=question, source="tool", resume_item=item),
                         )
                     result_parts.append(part)
         return ToolExecutionBatch(tool_parts=result_parts)
@@ -75,7 +86,7 @@ class ToolDispatcher:
             tool = self._registry.get(item["tool_name"])
             item["tool"] = tool
             item["spec"] = tool.spec if tool else None
-        part, _ = await self._execute_one(session, workspace, agent, item, runtime, config, skip_approval=True)
+        part, _, _ = await self._execute_one(session, workspace, agent, item, runtime, config, skip_approval=True)
         return part
 
     def _group_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -110,20 +121,20 @@ class ToolDispatcher:
         runtime: RuntimeHandles,
         config: Any,
         skip_approval: bool = False,
-    ) -> tuple[ToolPart, ApprovalRequest | None]:
+    ) -> tuple[ToolPart, ApprovalRequest | None, QuestionRequest | None]:
         tool: BaseTool | None = item.get("tool")
         tool_name = item["tool_name"]
         tool_args = item.get("arguments", {})
         tool_call_id = item.get("tool_call_id")
 
         if tool is None:
-            return self._build_tool_part(tool_call_id, tool_name, self._missing_tool_result(tool_name)), None
+            return self._build_tool_part(tool_call_id, tool_name, self._missing_tool_result(tool_name)), None, None
 
         tool_context = ToolExecutionContext(session=session, workspace=workspace, agent=agent)
         if not skip_approval:
             preflight = await tool.preflight(tool_args, tool_context)
             if preflight.status == "blocked" and preflight.result is not None:
-                return self._build_tool_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None
+                return self._build_tool_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None, None
             if preflight.status == "requires_approval":
                 approval = ApprovalRequest(
                     approval_id=f"approval_tool_{tool_call_id}",
@@ -131,7 +142,7 @@ class ToolDispatcher:
                     action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
                     created_at=utc_now_iso(),
                 )
-                return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval
+                return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval, None
 
         if tool.spec.requires_approval and not skip_approval:
             approval = ApprovalRequest(
@@ -140,7 +151,7 @@ class ToolDispatcher:
                 action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
                 created_at=utc_now_iso(),
             )
-            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval
+            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval, None
 
         ctx = HookContext(
             hook_type=HookType.TOOL_BEFORE.value,
@@ -154,7 +165,7 @@ class ToolDispatcher:
         )
         hook_result = await self._hook_manager.run(HookType.TOOL_BEFORE, ctx)
         if hook_result.requires_human_input and hook_result.human_request:
-            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), hook_result.human_request
+            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), hook_result.human_request, None
 
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
@@ -175,6 +186,14 @@ class ToolDispatcher:
         except Exception as exc:  # noqa: BLE001
             self._logger.exception("tool failed", tool_name=tool_name, error=str(exc))
             result = self._error_result(tool_name, exc.__class__.__name__, str(exc))
+
+        if result.get("status") == "question_required":
+            question = QuestionRequest(
+                question_id=str(result.get("question_id") or f"question_tool_{tool_call_id}"),
+                questions=[question for question in result.get("questions", []) if isinstance(question, dict)],
+                created_at=utc_now_iso(),
+            )
+            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), None, question
 
         after_ctx = HookContext(
             hook_type=HookType.TOOL_AFTER.value,
@@ -197,7 +216,7 @@ class ToolDispatcher:
                 data={"tool_name": tool_name, "tool_call_id": tool_call_id, "result": result},
             )
         )
-        return self._build_tool_part(tool_call_id, tool_name, result, tool_args=tool_args), None
+        return self._build_tool_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
 
     def _build_pending_tool_part(self, tool_call_id: str | None, tool_name: str, tool_args: dict[str, Any]) -> ToolPart:
         return ToolPart(

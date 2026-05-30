@@ -5,7 +5,7 @@ from pathlib import Path
 
 from codepilot.config.settings import AppSettings, ContextModelThresholdSettings
 from codepilot.context import ContextCompressor, TOOL_RESULT_PLACEHOLDER
-from codepilot.events import SessionCompactedEvent
+from codepilot.events import SessionCompactedEvent, SessionMetaEvent
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import LLMState, Message, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
 from codepilot.utils import utc_now_iso
@@ -173,6 +173,19 @@ def test_session_compacted_record_replaces_replayed_messages(tmp_path: Path) -> 
         compacted_message = user_message("user_summary", "历史上下文摘要")
 
         await memory.handle_domain_event(
+            SessionMetaEvent(
+                session_id="session_1",
+                created_at=utc_now_iso(),
+                data={
+                    "title": "上下文压缩",
+                    "workspace_id": "ws_1",
+                    "workspace_path": "/tmp/codepilot",
+                    "initial_user_message_id": "user_1",
+                    "updated_at": utc_now_iso(),
+                },
+            )
+        )
+        await memory.handle_domain_event(
             SessionCompactedEvent(
                 session_id="session_1",
                 created_at=utc_now_iso(),
@@ -186,6 +199,7 @@ def test_session_compacted_record_replaces_replayed_messages(tmp_path: Path) -> 
         replay = await memory.replay("session_1")
 
         assert [message["info"]["id"] for message in replay["messages"]] == ["user_summary"]
-        assert replay["session"]["data"]["metadata"]["context_compression"]["summary_message_id"] == "user_summary"
+        compacted_record = next(record for record in replay["records"] if record["record_type"] == "session_compacted")
+        assert compacted_record["data"]["metadata"]["context_compression"]["summary_message_id"] == "user_summary"
 
     asyncio.run(run_case())

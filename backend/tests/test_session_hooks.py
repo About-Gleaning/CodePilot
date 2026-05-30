@@ -9,11 +9,13 @@ from codepilot.config import AppSettings, build_llm_runtime_settings
 from codepilot.config.settings import LLMProviderSettings, LLMSettings
 from codepilot.context import CompressionResult
 from codepilot.events import EventBus
-from codepilot.hooks import BaseHook, HookContext, HookManager, HookResult, HookType, RuntimeHandles, SessionTitleHook
+from codepilot.hooks import BaseHook, HookContext, HookManager, HookResult, HookType, RuntimeHandles
+from codepilot.main import _build_hook_manager
 from codepilot.session import (
     AgentLoop,
     ApprovalResult,
     Message,
+    QuestionResult,
     SessionState,
     SessionStatus,
     TextPart,
@@ -22,7 +24,8 @@ from codepilot.session import (
 )
 from codepilot.session.agents import AgentProfile
 from codepilot.session.message import ToolPartState
-from codepilot.tools import BaseTool, ToolDispatcher, ToolRegistry, ToolSpec
+from codepilot.session.title import SessionTitleService
+from codepilot.tools import BaseTool, QuestionTool, ToolDispatcher, ToolRegistry, ToolSpec
 from codepilot.tools.base import ToolExecutionContext
 
 
@@ -37,27 +40,6 @@ def build_settings() -> AppSettings:
     )
     settings = AppSettings(llm=llm_settings)
     runtime = build_llm_runtime_settings(settings.llm, environ={"OPENAI_API_KEY": "sk-openai"})
-    return settings.model_copy(update={"llm_runtime": runtime})
-
-
-def build_qwen_settings() -> AppSettings:
-    llm_settings = LLMSettings(
-        providers={
-            "qwen": LLMProviderSettings(
-                label="Qwen",
-                models=["qwen-plus"],
-                litellm_model_prefix="openai/",
-            )
-        }
-    )
-    settings = AppSettings(llm=llm_settings)
-    runtime = build_llm_runtime_settings(
-        settings.llm,
-        environ={
-            "QWEN_API_KEY": "sk-qwen",
-            "QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        },
-    )
     return settings.model_copy(update={"llm_runtime": runtime})
 
 
@@ -171,9 +153,11 @@ class StubTitleLLMClient:
         self.response = response
         self.error = error
         self.calls = 0
+        self.last_kwargs: dict[str, object] = {}
 
-    async def complete_text(self, **_kwargs: object) -> str:
+    async def complete_text(self, **kwargs: object) -> str:
         self.calls += 1
+        self.last_kwargs = kwargs
         if self.error:
             raise self.error
         return self.response
@@ -204,43 +188,40 @@ class StubToolDispatcher:
         raise AssertionError("当前测试不应执行审批后的工具调用")
 
 
-def build_title_hook_context(session: SessionState, event_bus: RecordingEventBus | None = None) -> HookContext:
-    return HookContext(
-        hook_type=HookType.SESSION_BEFORE.value,
-        session=session,
-        workspace=SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot")),
-        agent=SimpleNamespace(name="build"),
-        messages=session.messages,
-        current_message=session.messages[-1] if session.messages else None,
-        config=build_qwen_settings(),
-        runtime=RuntimeHandles(event_bus=event_bus or RecordingEventBus()),
-    )
-
-
-def test_session_title_hook_generates_title_for_first_user_message(monkeypatch: Any) -> None:
+def test_session_title_service_generates_title_for_first_user_message(monkeypatch: Any) -> None:
     client = StubTitleLLMClient(response="《这是一个非常非常长的会话标题应该被截断并继续超过限制》")
-    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    monkeypatch.setattr("codepilot.session.title.LiteLLMClient", lambda: client)
     session = build_session()
     event_bus = RecordingEventBus()
-    hook = SessionTitleHook(
-        hook_id="session-title",
-        hook_type=HookType.SESSION_BEFORE,
-        name="session_title",
-    )
+    service = SessionTitleService()
 
-    result = asyncio.run(hook.execute(build_title_hook_context(session, event_bus)))
+    asyncio.run(service.generate_for_session(session, event_bus))
 
-    assert result.status == "ok"
     assert client.calls == 1
-    assert session.title == "这是一个非常非常长的会话标题应该被截断并"
-    assert len(session.title) == 20
-    assert event_bus.domain_events[0].data["title"] == "这是一个非常非常长的会话标题应该被截断并"
+    assert session.title == "这是一个非常非常长的会话标题应"
+    assert len(session.title) == 15
+    assert event_bus.domain_events[0].data["title"] == "这是一个非常非常长的会话标题应"
+    assert event_bus.domain_events[0].event_type.value == "session_meta"
     assert event_bus.stream_events[0].event_type == "session_title_updated"
 
 
-def test_session_title_hook_runs_only_on_first_user_message(monkeypatch: Any) -> None:
+def test_session_title_service_uses_fixed_qwen_model(monkeypatch: Any) -> None:
     client = StubTitleLLMClient()
-    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    monkeypatch.setattr("codepilot.session.title.LiteLLMClient", lambda: client)
+    session = build_session()
+    service = SessionTitleService()
+
+    asyncio.run(service.generate_for_session(session, RecordingEventBus()))
+
+    llm_state = client.last_kwargs["llm_state"]
+    assert llm_state.provider == "qwen"
+    assert llm_state.model == "qwen3.5-flash"
+    assert llm_state.metadata["litellm_model_prefix"] == "openai/"
+
+
+def test_session_title_service_runs_only_on_first_user_message(monkeypatch: Any) -> None:
+    client = StubTitleLLMClient()
+    monkeypatch.setattr("codepilot.session.title.LiteLLMClient", lambda: client)
     session = build_session()
     session.messages.append(
         Message(
@@ -255,55 +236,34 @@ def test_session_title_hook_runs_only_on_first_user_message(monkeypatch: Any) ->
             parts=[TextPart(text="继续补充")],
         )
     )
-    hook = SessionTitleHook(
-        hook_id="session-title",
-        hook_type=HookType.SESSION_BEFORE,
-        name="session_title",
-    )
+    service = SessionTitleService()
 
-    asyncio.run(hook.execute(build_title_hook_context(session)))
+    asyncio.run(service.generate_for_session(session, RecordingEventBus()))
 
     assert client.calls == 0
     assert session.title is None
 
 
-def test_session_title_hook_failure_does_not_block_session(monkeypatch: Any) -> None:
+def test_session_title_service_failure_does_not_block_session(monkeypatch: Any) -> None:
     client = StubTitleLLMClient(error=RuntimeError("title failed"))
-    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
+    monkeypatch.setattr("codepilot.session.title.LiteLLMClient", lambda: client)
     session = build_session()
-    hook = SessionTitleHook(
-        hook_id="session-title",
-        hook_type=HookType.SESSION_BEFORE,
-        name="session_title",
-    )
+    service = SessionTitleService()
 
-    result = asyncio.run(hook.execute(build_title_hook_context(session)))
+    asyncio.run(service.generate_for_session(session, RecordingEventBus()))
 
-    assert result.status == "ok"
     assert client.calls == 1
     assert session.title is None
     assert session.status == SessionStatus.RUNNING
 
 
-def test_session_title_hook_is_dispatched_once_per_session(monkeypatch: Any) -> None:
-    client = StubTitleLLMClient(error=RuntimeError("title failed"))
-    monkeypatch.setattr("codepilot.hooks.session_title.LiteLLMClient", lambda: client)
-    session = build_session()
-    manager = HookManager()
-    manager.register(
-        SessionTitleHook(
-            hook_id="session-title",
-            hook_type=HookType.SESSION_BEFORE,
-            name="session_title",
-            run_once_per_session=True,
-        )
-    )
+def test_builtin_session_title_hook_is_not_registered() -> None:
+    settings = AppSettings()
+    manager = _build_hook_manager(settings)
 
-    asyncio.run(manager.run(HookType.SESSION_BEFORE, build_title_hook_context(session)))
-    asyncio.run(manager.run(HookType.SESSION_BEFORE, build_title_hook_context(session)))
+    title_hooks = [hook for hook in manager.get_hooks(HookType.SESSION_BEFORE) if hook.hook_id == "session-title-hook"]
 
-    assert client.calls == 1
-    assert session.metadata["hook_once"]["session-title"]
+    assert title_hooks == []
 
 
 def test_agent_loop_runs_session_hooks_around_loop() -> None:
@@ -721,6 +681,41 @@ class ContinueToolCallLiteLLMClient(StubLiteLLMClient):
         )
 
 
+class QuestionToolCallLiteLLMClient(StubLiteLLMClient):
+    async def stream_chat(
+        self,
+        session: SessionState,
+        llm_state: Any,
+        provider_messages: list[Any],
+        tools: list[dict[str, Any]],
+        event_bus: EventBus,
+    ) -> Any:
+        self.calls += 1
+        self.last_provider_messages = provider_messages
+        if self.calls == 1:
+            return SimpleNamespace(
+                text="需要澄清",
+                reasoning="",
+                tool_calls=[
+                    {
+                        "tool_call_id": "call_question_1",
+                        "tool_name": "question",
+                        "arguments": {
+                            "questions": [
+                                {
+                                    "id": "target",
+                                    "question": "请选择目标",
+                                    "options": [{"value": "backend", "label": "后端"}],
+                                    "custom": True,
+                                }
+                            ]
+                        },
+                    }
+                ],
+            )
+        return SimpleNamespace(text="收到答案", reasoning="", tool_calls=[])
+
+
 class ContinueToolDispatcher(StubToolDispatcher):
     async def execute_tool_calls(self, **kwargs: Any) -> Any:
         tool_calls = kwargs["tool_calls"]
@@ -738,6 +733,7 @@ class ContinueToolDispatcher(StubToolDispatcher):
                 for tool_call in tool_calls
             ],
             pending_approval=None,
+            pending_question=None,
         )
 
 
@@ -884,6 +880,134 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
     assert session.messages[-1].info.role == "user"
     assert session.messages[-1].info.agent == "build"
     assert session.messages[-2].tool_parts()[0].state.status == "pending"
+
+
+def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(QuestionTool(timeout_seconds=1))
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    llm_client = QuestionToolCallLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    question_event = asyncio.Event()
+    question_result_holder = {"result": None}
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    async def reply_question() -> SessionState:
+        task = asyncio.create_task(
+            loop.run(
+                session=session,
+                workspace=workspace,
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["question"], max_iterations=3),
+                runtime=runtime,
+                config=settings,
+                approval_event=asyncio.Event(),
+                approval_result_holder={"result": None},
+                stop_event=asyncio.Event(),
+                question_event=question_event,
+                question_result_holder=question_result_holder,
+            )
+        )
+        while not any(event.event_type == "human_question_required" for event in stream_events):
+            await asyncio.sleep(0)
+        request = next(event.data for event in stream_events if event.event_type == "human_question_required")
+        question_result_holder["result"] = QuestionResult(
+            question_id=request["question_id"],
+            answers={"target": {"values": ["backend"], "custom": ""}},
+            created_at="2026-04-30T00:00:01Z",
+        )
+        question_event.set()
+        return await task
+
+    result = asyncio.run(reply_question())
+
+    assert result.status == SessionStatus.COMPLETED
+    assert llm_client.calls == 2
+    assert "human_approval_required" not in [event.event_type for event in stream_events]
+    assert [event.event_type for event in stream_events].count("human_question_required") == 1
+    assert [event.event_type for event in stream_events].count("human_question_resolved") == 1
+    question_message = result.messages[-2]
+    question_part = question_message.tool_parts()[0]
+    assert question_part.tool == "question"
+    assert question_part.state.status == "completed"
+    assert question_part.state.output["answers"]["target"]["values"] == ["backend"]
+    assert any(
+        isinstance(message, Message)
+        and message.tool_parts()
+        and message.tool_parts()[0].state.output["tool_name"] == "question"
+        for message in llm_client.last_provider_messages
+    )
+
+
+def test_agent_loop_question_decline_appends_user_message_and_stops() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(QuestionTool(timeout_seconds=1))
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    llm_client = QuestionToolCallLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    question_event = asyncio.Event()
+    question_result_holder = {"result": None}
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    async def decline_question() -> SessionState:
+        task = asyncio.create_task(
+            loop.run(
+                session=session,
+                workspace=workspace,
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["question"], max_iterations=3),
+                runtime=runtime,
+                config=settings,
+                approval_event=asyncio.Event(),
+                approval_result_holder={"result": None},
+                stop_event=asyncio.Event(),
+                question_event=question_event,
+                question_result_holder=question_result_holder,
+            )
+        )
+        while not any(event.event_type == "human_question_required" for event in stream_events):
+            await asyncio.sleep(0)
+        request = next(event.data for event in stream_events if event.event_type == "human_question_required")
+        question_result_holder["result"] = QuestionResult(
+            question_id=request["question_id"],
+            declined=True,
+            created_at="2026-04-30T00:00:01Z",
+        )
+        question_event.set()
+        return await task
+
+    result = asyncio.run(decline_question())
+
+    assert result.status == SessionStatus.COMPLETED
+    assert llm_client.calls == 1
+    assert result.messages[-1].info.role == "user"
+    assert "用户拒绝回答 question 工具提出的问题" in result.messages[-1].text_content()
+    assert result.messages[-2].tool_parts()[0].state.status == "pending"
+    resolved = next(event for event in stream_events if event.event_type == "human_question_resolved")
+    assert resolved.data["declined"] is True
+    assert resolved.data["continue_loop"] is False
 
 
 def test_agent_loop_appends_assistant_message_when_max_iterations_exceeded() -> None:

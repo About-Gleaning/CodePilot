@@ -19,7 +19,19 @@ from .message import (
     build_assistant_message_info,
     build_user_message_info,
 )
-from .state import AgentState, ApprovalRequest, ApprovalResult, LLMState, PendingApproval, SessionState, SessionStatus, StopRequest
+from .state import (
+    AgentState,
+    ApprovalRequest,
+    ApprovalResult,
+    LLMState,
+    PendingApproval,
+    PendingQuestion,
+    QuestionRequest,
+    QuestionResult,
+    SessionState,
+    SessionStatus,
+    StopRequest,
+)
 
 if TYPE_CHECKING:
     from .agents import AgentProfile
@@ -43,6 +55,9 @@ __all__ = [
     "MessageModelRef",
     "MessagePart",
     "PendingApproval",
+    "PendingQuestion",
+    "QuestionRequest",
+    "QuestionResult",
     "SessionRunner",
     "SessionState",
     "SessionStatus",

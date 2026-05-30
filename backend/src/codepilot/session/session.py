@@ -8,6 +8,7 @@ from __future__ import annotations
 3. 把人工审批委托给 ApprovalCoordinator，统一审批事件与拒绝消息处理。
 """
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,9 +17,9 @@ from codepilot.hooks import HookManager, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
-from codepilot.session.flow import ApprovalCoordinator, SessionMessageAppender, TurnExecutor, TurnResult
-from codepilot.session.message import AssistantMessageInfo, ToolPart
-from codepilot.session.state import AgentState, ApprovalResult, LLMState, PendingApproval, SessionState, SessionStatus
+from codepilot.session.flow import ApprovalCoordinator, QuestionCoordinator, SessionMessageAppender, TurnExecutor, TurnResult
+from codepilot.session.message import AssistantMessageInfo, ToolPart, ToolPartState
+from codepilot.session.state import AgentState, ApprovalResult, LLMState, PendingApproval, PendingQuestion, QuestionResult, SessionState, SessionStatus
 from codepilot.tools import ToolDispatcher, ToolRegistry
 from codepilot.utils import utc_now_iso, utc_now_millis
 
@@ -34,6 +35,8 @@ class _RunContext:
     config: Any
     approval_event: Any
     approval_result_holder: dict[str, ApprovalResult | None]
+    question_event: Any
+    question_result_holder: dict[str, QuestionResult | None]
     stop_event: Any
     agent_state: AgentState
     llm_state: LLMState
@@ -70,6 +73,7 @@ class AgentLoop:
         self._hook_manager = hook_manager
         self._message_appender = SessionMessageAppender()
         self._approval_coordinator = ApprovalCoordinator(message_appender=self._message_appender)
+        self._question_coordinator = QuestionCoordinator(message_appender=self._message_appender)
         self._turn_executor = TurnExecutor(
             llm_client=llm_client,
             tool_registry=tool_registry,
@@ -89,6 +93,8 @@ class AgentLoop:
         approval_event: Any,
         approval_result_holder: dict[str, ApprovalResult | None],
         stop_event: Any,
+        question_event: Any | None = None,
+        question_result_holder: dict[str, QuestionResult | None] | None = None,
     ) -> SessionState:
         """执行一次完整会话，直到完成、失败、取消或被人工拒绝。
 
@@ -103,6 +109,8 @@ class AgentLoop:
             config=config,
             approval_event=approval_event,
             approval_result_holder=approval_result_holder,
+            question_event=question_event,
+            question_result_holder=question_result_holder or {"result": None},
             stop_event=stop_event,
             agent_state=self._build_agent_state(session, agent_profile),
             llm_state=self._build_llm_state(session, config),
@@ -236,6 +244,8 @@ class AgentLoop:
         if turn_result.status == "failed":
             ctx.session.status = SessionStatus.FAILED
             return False
+        if turn_result.status == "needs_question" and turn_result.pending_question is not None:
+            return await self._handle_pending_question(ctx, turn_result.pending_question, iteration)
         if turn_result.status != "needs_approval" or turn_result.pending_approval is None:
             return True
 
@@ -266,6 +276,29 @@ class AgentLoop:
         await self._resume_approved_tool_call(ctx, approval)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
+    async def _handle_pending_question(
+        self,
+        ctx: _RunContext,
+        question: PendingQuestion,
+        iteration: int,
+    ) -> bool:
+        """处理 question 工具等待；回答后回填工具结果，拒答后结束当前 run。"""
+        result = await self._wait_for_question(ctx, question)
+        if result is None or result.declined:
+            return False
+        if question.resume_item is None:
+            return True
+        self._merge_question_result(ctx.session, question, result)
+        await ctx.runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="assistant_message_completed",
+                session_id=ctx.session.session_id,
+                created_at=utc_now_iso(),
+                data={"message": ctx.session.messages[-1].model_dump()},
+            )
+        )
+        return await self._run_loop_after_approved_tool(ctx, iteration)
+
     async def _wait_for_approval(self, ctx: _RunContext, approval: PendingApproval) -> ApprovalResult | None:
         return await self._approval_coordinator.wait(
             session=ctx.session,
@@ -274,6 +307,16 @@ class AgentLoop:
             runtime=ctx.runtime,
             approval_event=ctx.approval_event,
             approval_result_holder=ctx.approval_result_holder,
+        )
+
+    async def _wait_for_question(self, ctx: _RunContext, question: PendingQuestion) -> QuestionResult | None:
+        return await self._question_coordinator.wait(
+            session=ctx.session,
+            question=question,
+            agent_state=ctx.agent_state,
+            runtime=ctx.runtime,
+            question_event=ctx.question_event,
+            question_result_holder=ctx.question_result_holder,
         )
 
     def _is_rejected(self, result: ApprovalResult | None) -> bool:
@@ -414,3 +457,40 @@ class AgentLoop:
         # 工具结果补齐后，把消息完成时间和结束原因同步更新，方便前端正确展示状态。
         latest_message.info.time.completed = utc_now_millis()
         latest_message.info.finish = "tool_completed"
+
+    def _merge_question_result(self, session: SessionState, question: PendingQuestion, result: QuestionResult) -> None:
+        """把用户答案作为原 question 工具调用结果回填，供下一轮 LLM 以 tool 消息读取。"""
+        if not session.messages or question.resume_item is None:
+            return
+        latest_message = session.messages[-1]
+        if latest_message.info.role != "assistant":
+            return
+        call_id = question.resume_item.get("tool_call_id")
+        output = {
+            "status": "ok",
+            "tool_name": "question",
+            "question_id": result.question_id,
+            "answers": result.answers,
+            "output": self._summarize_question_answers(result.answers),
+        }
+        for index, part in enumerate(latest_message.parts):
+            if isinstance(part, ToolPart) and part.call_id == call_id:
+                latest_message.parts[index] = ToolPart(
+                    call_id=part.call_id,
+                    tool=part.tool,
+                    state=ToolPartState(
+                        status="completed",
+                        input=part.state.input,
+                        output=output,
+                        time=part.state.time,
+                    ),
+                )
+                assert isinstance(latest_message.info, AssistantMessageInfo)
+                latest_message.info.time.completed = utc_now_millis()
+                latest_message.info.finish = "tool_completed"
+                return
+
+    def _summarize_question_answers(self, answers: dict[str, Any]) -> str:
+        if not answers:
+            return "用户未提供具体答案。"
+        return "用户已回答 question 工具提出的问题：" + json.dumps(answers, ensure_ascii=False)

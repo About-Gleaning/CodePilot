@@ -10,6 +10,7 @@ from .definitions import (
     MessageCreatedEvent,
     SessionCompactedEvent,
     SessionLifecycleEvent,
+    SessionMetaEvent,
     StreamEvent,
 )
 
@@ -20,5 +21,6 @@ __all__ = [
     "MessageCreatedEvent",
     "SessionCompactedEvent",
     "SessionLifecycleEvent",
+    "SessionMetaEvent",
     "StreamEvent",
 ]

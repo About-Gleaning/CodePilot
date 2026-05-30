@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot.events import MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent
+from codepilot.events import EventBus, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, build_user_message_info
+from codepilot.session.title import SessionTitleService
 from codepilot.utils import utc_now_iso
 
 
@@ -42,6 +43,20 @@ def build_session(session_id: str, status: SessionStatus = SessionStatus.COMPLET
 
 
 async def persist_session(memory: JsonlSessionMemory, session: SessionState, messages: list[Message]) -> None:
+    first_message_id = messages[0].info.id if messages else ""
+    await memory.handle_domain_event(
+        SessionMetaEvent(
+            session_id=session.session_id,
+            created_at=session.created_at,
+            data={
+                "title": session.title or first_message_id or session.session_id,
+                "workspace_id": session.workspace_id,
+                "workspace_path": session.workspace_path,
+                "initial_user_message_id": first_message_id,
+                "updated_at": session.updated_at,
+            },
+        )
+    )
     await memory.handle_domain_event(
         SessionLifecycleEvent(
             session_id=session.session_id,
@@ -66,14 +81,41 @@ def write_jsonl(path, records: list[dict]) -> None:
 
 
 def session_record(session: SessionState, created_at: str, status: SessionStatus | None = None) -> dict:
-    data = session.model_dump(exclude={"messages"})
-    if status is not None:
-        data["status"] = status.value
+    status_value = (status or session.status).value
+    record_type = "session_status_changed"
+    if status_value == SessionStatus.RUNNING.value:
+        record_type = "session_started"
+    if status_value in {SessionStatus.COMPLETED.value, SessionStatus.CANCELLED.value}:
+        record_type = "session_finished"
+    if status_value == SessionStatus.FAILED.value:
+        record_type = "session_failed"
+    data = {
+        "status": status_value,
+        "agent_name": session.agent_name,
+        "provider": session.provider,
+        "model": session.model,
+        "updated_at": created_at,
+    }
     return {
-        "record_type": "session_finished",
+        "record_type": record_type,
         "session_id": session.session_id,
         "created_at": created_at,
         "data": data,
+    }
+
+
+def meta_record(session: SessionState, created_at: str, title: str = "默认标题", initial_message_id: str = "msg_1") -> dict:
+    return {
+        "record_type": "session_meta",
+        "session_id": session.session_id,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "data": {
+            "title": title,
+            "workspace_id": session.workspace_id,
+            "workspace_path": session.workspace_path,
+            "initial_user_message_id": initial_message_id,
+        },
     }
 
 
@@ -85,6 +127,16 @@ def message_record(message: Message, created_at: str) -> dict:
         "created_at": created_at,
         "data": message.model_dump(),
     }
+
+
+class StubTitleLLMClient:
+    """固定返回标题，避免测试依赖真实 LLM 网络与密钥。"""
+
+    def __init__(self, response: str) -> None:
+        self.response = response
+
+    async def complete_text(self, **_: object) -> str:
+        return self.response
 
 
 def test_list_sessions_returns_summaries_sorted_by_latest_update(tmp_path) -> None:
@@ -122,6 +174,126 @@ def test_list_sessions_returns_generated_title(tmp_path) -> None:
     asyncio.run(run_case())
 
 
+def test_session_meta_is_first_record_and_lifecycle_is_compact(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.RUNNING)
+        message = build_message("session_1", "msg_1", "默认标题来源")
+
+        await persist_session(memory, session, [message])
+
+        records = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+        assert records[0]["record_type"] == "session_meta"
+        assert records[0]["data"]["workspace_id"] == "ws_1"
+        assert "agent_name" not in records[0]["data"]
+        assert "provider" not in records[0]["data"]
+        assert "model" not in records[0]["data"]
+        assert "metadata" not in records[0]["data"]
+        assert records[1]["record_type"] == "session_started"
+        assert records[1]["data"] == {
+            "status": "RUNNING",
+            "agent_name": "build",
+            "provider": "openai",
+            "model": "gpt-5.3-codex",
+            "updated_at": session.updated_at,
+        }
+
+    asyncio.run(run_case())
+
+
+def test_session_meta_title_update_rewrites_first_record(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.RUNNING)
+
+        await persist_session(memory, session, [build_message("session_1", "msg_1", "用户输入很长")])
+        await memory.handle_domain_event(
+            SessionMetaEvent(
+                session_id=session.session_id,
+                created_at="2026-05-29T10:02:00Z",
+                data={"title": "LLM 生成标题", "updated_at": "2026-05-29T10:02:00Z"},
+            )
+        )
+
+        records = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+        assert records[0]["record_type"] == "session_meta"
+        assert records[0]["data"]["title"] == "LLM 生成标题"
+        assert [record["record_type"] for record in records].count("session_started") == 1
+        assert memory.list_sessions()[0]["title"] == "LLM 生成标题"
+
+    asyncio.run(run_case())
+
+
+def test_session_title_service_updates_jsonl_session_meta_title(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run_case() -> None:
+        monkeypatch.setattr("codepilot.session.title.LiteLLMClient", lambda: StubTitleLLMClient("LLM生成标题"))
+        memory = JsonlSessionMemory(tmp_path)
+        event_bus = EventBus()
+        event_bus.subscribe_domain(memory.handle_domain_event)
+        session = build_session("session_1", status=SessionStatus.RUNNING)
+        message = build_message("session_1", "msg_1", "请帮我修复会话标题没有写回jsonl的问题")
+        session.messages.append(message)
+
+        await event_bus.publish_domain_event(
+            SessionMetaEvent(
+                session_id=session.session_id,
+                created_at=session.created_at,
+                data={
+                    "title": "请帮我修复会话标题没有",
+                    "workspace_id": session.workspace_id,
+                    "workspace_path": session.workspace_path,
+                    "initial_user_message_id": message.info.id,
+                    "updated_at": session.updated_at,
+                },
+            )
+        )
+
+        await SessionTitleService().generate_for_session(session, event_bus)
+
+        records = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+        assert records[0]["record_type"] == "session_meta"
+        assert records[0]["data"]["title"] == "LLM生成标题"
+        assert [record["record_type"] for record in records].count("session_meta") == 1
+        assert memory.list_sessions()[0]["title"] == "LLM生成标题"
+
+    asyncio.run(run_case())
+
+
+def test_domain_event_bus_persists_session_meta_before_lifecycle(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.RUNNING)
+        bus = EventBus()
+        bus.subscribe_domain(memory.handle_domain_event)
+
+        await bus.publish_domain_event(
+            SessionMetaEvent(
+                session_id=session.session_id,
+                created_at=session.created_at,
+                data={
+                    "title": "默认标题",
+                    "workspace_id": session.workspace_id,
+                    "workspace_path": session.workspace_path,
+                    "initial_user_message_id": "msg_1",
+                    "updated_at": session.updated_at,
+                },
+            )
+        )
+        await bus.publish_domain_event(
+            SessionLifecycleEvent(
+                session_id=session.session_id,
+                status=session.status.value,
+                created_at=session.created_at,
+                data=session.model_dump(exclude={"messages"}),
+            )
+        )
+
+        records = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+        assert [record["record_type"] for record in records] == ["session_meta", "session_started"]
+
+    asyncio.run(run_case())
+
+
 def test_list_sessions_merges_same_session_across_days(tmp_path) -> None:
     session = build_session("session_1")
     first_message = build_message("session_1", "msg_1", "第一天需求")
@@ -129,6 +301,7 @@ def test_list_sessions_merges_same_session_across_days(tmp_path) -> None:
     write_jsonl(
         tmp_path / "2026-05-28-session_1.jsonl",
         [
+            meta_record(session, "2026-05-28T10:00:00Z", title="跨天会话", initial_message_id="msg_1"),
             session_record(session, "2026-05-28T10:00:00Z", SessionStatus.RUNNING),
             message_record(first_message, "2026-05-28T10:01:00Z"),
         ],
@@ -156,6 +329,7 @@ def test_replay_merges_same_session_across_days(tmp_path) -> None:
     write_jsonl(
         tmp_path / "2026-05-28-session_1.jsonl",
         [
+            meta_record(session, "2026-05-28T10:00:00Z", title="跨天会话", initial_message_id="msg_1"),
             session_record(session, "2026-05-28T10:00:00Z", SessionStatus.RUNNING),
             message_record(first_message, "2026-05-28T10:01:00Z"),
         ],
@@ -172,7 +346,7 @@ def test_replay_merges_same_session_across_days(tmp_path) -> None:
 
     assert replay["session"]["session_id"] == "session_1"
     assert [Message.model_validate(item).text_content() for item in replay["messages"]] == ["第一天需求", "第二天继续"]
-    assert len(replay["records"]) == 4
+    assert len(replay["records"]) == 5
 
 
 def test_replay_without_session_id_uses_latest_record_time(tmp_path) -> None:
@@ -181,6 +355,7 @@ def test_replay_without_session_id_uses_latest_record_time(tmp_path) -> None:
     write_jsonl(
         tmp_path / "2026-05-28-session_1.jsonl",
         [
+            meta_record(old_named_session, "2026-05-28T10:00:00Z", title="旧文件新内容", initial_message_id="msg_1"),
             session_record(old_named_session, "2026-05-28T10:00:00Z", SessionStatus.RUNNING),
             message_record(build_message("session_1", "msg_1", "实际最新会话"), "2026-05-30T10:00:00Z"),
         ],
@@ -188,6 +363,7 @@ def test_replay_without_session_id_uses_latest_record_time(tmp_path) -> None:
     write_jsonl(
         tmp_path / "2026-05-29-session_2.jsonl",
         [
+            meta_record(newer_named_session, "2026-05-29T10:00:00Z", title="新文件旧内容", initial_message_id="msg_2"),
             session_record(newer_named_session, "2026-05-29T10:00:00Z", SessionStatus.COMPLETED),
             message_record(build_message("session_2", "msg_2", "文件名更新但内容较旧"), "2026-05-29T10:01:00Z"),
         ],
@@ -203,7 +379,7 @@ def test_handle_domain_event_reuses_existing_session_file(tmp_path) -> None:
         memory = JsonlSessionMemory(tmp_path)
         session = build_session("session_1")
         old_path = tmp_path / "2026-05-28-session_1.jsonl"
-        write_jsonl(old_path, [session_record(session, "2026-05-28T10:00:00Z")])
+        write_jsonl(old_path, [meta_record(session, "2026-05-28T10:00:00Z"), session_record(session, "2026-05-28T10:00:00Z")])
 
         await memory.handle_domain_event(
             MessageCreatedEvent(
@@ -215,7 +391,7 @@ def test_handle_domain_event_reuses_existing_session_file(tmp_path) -> None:
         )
 
         assert [path.name for path in tmp_path.glob("*.jsonl")] == ["2026-05-28-session_1.jsonl"]
-        assert len(old_path.read_text(encoding="utf-8").splitlines()) == 2
+        assert len(old_path.read_text(encoding="utf-8").splitlines()) == 3
 
     asyncio.run(run_case())
 

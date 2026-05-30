@@ -27,6 +27,7 @@ class EventBus:
         self._emitter = AsyncIOEventEmitter()
         self._logger = get_logger("codepilot.events")
         self._stream_subscribers: set[asyncio.Queue[StreamEvent]] = set()
+        self._domain_subscribers: list[DomainSubscriber] = []
         self._seq = 0
 
     def subscribe_stream(self, subscriber: StreamSubscriber) -> None:
@@ -35,7 +36,7 @@ class EventBus:
 
     def subscribe_domain(self, subscriber: DomainSubscriber) -> None:
         """注册领域事件订阅者。"""
-        self._emitter.on("domain", self._safe_wrapper(subscriber, "domain"))
+        self._domain_subscribers.append(subscriber)
 
     async def publish_stream_event(self, event: StreamEvent) -> StreamEvent:
         """发布流式事件，并同步推送到所有已创建的流式消费队列。"""
@@ -52,7 +53,8 @@ class EventBus:
 
     async def publish_domain_event(self, event: DomainEvent) -> DomainEvent:
         """发布领域事件。"""
-        self._emitter.emit("domain", event)
+        for subscriber in list(self._domain_subscribers):
+            await self._run_subscriber(subscriber, event, "domain")
         return event
 
     def create_stream_queue(self) -> asyncio.Queue[StreamEvent]:
@@ -78,12 +80,15 @@ class EventBus:
 
         async def _runner(event: Any) -> None:
             """执行订阅者，并兼容同步与异步两种回调形式。"""
-            try:
-                result = subscriber(event)
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception as exc:  # noqa: BLE001
-                # 订阅者异常只记录日志，不向上冒泡，保证事件总线继续工作。
-                self._logger.exception("event subscriber failed", channel=channel, error=str(exc))
+            await self._run_subscriber(subscriber, event, channel)
 
         return _runner
+
+    async def _run_subscriber(self, subscriber: Callable[..., Awaitable[None] | None], event: Any, channel: str) -> None:
+        """执行订阅者并隔离异常，保证单个订阅失败不影响后续分发。"""
+        try:
+            result = subscriber(event)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("event subscriber failed", channel=channel, error=str(exc))

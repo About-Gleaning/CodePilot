@@ -95,6 +95,29 @@ type ApprovalRequest = {
   action?: Record<string, unknown>;
 };
 
+type QuestionOption = {
+  value: string;
+  label: string;
+};
+
+type QuestionItem = {
+  id: string;
+  question: string;
+  multiple?: boolean;
+  custom?: boolean;
+  options: QuestionOption[];
+};
+
+type QuestionRequest = {
+  question_id: string;
+  questions: QuestionItem[];
+};
+
+type QuestionAnswer = {
+  values: string[];
+  custom: string;
+};
+
 type SelectOption = {
   value: string;
   label: string;
@@ -116,6 +139,8 @@ const EVENT_LABELS: Record<string, string> = {
   context_compacted: '上下文压缩',
   human_approval_required: '需要人工确认',
   human_approval_resolved: '人工确认已处理',
+  human_question_required: '需要用户回答',
+  human_question_resolved: '用户回答已处理',
   error: '错误',
 };
 
@@ -131,6 +156,8 @@ const KEY_EVENT_TYPES = new Set([
   'context_compacted',
   'human_approval_required',
   'human_approval_resolved',
+  'human_question_required',
+  'human_question_resolved',
   'error',
 ]);
 
@@ -178,6 +205,8 @@ function App() {
   const [formError, setFormError] = useState('');
   const [approvalComment, setApprovalComment] = useState('');
   const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
+  const [questionRequest, setQuestionRequest] = useState<QuestionRequest | null>(null);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, QuestionAnswer>>({});
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
@@ -193,6 +222,20 @@ function App() {
       eventSourceRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (!questionRequest) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        void handleQuestionDecline();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [questionRequest]);
 
   async function bootstrap() {
     try {
@@ -265,6 +308,15 @@ function App() {
     if (event.event_type === 'human_approval_resolved') {
       setApprovalRequest(null);
       setApprovalComment('');
+    }
+    if (event.event_type === 'human_question_required') {
+      const request = event.data as QuestionRequest;
+      setQuestionRequest(request);
+      setQuestionAnswers(initQuestionAnswers(request));
+    }
+    if (event.event_type === 'human_question_resolved') {
+      setQuestionRequest(null);
+      setQuestionAnswers({});
     }
     if (
       event.event_type === 'session_started' ||
@@ -355,6 +407,8 @@ function App() {
     setLiveDelta('');
     setApprovalRequest(null);
     setApprovalComment('');
+    setQuestionRequest(null);
+    setQuestionAnswers({});
     setFormError('');
   }
 
@@ -373,6 +427,8 @@ function App() {
       setLiveDelta('');
       setApprovalRequest(null);
       setApprovalComment('');
+      setQuestionRequest(null);
+      setQuestionAnswers({});
       setLastSeq(0);
       lastSeqRef.current = 0;
       connectStream(0);
@@ -409,6 +465,64 @@ function App() {
       await refreshStatus();
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '处理审批失败');
+    }
+  }
+
+  function initQuestionAnswers(request: QuestionRequest): Record<string, QuestionAnswer> {
+    return Object.fromEntries(request.questions.map((question) => [question.id, { values: [], custom: '' }]));
+  }
+
+  function updateQuestionChoice(question: QuestionItem, value: string, checked: boolean) {
+    setQuestionAnswers((prev) => {
+      const current = prev[question.id] || { values: [], custom: '' };
+      const values = question.multiple
+        ? checked
+          ? Array.from(new Set([...current.values, value]))
+          : current.values.filter((item) => item !== value)
+        : [value];
+      return { ...prev, [question.id]: { ...current, values } };
+    });
+  }
+
+  function updateQuestionCustom(questionId: string, custom: string) {
+    setQuestionAnswers((prev) => {
+      const current = prev[questionId] || { values: [], custom: '' };
+      return { ...prev, [questionId]: { ...current, custom } };
+    });
+  }
+
+  async function handleQuestionReply() {
+    if (!questionRequest) {
+      return;
+    }
+    setFormError('');
+    try {
+      await postJson('/api/session/input', {
+        type: 'question_reply',
+        question_id: questionRequest.question_id,
+        answers: questionAnswers,
+      });
+      await refreshStatus();
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : '提交回答失败');
+    }
+  }
+
+  async function handleQuestionDecline() {
+    if (!questionRequest) {
+      return;
+    }
+    setFormError('');
+    try {
+      await postJson('/api/session/input', {
+        type: 'question_decline',
+        question_id: questionRequest.question_id,
+      });
+      setQuestionRequest(null);
+      setQuestionAnswers({});
+      await refreshStatus();
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : '退出回答失败');
     }
   }
 
@@ -500,7 +614,7 @@ function App() {
           ) : null}
         </section>
 
-        <form className={`composer ${approvalRequest ? 'has-approval' : ''}`} onSubmit={handleStart}>
+        <form className={`composer ${approvalRequest || questionRequest ? 'has-approval' : ''}`} onSubmit={handleStart}>
           <div className="composer-config">
             <label className="field compact-field">
               <span>Agent</span>
@@ -548,6 +662,49 @@ function App() {
                 onChange={(e) => setApprovalComment(e.target.value)}
               />
             </section>
+          ) : questionRequest ? (
+            <section className="composer-question" aria-label="用户回答">
+              <div className="approval-heading">
+                <MessageSquareText size={16} />
+                <strong>需要回答</strong>
+                <code>{questionRequest.question_id}</code>
+              </div>
+              <div className="question-list">
+                {questionRequest.questions.map((question) => {
+                  const answer = questionAnswers[question.id] || { values: [], custom: '' };
+                  return (
+                    <fieldset className="question-fieldset" key={question.id}>
+                      <legend>{question.question}</legend>
+                      <div className="question-options">
+                        {question.options.map((option) => {
+                          const inputType = question.multiple ? 'checkbox' : 'radio';
+                          const checked = answer.values.includes(option.value);
+                          return (
+                            <label className="question-option" key={option.value}>
+                              <input
+                                type={inputType}
+                                name={question.id}
+                                checked={checked}
+                                onChange={(e) => updateQuestionChoice(question, option.value, e.target.checked)}
+                              />
+                              <span>{option.label}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                      {question.custom && answer.values.includes('__custom__') ? (
+                        <textarea
+                          rows={2}
+                          placeholder="补充说明"
+                          value={answer.custom}
+                          onChange={(e) => updateQuestionCustom(question.id, e.target.value)}
+                        />
+                      ) : null}
+                    </fieldset>
+                  );
+                })}
+              </div>
+            </section>
           ) : (
             <textarea
               rows={4}
@@ -567,6 +724,17 @@ function App() {
                 <button type="button" className="button danger" onClick={() => handleApproval(false)}>
                   <X size={15} />
                   拒绝
+                </button>
+              </>
+            ) : questionRequest ? (
+              <>
+                <button type="button" className="button secondary" onClick={handleQuestionDecline}>
+                  <X size={15} />
+                  退出
+                </button>
+                <button type="button" className="button primary" onClick={handleQuestionReply}>
+                  <Check size={15} />
+                  提交
                 </button>
               </>
             ) : (

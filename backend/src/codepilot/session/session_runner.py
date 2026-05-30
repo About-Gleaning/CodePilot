@@ -11,13 +11,14 @@ import asyncio
 from typing import Any
 
 from codepilot.config.settings import resolve_llm_selection
-from codepilot.events import MessageCreatedEvent, SessionLifecycleEvent, StreamEvent
+from codepilot.events import MessageCreatedEvent, SessionLifecycleEvent, SessionMetaEvent, StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.hooks import HookManager, RuntimeHandles
 from codepilot.session.agents import AgentProfile
 from codepilot.session.message import Message, TextPart, build_user_message_info
 from codepilot.session.session import AgentLoop
-from codepilot.session.state import ApprovalResult, SessionState, SessionStatus
+from codepilot.session.state import ApprovalResult, QuestionResult, SessionState, SessionStatus
+from codepilot.session.title import SessionTitleService
 from codepilot.utils import new_message_id, new_session_id, utc_now_iso, utc_now_millis
 
 
@@ -32,6 +33,7 @@ class SessionRunner:
         hook_manager: HookManager,
         agent_loop: AgentLoop,
         agent_profiles: dict[str, AgentProfile],
+        title_service: SessionTitleService | None = None,
     ) -> None:
         self._workspace = workspace
         self._config = config
@@ -41,9 +43,13 @@ class SessionRunner:
         self._agent_profiles = agent_profiles
         self._session: SessionState | None = None
         self._task: asyncio.Task[SessionState] | None = None
+        self._title_service = title_service or SessionTitleService()
+        self._title_tasks: set[asyncio.Task[None]] = set()
         self._stop_event = asyncio.Event()
         self._approval_event = asyncio.Event()
         self._approval_result_holder: dict[str, ApprovalResult | None] = {"result": None}
+        self._question_event = asyncio.Event()
+        self._question_result_holder: dict[str, QuestionResult | None] = {"result": None}
 
     async def handle_input(self, gateway_input: GatewayInput) -> SessionState | None:
         """按输入类型路由到对应的会话处理分支。"""
@@ -51,6 +57,10 @@ class SessionRunner:
             return await self._handle_stop()
         if gateway_input.type == GatewayInputType.HUMAN_REPLY:
             return await self._handle_human_reply(gateway_input)
+        if gateway_input.type == GatewayInputType.QUESTION_REPLY:
+            return await self._handle_question_reply(gateway_input)
+        if gateway_input.type == GatewayInputType.QUESTION_DECLINE:
+            return await self._handle_question_decline(gateway_input)
         return await self._handle_user_message(gateway_input)
 
     def get_status_snapshot(self) -> dict[str, Any]:
@@ -96,6 +106,8 @@ class SessionRunner:
         self._stop_event = asyncio.Event()
         self._approval_event = asyncio.Event()
         self._approval_result_holder = {"result": None}
+        self._question_event = asyncio.Event()
+        self._question_result_holder = {"result": None}
         return self._session
 
     async def shutdown(self) -> None:
@@ -113,6 +125,7 @@ class SessionRunner:
         if self._session and self._session.status == SessionStatus.WAITING_HUMAN:
             raise ValueError("当前 session 正在等待人工确认，不接受新的 user_message")
 
+        is_new_session = not gateway_input.session_id
         if gateway_input.session_id:
             if self._session is None:
                 raise ValueError(f"session `{gateway_input.session_id}` 不存在或未加载")
@@ -133,6 +146,27 @@ class SessionRunner:
             self._session.updated_at = utc_now_iso()
         else:
             self._session = self._new_session(gateway_input)
+
+        # 用户输入先落入 session 内存，再交给 AgentLoop 负责完整的一次 session 执行。
+        message = self._build_user_message(gateway_input)
+        self._session.messages.append(message)
+        self._session.updated_at = utc_now_iso()
+
+        if is_new_session:
+            self._session.title = self._default_title(gateway_input.content, self._session.session_id)
+            await self._event_bus.publish_domain_event(
+                SessionMetaEvent(
+                    session_id=self._session.session_id,
+                    created_at=self._session.created_at,
+                    data={
+                        "title": self._session.title,
+                        "workspace_id": self._session.workspace_id,
+                        "workspace_path": self._session.workspace_path,
+                        "initial_user_message_id": message.info.id,
+                        "updated_at": self._session.updated_at,
+                    },
+                )
+            )
             await self._event_bus.publish_domain_event(
                 SessionLifecycleEvent(
                     session_id=self._session.session_id,
@@ -149,11 +183,7 @@ class SessionRunner:
                     data=self._session.model_dump(exclude={"messages"}),
                 )
             )
-
-        # 用户输入先落入 session 内存，再交给 AgentLoop 负责完整的一次 session 执行。
-        message = self._build_user_message(gateway_input)
-        self._session.messages.append(message)
-        self._session.updated_at = utc_now_iso()
+            self._schedule_title_generation(self._session)
 
         runtime = RuntimeHandles(event_bus=self._event_bus)
         profile = self._agent_profiles[self._session.agent_name]
@@ -178,11 +208,22 @@ class SessionRunner:
         self._stop_event = asyncio.Event()
         self._approval_event = asyncio.Event()
         self._approval_result_holder = {"result": None}
+        self._question_event = asyncio.Event()
+        self._question_result_holder = {"result": None}
         self._task = asyncio.create_task(
             self._run_loop(runtime=runtime, profile=profile),
             name=f"codepilot-session-{self._session.session_id}",
         )
         return self._session
+
+    def _schedule_title_generation(self, session: SessionState) -> None:
+        """新会话创建后异步刷新 LLM 标题，默认标题已先保证历史列表可展示。"""
+        task = asyncio.create_task(
+            self._title_service.generate_for_session(session, self._event_bus),
+            name=f"codepilot-session-title-{session.session_id}",
+        )
+        self._title_tasks.add(task)
+        task.add_done_callback(self._title_tasks.discard)
 
     async def _run_loop(self, runtime: RuntimeHandles, profile: AgentProfile) -> SessionState:
         """执行 AgentLoop，并在异常时补发失败事件。"""
@@ -196,6 +237,8 @@ class SessionRunner:
                 config=self._config,
                 approval_event=self._approval_event,
                 approval_result_holder=self._approval_result_holder,
+                question_event=self._question_event,
+                question_result_holder=self._question_result_holder,
                 stop_event=self._stop_event,
             )
         except Exception as exc:  # noqa: BLE001
@@ -235,6 +278,13 @@ class SessionRunner:
                 created_at=utc_now_iso(),
             )
             self._approval_event.set()
+            self._question_result_holder["result"] = QuestionResult(
+                question_id="stop_during_waiting",
+                declined=True,
+                comment="用户停止任务",
+                created_at=utc_now_iso(),
+            )
+            self._question_event.set()
         elif self._session.status == SessionStatus.RUNNING:
             # 正常运行中的会话使用 stop_event 协作式停止，避免强杀任务造成状态不一致。
             self._session.status = SessionStatus.STOPPING
@@ -262,6 +312,8 @@ class SessionRunner:
         """接收人工审批结果，并唤醒等待审批的执行流程。"""
         if self._session is None or self._session.status != SessionStatus.WAITING_HUMAN:
             raise ValueError("当前没有等待人工确认的 session")
+        if self._session.metadata.get("pending_human_type") != "approval":
+            raise ValueError("当前 session 等待的不是人工审批")
         self._approval_result_holder["result"] = ApprovalResult(
             approval_id=gateway_input.approval_id or "",
             approved=bool(gateway_input.approved),
@@ -269,6 +321,37 @@ class SessionRunner:
             created_at=utc_now_iso(),
         )
         self._approval_event.set()
+        return self._session
+
+    async def _handle_question_reply(self, gateway_input: GatewayInput) -> SessionState | None:
+        """接收 question 工具答案，并唤醒等待中的执行流程。"""
+        if self._session is None or self._session.status != SessionStatus.WAITING_HUMAN:
+            raise ValueError("当前没有等待用户回答的 session")
+        if self._session.metadata.get("pending_human_type") != "question":
+            raise ValueError("当前 session 等待的不是用户回答")
+        self._question_result_holder["result"] = QuestionResult(
+            question_id=gateway_input.question_id or "",
+            answers=gateway_input.answers or {},
+            declined=False,
+            created_at=utc_now_iso(),
+        )
+        self._question_event.set()
+        return self._session
+
+    async def _handle_question_decline(self, gateway_input: GatewayInput) -> SessionState | None:
+        """接收 question 拒答信号；会话循环会记录拒答消息并结束当前 run。"""
+        if self._session is None or self._session.status != SessionStatus.WAITING_HUMAN:
+            raise ValueError("当前没有等待用户回答的 session")
+        if self._session.metadata.get("pending_human_type") != "question":
+            raise ValueError("当前 session 等待的不是用户回答")
+        self._question_result_holder["result"] = QuestionResult(
+            question_id=gateway_input.question_id or "",
+            answers={},
+            declined=True,
+            comment=gateway_input.comment,
+            created_at=utc_now_iso(),
+        )
+        self._question_event.set()
         return self._session
 
     def _new_session(self, gateway_input: GatewayInput) -> SessionState:
@@ -311,3 +394,8 @@ class SessionRunner:
             ),
             parts=[TextPart(text=gateway_input.content or "")],
         )
+
+    def _default_title(self, content: str, session_id: str) -> str:
+        """用首条用户输入生成默认标题，避免新会话历史列表出现空标题。"""
+        normalized = " ".join(str(content or "").split())
+        return normalized[:15] or session_id

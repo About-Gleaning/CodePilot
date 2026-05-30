@@ -33,6 +33,11 @@ class DummyAgentLoop:
         return session
 
 
+class NoopTitleService:
+    async def generate_for_session(self, session: SessionState, event_bus: object) -> None:
+        return None
+
+
 def build_settings(environ: dict[str, str]) -> AppSettings:
     llm_settings = LLMSettings(
         providers={
@@ -61,6 +66,7 @@ def build_session_runner(settings: AppSettings) -> SessionRunner:
         hook_manager=None,
         agent_loop=DummyAgentLoop(),
         agent_profiles={"build": object(), "plan": object()},
+        title_service=NoopTitleService(),
     )
 
 

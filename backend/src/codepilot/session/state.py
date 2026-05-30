@@ -69,6 +69,26 @@ class PendingApproval(BaseModel):
     resume_item: dict[str, Any] | None = None
 
 
+class QuestionRequest(BaseModel):
+    question_id: str
+    questions: list[dict[str, Any]]
+    created_at: str
+
+
+class QuestionResult(BaseModel):
+    question_id: str
+    answers: dict[str, Any] = Field(default_factory=dict)
+    declined: bool = False
+    comment: str | None = None
+    created_at: str
+
+
+class PendingQuestion(BaseModel):
+    request: QuestionRequest
+    source: str
+    resume_item: dict[str, Any] | None = None
+
+
 class StopRequest(BaseModel):
     reason: str = "user_requested"
     created_at: str

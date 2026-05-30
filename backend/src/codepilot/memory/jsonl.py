@@ -6,6 +6,7 @@ JSONL 文件，并在需要时按顺序回放，供会话恢复和 SSE 断线续
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime
 from pathlib import Path
@@ -13,7 +14,15 @@ from typing import Any
 
 import aiofiles
 
-from codepilot.events import ApprovalEvent, DomainEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, StreamEvent
+from codepilot.events import (
+    ApprovalEvent,
+    DomainEvent,
+    MessageCreatedEvent,
+    SessionCompactedEvent,
+    SessionLifecycleEvent,
+    SessionMetaEvent,
+    StreamEvent,
+)
 from codepilot.logging import get_logger
 
 
@@ -24,18 +33,23 @@ class JsonlSessionMemory:
         """初始化会话存储目录和日志器。"""
         self._sessions_dir = sessions_dir
         self._logger = get_logger("codepilot.memory.session")
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def handle_domain_event(self, event: DomainEvent) -> None:
         """将单个领域事件转换为记录并追加写入当前会话文件。"""
         session_id = event.session_id
         if not session_id:
             return
-        path = self._session_file(session_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        record = self._to_record(event)
-        # JSONL 采用“一行一条记录”的追加写入方式，既便于顺序回放，也避免整文件重写。
-        async with aiofiles.open(path, "a", encoding="utf-8") as file:
-            await file.write(json.dumps(record, ensure_ascii=False) + "\n")
+        async with self._lock_for_session(session_id):
+            path = self._session_file(session_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(event, SessionMetaEvent):
+                await self._upsert_session_meta(path, self._to_record(event))
+                return
+            record = self._to_record(event)
+            # JSONL 采用“一行一条记录”的追加写入方式，既便于顺序回放，也避免整文件重写。
+            async with aiofiles.open(path, "a", encoding="utf-8") as file:
+                await file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     async def replay(self, session_id: str | None = None) -> dict[str, Any]:
         """回放指定会话的领域事件，并重建最新会话快照与消息列表。"""
@@ -43,24 +57,31 @@ class JsonlSessionMemory:
         if not records:
             return {"session": None, "messages": [], "records": []}
         messages: list[dict[str, Any]] = []
-        session_snapshot: dict[str, Any] | None = None
+        session_meta = self._require_session_meta(records)
+        session_data: dict[str, Any] = {
+            "session_id": session_meta["session_id"],
+            "title": session_meta["data"].get("title"),
+            "workspace_id": session_meta["data"].get("workspace_id"),
+            "workspace_path": session_meta["data"].get("workspace_path"),
+            "created_at": session_meta.get("created_at"),
+            "updated_at": session_meta.get("updated_at") or session_meta.get("created_at"),
+            "metadata": {},
+        }
+        session_snapshot: dict[str, Any] | None = {
+            "record_type": "session_meta",
+            "session_id": session_meta["session_id"],
+            "created_at": session_meta.get("created_at"),
+            "data": session_data,
+        }
         for record in records:
             if record["record_type"] == "message":
                 messages.append(record["data"])
             if record["record_type"] == "session_compacted":
                 messages = list(record["data"].get("messages") or [])
-                session_snapshot = {
-                    **(session_snapshot or {}),
-                    "session_id": record["session_id"],
-                    "created_at": record["created_at"],
-                    "data": {
-                        **((session_snapshot or {}).get("data") or {}),
-                        "metadata": record["data"].get("metadata") or {},
-                    },
-                }
             if record["record_type"] in {"session_started", "session_status_changed", "session_finished", "session_failed"}:
-                # 会话状态采用逐条覆盖的方式累积，最终得到最近一次生命周期快照。
-                session_snapshot = {**(session_snapshot or {}), **record}
+                # 状态节点只保存运行态字段，回放时与首行 session_meta 合成完整 SessionState。
+                session_data = {**session_data, **(record.get("data") or {})}
+                session_snapshot = {**record, "data": session_data}
         return {"session": session_snapshot, "messages": messages, "records": records}
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -74,6 +95,14 @@ class JsonlSessionMemory:
 
     def _to_record(self, event: DomainEvent) -> dict[str, Any]:
         """把不同类型的领域事件映射成统一可落盘的记录结构。"""
+        if isinstance(event, SessionMetaEvent):
+            return {
+                "record_type": "session_meta",
+                "session_id": event.session_id,
+                "created_at": event.created_at,
+                "updated_at": event.data.get("updated_at") or event.created_at,
+                "data": event.data,
+            }
         if isinstance(event, MessageCreatedEvent):
             return {
                 "record_type": "message",
@@ -109,9 +138,8 @@ class JsonlSessionMemory:
             return {
                 "record_type": lifecycle_type,
                 "session_id": event.session_id,
-                "workspace_id": event.data.get("workspace_id"),
                 "created_at": event.created_at,
-                "data": event.data,
+                "data": self._lifecycle_data(event),
             }
         return {
             "record_type": event.event_type.value,
@@ -119,6 +147,62 @@ class JsonlSessionMemory:
             "created_at": event.created_at,
             "data": event.data,
         }
+
+    async def _upsert_session_meta(self, path: Path, record: dict[str, Any]) -> None:
+        """创建或更新首行 session_meta，避免全局展示信息散落在状态节点中。"""
+        if not path.exists():
+            async with aiofiles.open(path, "a", encoding="utf-8") as file:
+                await file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return
+
+        records = self._load_records_from_path(path)
+        if not records:
+            records = [record]
+        elif records[0].get("record_type") != "session_meta":
+            raise ValueError("session jsonl 第一条记录必须是 session_meta")
+        else:
+            existing_data = records[0].get("data") if isinstance(records[0].get("data"), dict) else {}
+            records[0] = {
+                **records[0],
+                "updated_at": record.get("updated_at") or record.get("created_at") or records[0].get("updated_at"),
+                "data": {**existing_data, **(record.get("data") or {})},
+            }
+
+        temp_path = path.with_suffix(f"{path.suffix}.tmp")
+        temp_path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+
+    def _lifecycle_data(self, event: SessionLifecycleEvent) -> dict[str, Any]:
+        """只持久化状态事件自身需要的字段，避免重复保存会话全局信息。"""
+        data = event.data
+        return {
+            "status": event.status,
+            "agent_name": data.get("agent_name"),
+            "provider": data.get("provider"),
+            "model": data.get("model"),
+            "updated_at": data.get("updated_at") or event.created_at,
+        }
+
+    def _require_session_meta(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+        """新格式强制第一条记录为 session_meta，不再兼容旧 JSONL 布局。"""
+        first = records[0]
+        if first.get("record_type") != "session_meta":
+            raise ValueError("session jsonl 第一条记录必须是 session_meta")
+        data = first.get("data")
+        if not isinstance(data, dict):
+            raise ValueError("session_meta.data 必须是对象")
+        return first
+
+    def _lock_for_session(self, session_id: str) -> asyncio.Lock:
+        """按 session 维度串行化写入，避免同一 JSONL 文件并发读改写。"""
+        lock = self._session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[session_id] = lock
+        return lock
 
     def _session_file(self, session_id: str) -> Path:
         """生成会话记录文件路径；同一 session 后续写入固定复用既有文件。"""
@@ -189,11 +273,13 @@ class JsonlSessionMemory:
         for record in self._load_records_from_path(path):
             record_created_at = str(record.get("created_at") or "")
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
-            updated_at = str(data.get("updated_at") or record_created_at or updated_at)
+            updated_at = str(record.get("updated_at") or data.get("updated_at") or record_created_at or updated_at)
         return updated_at
 
     def _build_session_summary(self, records: list[dict[str, Any]]) -> dict[str, Any] | None:
         """从 JSONL 记录流中提取轻量摘要，避免前端加载完整消息体。"""
+        if not records:
+            return None
         session_data: dict[str, Any] = {}
         session_id = ""
         created_at = ""
@@ -201,12 +287,14 @@ class JsonlSessionMemory:
         status = ""
         message_count = 0
         preview = ""
+        session_meta = self._require_session_meta(records)
+        session_data.update(session_meta.get("data") or {})
+        created_at = str(session_meta.get("created_at") or "")
+        updated_at = str(session_meta.get("updated_at") or created_at)
         for record in records:
             session_id = str(record.get("session_id") or session_id)
             record_created_at = str(record.get("created_at") or "")
-            if not created_at and record_created_at:
-                created_at = record_created_at
-            if record_created_at:
+            if record_created_at and record.get("record_type") != "session_meta":
                 updated_at = record_created_at
             if record.get("record_type") == "message":
                 message_count += 1
@@ -221,7 +309,6 @@ class JsonlSessionMemory:
                 session_data = {**session_data, **(record.get("data") or {})}
                 status = str(session_data.get("status") or status)
                 updated_at = str(session_data.get("updated_at") or updated_at)
-                created_at = str(session_data.get("created_at") or created_at)
         if not session_id:
             return None
         return {

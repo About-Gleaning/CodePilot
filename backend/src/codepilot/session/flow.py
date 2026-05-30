@@ -32,7 +32,17 @@ from codepilot.session.message import (
     build_assistant_message_info,
     build_user_message_info,
 )
-from codepilot.session.state import AgentState, ApprovalRequest, ApprovalResult, LLMState, PendingApproval, SessionState, SessionStatus
+from codepilot.session.state import (
+    AgentState,
+    ApprovalRequest,
+    ApprovalResult,
+    LLMState,
+    PendingApproval,
+    PendingQuestion,
+    QuestionResult,
+    SessionState,
+    SessionStatus,
+)
 from codepilot.session.system_prompt import build_system_prompt
 from codepilot.tools.dispatcher import ToolDispatcher
 from codepilot.tools.registry import ToolRegistry
@@ -43,8 +53,9 @@ from codepilot.utils import new_message_id, utc_now_iso, utc_now_millis
 class TurnResult:
     """单轮执行结果，用于驱动外层会话循环继续、结束或等待人工审批。"""
 
-    status: Literal["continue", "completed", "stopped", "needs_approval", "failed"]
+    status: Literal["continue", "completed", "stopped", "needs_approval", "needs_question", "failed"]
     pending_approval: PendingApproval | None = None
+    pending_question: PendingQuestion | None = None
     stop_after_approval: bool = False
 
 
@@ -95,6 +106,7 @@ class ApprovalCoordinator:
     ) -> ApprovalResult | None:
         """统一处理审批等待、结果广播与拒绝后的系统消息沉淀。"""
         session.status = SessionStatus.WAITING_HUMAN
+        session.metadata["pending_human_type"] = "approval"
         session.updated_at = utc_now_iso()
         approval_result_holder["result"] = None
 
@@ -150,6 +162,7 @@ class ApprovalCoordinator:
         )
 
         if result.approved:
+            session.metadata.pop("pending_human_type", None)
             session.status = SessionStatus.RUNNING
             session.updated_at = utc_now_iso()
             return result
@@ -160,6 +173,7 @@ class ApprovalCoordinator:
             self._build_human_refusal_message(session, agent_state, approval.request, result),
             runtime,
         )
+        session.metadata.pop("pending_human_type", None)
         session.status = SessionStatus.CANCELLED
         session.updated_at = utc_now_iso()
         await runtime.event_bus.publish_stream_event(
@@ -192,6 +206,100 @@ class ApprovalCoordinator:
                 TextPart(
                     text=f"人工拒绝继续执行：{result.comment or '未提供备注'}",
                     metadata={"approval_id": approval.approval_id, "approved": result.approved},
+                ),
+            ],
+        )
+
+
+@dataclass(slots=True)
+class QuestionCoordinator:
+    """集中处理 question 工具等待生命周期，与审批语义保持隔离。"""
+
+    message_appender: SessionMessageAppender
+
+    async def wait(
+        self,
+        session: SessionState,
+        question: PendingQuestion,
+        agent_state: AgentState,
+        runtime: RuntimeHandles,
+        question_event: Any,
+        question_result_holder: dict[str, QuestionResult | None],
+    ) -> QuestionResult | None:
+        session.status = SessionStatus.WAITING_HUMAN
+        session.metadata["pending_human_type"] = "question"
+        session.updated_at = utc_now_iso()
+        question_result_holder["result"] = None
+
+        await runtime.event_bus.publish_domain_event(
+            SessionLifecycleEvent(
+                session_id=session.session_id,
+                status=session.status.value,
+                created_at=utc_now_iso(),
+                data=session.model_dump(exclude={"messages"}),
+            )
+        )
+        await runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="human_question_required",
+                session_id=session.session_id,
+                created_at=utc_now_iso(),
+                data=question.request.model_dump(),
+            )
+        )
+
+        question_event.clear()
+        await question_event.wait()
+        result = question_result_holder.get("result")
+        if result is None:
+            return None
+
+        await runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="human_question_resolved",
+                session_id=session.session_id,
+                created_at=utc_now_iso(),
+                data={**result.model_dump(), "continue_loop": not result.declined},
+            )
+        )
+        if result.declined:
+            await self.message_appender.append(
+                session,
+                self._build_question_decline_message(session, agent_state, question, result),
+                runtime,
+            )
+            session.metadata.pop("pending_human_type", None)
+            session.status = SessionStatus.COMPLETED
+            session.updated_at = utc_now_iso()
+            return result
+
+        session.metadata.pop("pending_human_type", None)
+        session.status = SessionStatus.RUNNING
+        session.updated_at = utc_now_iso()
+        return result
+
+    def _build_question_decline_message(
+        self,
+        session: SessionState,
+        agent_state: AgentState,
+        question: PendingQuestion,
+        result: QuestionResult,
+    ) -> Message:
+        question_summary = "；".join(str(item.get("question", "")) for item in question.request.questions if isinstance(item, dict))
+        suffix = f"。问题：{question_summary}" if question_summary else ""
+        return Message(
+            info=build_user_message_info(
+                message_id=new_message_id(),
+                session_id=session.session_id,
+                created_at_ms=utc_now_millis(),
+                agent=agent_state.name,
+                provider_id=session.provider,
+                model_id=session.model,
+            ),
+            parts=[
+                TextPart(
+                    text=f"用户拒绝回答 question 工具提出的问题{suffix}",
+                    metadata={"question_id": result.question_id, "declined": True},
                 ),
             ],
         )
@@ -504,12 +612,14 @@ class TurnExecutor:
         self._merge_tool_parts(assistant_message, tool_batch.tool_parts)
         self._append_step_finish(
             assistant_message,
-            reason="tool_pending" if tool_batch.pending_approval else "tool_completed",
+            reason="tool_pending" if tool_batch.pending_approval or tool_batch.pending_question else "tool_completed",
         )
         await self.message_appender.append(session, assistant_message, runtime)
         await self._publish_assistant_message_completed(session, assistant_message, runtime)
         if tool_batch.pending_approval:
             return TurnResult(status="needs_approval", pending_approval=tool_batch.pending_approval)
+        if tool_batch.pending_question:
+            return TurnResult(status="needs_question", pending_question=tool_batch.pending_question)
 
         # 工具完成后才运行 LOOP_AFTER，让 Hook 可以基于工具结果决定继续、失败或请求审批。
         # 如果工具还在等待审批，后续控制权必须交给审批流程，不能提前触发后置 Hook。
