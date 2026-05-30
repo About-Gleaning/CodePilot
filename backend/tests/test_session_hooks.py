@@ -914,6 +914,10 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
 
     assert result.status == SessionStatus.CANCELLED
     assert [event.event_type for event in stream_events].count("human_approval_required") == 1
+    interactions = [event for event in domain_events if event.event_type.value == "human_interaction"]
+    assert [event.data["status"] for event in interactions] == ["pending", "rejected"]
+    assert all(event.data["kind"] == "approval" for event in interactions)
+    assert interactions[0].data["interaction_id"] == "approval_tool_call_1"
     assert session.messages[-1].info.role == "user"
     assert session.messages[-1].info.agent == "build"
     assert session.messages[-2].tool_parts()[0].state.status == "pending"
@@ -939,7 +943,9 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     question_event = asyncio.Event()
     question_result_holder = {"result": None}
     stream_events: list[Any] = []
+    domain_events: list[Any] = []
     event_bus.subscribe_stream(stream_events.append)
+    event_bus.subscribe_domain(domain_events.append)
 
     async def reply_question() -> SessionState:
         task = asyncio.create_task(
@@ -974,6 +980,16 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     assert "human_approval_required" not in [event.event_type for event in stream_events]
     assert [event.event_type for event in stream_events].count("human_question_required") == 1
     assert [event.event_type for event in stream_events].count("human_question_resolved") == 1
+    interactions = [event for event in domain_events if event.event_type.value == "human_interaction"]
+    assert [event.data["status"] for event in interactions] == ["pending", "resolved"]
+    assert all(event.data["kind"] == "question" for event in interactions)
+    assert any(
+        event.event_type.value == "session_lifecycle" and event.status == SessionStatus.RUNNING.value for event in domain_events
+    )
+    resolved_event = interactions[-1]
+    assert resolved_event.data["message_id"] == result.messages[-2].info.id
+    assert resolved_event.data["call_id"] == "call_question_1"
+    assert resolved_event.data["result"]["answers"]["target"]["values"] == ["backend"]
     question_message = result.messages[-2]
     question_part = question_message.tool_parts()[0]
     assert question_part.tool == "question"

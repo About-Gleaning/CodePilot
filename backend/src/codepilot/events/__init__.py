@@ -5,8 +5,8 @@
 
 from .bus import EventBus
 from .definitions import (
-    ApprovalEvent,
     DomainEvent,
+    HumanInteractionEvent,
     MessageCreatedEvent,
     SessionCompactedEvent,
     SessionLifecycleEvent,
@@ -15,9 +15,9 @@ from .definitions import (
 )
 
 __all__ = [
-    "ApprovalEvent",
     "DomainEvent",
     "EventBus",
+    "HumanInteractionEvent",
     "MessageCreatedEvent",
     "SessionCompactedEvent",
     "SessionLifecycleEvent",

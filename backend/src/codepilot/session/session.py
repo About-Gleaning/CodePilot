@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from codepilot.events import SessionLifecycleEvent, StreamEvent
+from codepilot.events import HumanInteractionEvent, SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookManager, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
@@ -283,8 +283,12 @@ class AgentLoop:
     ) -> bool:
         """处理 question 工具等待；回答后回填工具结果，拒答后结束当前 run。"""
         result = await self._wait_for_question(ctx, question)
-        if result is None or result.declined:
+        if result is None:
             return False
+        await self._publish_question_resolved(ctx, question, result)
+        if result.declined:
+            return False
+        await self._publish_question_resume_status(ctx)
         if question.resume_item is None:
             return True
         self._merge_question_result(ctx.session, question, result)
@@ -297,6 +301,59 @@ class AgentLoop:
             )
         )
         return await self._run_loop_after_approved_tool(ctx, iteration)
+
+    async def _publish_question_resolved(
+        self,
+        ctx: _RunContext,
+        question: PendingQuestion,
+        result: QuestionResult,
+    ) -> None:
+        """以追加日志记录 question 答复，避免修改已落盘的 pending 消息。"""
+        resume_item = question.resume_item or {}
+        status = "declined" if result.declined else "resolved"
+        await ctx.runtime.event_bus.publish_domain_event(
+            HumanInteractionEvent(
+                session_id=ctx.session.session_id,
+                interaction_id=result.question_id,
+                created_at=result.created_at,
+                data={
+                    "kind": "question",
+                    "status": status,
+                    "interaction_id": result.question_id,
+                    "message_id": self._pending_question_message_id(ctx.session, resume_item),
+                    "call_id": resume_item.get("tool_call_id"),
+                    "request": question.request.model_dump(),
+                    "result": result.model_dump(),
+                    "tool_output": self._build_question_tool_output(question, result),
+                },
+            )
+        )
+
+    async def _publish_question_resume_status(self, ctx: _RunContext) -> None:
+        """用户回答后补一条 RUNNING 状态，表达会话从等待状态恢复执行。"""
+        await ctx.runtime.event_bus.publish_domain_event(
+            SessionLifecycleEvent(
+                session_id=ctx.session.session_id,
+                status=SessionStatus.RUNNING.value,
+                created_at=utc_now_iso(),
+                data={
+                    **ctx.session.model_dump(exclude={"messages"}),
+                    "lifecycle_record_type": "session_status_changed",
+                },
+            )
+        )
+
+    def _pending_question_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
+        """定位承载 pending question 工具片段的 assistant 消息。"""
+        call_id = resume_item.get("tool_call_id")
+        if not call_id:
+            return None
+        for message in reversed(session.messages):
+            if message.info.role != "assistant":
+                continue
+            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
+                return message.info.id
+        return None
 
     async def _wait_for_approval(self, ctx: _RunContext, approval: PendingApproval) -> ApprovalResult | None:
         return await self._approval_coordinator.wait(
@@ -465,13 +522,7 @@ class AgentLoop:
         if latest_message.info.role != "assistant":
             return
         call_id = question.resume_item.get("tool_call_id")
-        output = {
-            "status": "ok",
-            "tool_name": "question",
-            "question_id": result.question_id,
-            "answers": result.answers,
-            "output": summarize_question_answers(question.request.questions, result.answers),
-        }
+        output = self._build_question_tool_output(question, result)
         for index, part in enumerate(latest_message.parts):
             if isinstance(part, ToolPart) and part.call_id == call_id:
                 latest_message.parts[index] = ToolPart(
@@ -488,6 +539,16 @@ class AgentLoop:
                 latest_message.info.time.completed = utc_now_millis()
                 latest_message.info.finish = "tool_completed"
                 return
+
+    def _build_question_tool_output(self, question: PendingQuestion, result: QuestionResult) -> dict[str, Any]:
+        """统一生成 question 工具结果，供内存合并和 JSONL 回放共用。"""
+        return {
+            "status": "ok",
+            "tool_name": "question",
+            "question_id": result.question_id,
+            "answers": result.answers,
+            "output": summarize_question_answers(question.request.questions, result.answers),
+        }
 
 def summarize_question_answers(questions: list[dict[str, Any]], answers: dict[str, Any]) -> str:
     """把结构化答案转成自然语言，避免 LLM 直接读取前端内部 JSON。"""

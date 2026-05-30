@@ -6,9 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from codepilot.events import EventBus, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
+from codepilot.events import EventBus, HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
 from codepilot.memory import JsonlSessionMemory
-from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, build_user_message_info
+from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
+from codepilot.session.message import StepFinishPart, ToolPartState
 from codepilot.session.title import SessionTitleService
 from codepilot.utils import utc_now_iso
 
@@ -25,6 +26,32 @@ def build_message(session_id: str, message_id: str, text: str) -> Message:
         ),
         parts=[TextPart(text=text)],
     )
+
+
+def build_question_message(session_id: str, message_id: str) -> Message:
+    message = Message(
+        info=build_assistant_message_info(
+            message_id=message_id,
+            session_id=session_id,
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd="/tmp/codepilot",
+            root="/tmp/codepilot",
+        ),
+        parts=[
+            ToolPart(
+                call_id="call_question_1",
+                tool="question",
+                state=ToolPartState(status="pending", input={"questions": []}),
+            ),
+            StepFinishPart(reason="tool_pending"),
+        ],
+    )
+    message.info.finish = "tool_pending"
+    return message
 
 
 def build_session(session_id: str, status: SessionStatus = SessionStatus.COMPLETED) -> SessionState:
@@ -220,6 +247,53 @@ def test_session_meta_title_update_rewrites_first_record(tmp_path) -> None:
         assert records[0]["data"]["title"] == "LLM 生成标题"
         assert [record["record_type"] for record in records].count("session_started") == 1
         assert memory.list_sessions()[0]["title"] == "LLM 生成标题"
+
+    asyncio.run(run_case())
+
+
+def test_human_interaction_question_resolved_completes_pending_tool_on_replay(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.RUNNING)
+        message = build_question_message(session.session_id, "msg_question_1")
+
+        await persist_session(memory, session, [message])
+        await memory.handle_domain_event(
+            HumanInteractionEvent(
+                session_id=session.session_id,
+                interaction_id="question_1",
+                created_at="2026-05-29T10:03:00Z",
+                data={
+                    "kind": "question",
+                    "status": "resolved",
+                    "interaction_id": "question_1",
+                    "message_id": "msg_question_1",
+                    "call_id": "call_question_1",
+                    "result": {
+                        "question_id": "question_1",
+                        "answers": {"target": {"values": ["backend"], "note": ""}},
+                        "declined": False,
+                        "created_at": "2026-05-29T10:03:00Z",
+                    },
+                    "tool_output": {
+                        "status": "ok",
+                        "tool_name": "question",
+                        "question_id": "question_1",
+                        "answers": {"target": {"values": ["backend"], "note": ""}},
+                        "output": "用户已回答 question 工具提出的问题。",
+                    },
+                },
+            )
+        )
+
+        replay = await memory.replay(session.session_id)
+
+        replayed_message = replay["messages"][0]
+        tool_part = replayed_message["parts"][0]
+        assert tool_part["state"]["status"] == "completed"
+        assert tool_part["state"]["output"]["answers"]["target"]["values"] == ["backend"]
+        assert replayed_message["parts"][1]["reason"] == "tool_completed"
+        assert replayed_message["info"]["finish"] == "tool_completed"
 
     asyncio.run(run_case())
 

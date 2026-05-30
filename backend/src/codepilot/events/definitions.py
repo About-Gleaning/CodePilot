@@ -32,8 +32,8 @@ class DomainEventType(str, Enum):
 
     SESSION_META = "session_meta"
     MESSAGE_CREATED = "message_created"
+    HUMAN_INTERACTION = "human_interaction"
     SESSION_LIFECYCLE = "session_lifecycle"
-    APPROVAL = "approval"
     SESSION_COMPACTED = "session_compacted"
 
 
@@ -53,6 +53,13 @@ class MessageCreatedEvent(DomainEvent):
     message: Message
 
 
+class HumanInteractionEvent(DomainEvent):
+    """人工交互生命周期事件，统一覆盖 question 与 approval。"""
+
+    event_type: DomainEventType = DomainEventType.HUMAN_INTERACTION
+    interaction_id: str
+
+
 class SessionMetaEvent(DomainEvent):
     """会话全局索引信息创建或更新时发布的领域事件。"""
 
@@ -63,14 +70,6 @@ class SessionLifecycleEvent(DomainEvent):
     """会话生命周期状态变化时发布的领域事件。"""
 
     event_type: DomainEventType = DomainEventType.SESSION_LIFECYCLE
-    status: str
-
-
-class ApprovalEvent(DomainEvent):
-    """审批流程状态变化时发布的领域事件。"""
-
-    event_type: DomainEventType = DomainEventType.APPROVAL
-    approval_id: str
     status: str
 
 

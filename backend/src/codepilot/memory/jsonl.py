@@ -15,8 +15,8 @@ from typing import Any
 import aiofiles
 
 from codepilot.events import (
-    ApprovalEvent,
     DomainEvent,
+    HumanInteractionEvent,
     MessageCreatedEvent,
     SessionCompactedEvent,
     SessionLifecycleEvent,
@@ -76,6 +76,8 @@ class JsonlSessionMemory:
         for record in records:
             if record["record_type"] == "message":
                 messages.append(record["data"])
+            if record["record_type"] == "human_interaction":
+                self._apply_human_interaction(messages, record)
             if record["record_type"] == "session_compacted":
                 messages = list(record["data"].get("messages") or [])
             if record["record_type"] in {"session_started", "session_status_changed", "session_finished", "session_failed"}:
@@ -111,13 +113,13 @@ class JsonlSessionMemory:
                 "created_at": event.created_at,
                 "data": event.message.model_dump(),
             }
-        if isinstance(event, ApprovalEvent):
+        if isinstance(event, HumanInteractionEvent):
             return {
-                "record_type": "human_approval",
+                "record_type": "human_interaction",
                 "session_id": event.session_id,
-                "approval_id": event.approval_id,
+                "interaction_id": event.interaction_id,
                 "created_at": event.created_at,
-                "data": {"status": event.status, **event.data},
+                "data": event.data,
             }
         if isinstance(event, SessionCompactedEvent):
             return {
@@ -130,6 +132,8 @@ class JsonlSessionMemory:
             lifecycle_type = "session_status_changed"
             if event.status == "RUNNING":
                 lifecycle_type = "session_started"
+                if event.data.get("lifecycle_record_type") == "session_status_changed":
+                    lifecycle_type = "session_status_changed"
             if event.status in {"COMPLETED", "CANCELLED"}:
                 lifecycle_type = "session_finished"
             if event.status == "FAILED":
@@ -146,6 +150,62 @@ class JsonlSessionMemory:
             "session_id": event.session_id,
             "created_at": event.created_at,
             "data": event.data,
+        }
+
+    def _apply_human_interaction(self, messages: list[dict[str, Any]], record: dict[str, Any]) -> None:
+        """回放人工交互记录；当前只有 question resolved 会补全工具状态。"""
+        data = record.get("data") if isinstance(record.get("data"), dict) else {}
+        if data.get("kind") != "question" or data.get("status") != "resolved":
+            return
+        message_id = str(data.get("message_id") or "")
+        call_id = str(data.get("call_id") or "")
+        if not message_id or not call_id:
+            return
+
+        for message in messages:
+            info = message.get("info") if isinstance(message.get("info"), dict) else {}
+            if info.get("id") != message_id:
+                continue
+            self._complete_question_tool_part(message, data, call_id)
+            return
+
+    def _complete_question_tool_part(self, message: dict[str, Any], data: dict[str, Any], call_id: str) -> None:
+        """根据 call_id 补齐 question 工具结果，并同步步骤完成原因。"""
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            return
+        matched = False
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool" and part.get("call_id") == call_id and part.get("tool") == "question":
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                part["state"] = {
+                    **state,
+                    "status": "completed",
+                    "output": data.get("tool_output") if isinstance(data.get("tool_output"), dict) else self._fallback_question_output(data),
+                }
+                matched = True
+        if not matched:
+            return
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "step-finish" and part.get("reason") == "tool_pending":
+                part["reason"] = "tool_completed"
+        info = message.get("info") if isinstance(message.get("info"), dict) else {}
+        if info.get("role") == "assistant":
+            info["finish"] = "tool_completed"
+
+    def _fallback_question_output(self, data: dict[str, Any]) -> dict[str, Any]:
+        """缺少完整工具输出时，用 interaction 结果生成可读的工具输出。"""
+        result = data.get("result") if isinstance(data.get("result"), dict) else {}
+        return {
+            "status": "ok",
+            "tool_name": "question",
+            "question_id": data.get("interaction_id"),
+            "answers": result.get("answers") if isinstance(result.get("answers"), dict) else {},
+            "output": data.get("output") or "用户已回答 question 工具提出的问题。",
         }
 
     async def _upsert_session_meta(self, path: Path, record: dict[str, Any]) -> None:

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from codepilot.context import ContextCompressionError, ContextCompressor
-from codepilot.events import ApprovalEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, StreamEvent
+from codepilot.events import HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookContext, HookManager, HookResult, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
@@ -110,13 +110,20 @@ class ApprovalCoordinator:
         session.updated_at = utc_now_iso()
         approval_result_holder["result"] = None
 
+        resume_item = approval.resume_item or {}
         await runtime.event_bus.publish_domain_event(
-            ApprovalEvent(
+            HumanInteractionEvent(
                 session_id=session.session_id,
-                approval_id=approval.request.approval_id,
-                status="pending",
+                interaction_id=approval.request.approval_id,
                 created_at=utc_now_iso(),
-                data=approval.request.model_dump(),
+                data={
+                    "kind": "approval",
+                    "status": "pending",
+                    "interaction_id": approval.request.approval_id,
+                    "message_id": self._pending_tool_message_id(session, resume_item),
+                    "call_id": resume_item.get("tool_call_id"),
+                    "request": approval.request.model_dump(),
+                },
             )
         )
         await runtime.event_bus.publish_domain_event(
@@ -144,12 +151,16 @@ class ApprovalCoordinator:
             return None
 
         await runtime.event_bus.publish_domain_event(
-            ApprovalEvent(
+            HumanInteractionEvent(
                 session_id=session.session_id,
-                approval_id=result.approval_id,
-                status="approved" if result.approved else "rejected",
+                interaction_id=result.approval_id,
                 created_at=utc_now_iso(),
-                data=result.model_dump(),
+                data={
+                    "kind": "approval",
+                    "status": "approved" if result.approved else "rejected",
+                    "interaction_id": result.approval_id,
+                    "result": result.model_dump(),
+                },
             )
         )
         await runtime.event_bus.publish_stream_event(
@@ -210,6 +221,18 @@ class ApprovalCoordinator:
             ],
         )
 
+    def _pending_tool_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
+        """定位承载 pending 工具片段的 assistant 消息，hook 审批允许为空。"""
+        call_id = resume_item.get("tool_call_id")
+        if not call_id:
+            return None
+        for message in reversed(session.messages):
+            if message.info.role != "assistant":
+                continue
+            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
+                return message.info.id
+        return None
+
 
 @dataclass(slots=True)
 class QuestionCoordinator:
@@ -231,6 +254,22 @@ class QuestionCoordinator:
         session.updated_at = utc_now_iso()
         question_result_holder["result"] = None
 
+        resume_item = question.resume_item or {}
+        await runtime.event_bus.publish_domain_event(
+            HumanInteractionEvent(
+                session_id=session.session_id,
+                interaction_id=question.request.question_id,
+                created_at=utc_now_iso(),
+                data={
+                    "kind": "question",
+                    "status": "pending",
+                    "interaction_id": question.request.question_id,
+                    "message_id": self._pending_tool_message_id(session, resume_item),
+                    "call_id": resume_item.get("tool_call_id"),
+                    "request": question.request.model_dump(),
+                },
+            )
+        )
         await runtime.event_bus.publish_domain_event(
             SessionLifecycleEvent(
                 session_id=session.session_id,
@@ -277,6 +316,18 @@ class QuestionCoordinator:
         session.status = SessionStatus.RUNNING
         session.updated_at = utc_now_iso()
         return result
+
+    def _pending_tool_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
+        """定位承载 pending question 工具片段的 assistant 消息。"""
+        call_id = resume_item.get("tool_call_id")
+        if not call_id:
+            return None
+        for message in reversed(session.messages):
+            if message.info.role != "assistant":
+                continue
+            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
+                return message.info.id
+        return None
 
     def _build_question_decline_message(
         self,
