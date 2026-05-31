@@ -46,8 +46,8 @@ class BashTool(BaseTool):
             timeout_seconds=timeout_seconds,
         )
 
-    def get_llm_description(self, *, agent_name: str | None = None) -> str:
-        if agent_name in {"plan", "explore"}:
+    def get_llm_description(self, *, agent_name: str | None = None, agent_readonly: bool | None = None) -> str:
+        if agent_readonly or agent_name in {"plan", "explore"}:
             return READONLY_DESCRIPTION
         return BUILD_DESCRIPTION
 
@@ -126,7 +126,7 @@ class BashTool(BaseTool):
                 "error_message": decision.reason,
                 "recoverable": True,
             }
-        if context.agent.name in {"plan", "explore"}:
+        if self._is_readonly_agent(context):
             self._scratch_dir(context).mkdir(parents=True, exist_ok=True)
         return await run_bash_command(
             request,
@@ -137,7 +137,7 @@ class BashTool(BaseTool):
         )
 
     def _decide(self, request: BashRequest, context: ToolExecutionContext, *, skip_approval: bool = False) -> Any:
-        if context.agent.name in {"plan", "explore"}:
+        if self._is_readonly_agent(context):
             return decide_readonly_policy(
                 request,
                 self._settings,
@@ -148,6 +148,9 @@ class BashTool(BaseTool):
         if skip_approval and decision.status == "requires_approval":
             return decision.__class__(status="allow", reason="审批已通过。")
         return decision
+
+    def _is_readonly_agent(self, context: ToolExecutionContext) -> bool:
+        return bool(getattr(context.agent, "readonly", getattr(context.agent, "name", None) in {"plan", "explore"}))
 
     def _scratch_dir(self, context: ToolExecutionContext) -> Path:
         session_id = str(context.session.session_id)

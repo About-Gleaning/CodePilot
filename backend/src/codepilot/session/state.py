@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -35,7 +35,11 @@ class SessionState(BaseModel):
 
 class AgentState(BaseModel):
     name: str
-    role: str = "main"
+    role: str = "agent"
+    kind: Literal["agent", "subagent"] = "agent"
+    readonly: bool = False
+    context_id: str | None = "main"
+    parent_call_id: str | None = None
     depth: int = 0
     parent_agent_id: str | None = None
     can_call_subagent: bool = False

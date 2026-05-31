@@ -221,7 +221,7 @@ def test_question_rejects_invalid_questions(tmp_path: Path) -> None:
 
 
 def test_agent_tool_permissions_are_scoped() -> None:
-    profiles = build_agent_profiles(max_iterations=3)
+    profiles = build_agent_profiles(max_iterations=3, subagent_max_iterations=5)
 
     assert {"bash_tool", "read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
     assert "load_skill" in profiles["build"].allowed_tools
@@ -232,7 +232,16 @@ def test_agent_tool_permissions_are_scoped() -> None:
     assert "edit_file" not in profiles["plan"].allowed_tools
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["build"].allowed_tools)
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["plan"].allowed_tools)
-    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "question"]
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill"]
+    assert profiles["build"].kind == "agent"
+    assert profiles["plan"].kind == "agent"
+    assert profiles["explore"].kind == "subagent"
+    assert "task" in profiles["build"].allowed_tools
+    assert "task" in profiles["plan"].allowed_tools
+    assert "task" not in profiles["explore"].allowed_tools
+    assert profiles["build"].max_iterations == 3
+    assert profiles["plan"].max_iterations == 3
+    assert profiles["explore"].max_iterations == 5
 
 
 def test_file_tool_descriptions_are_loaded_into_schema() -> None:

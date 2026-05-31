@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 MessageRole = Literal["user", "assistant"]
 HookMessageRole = Literal["user", "assistant"]
 ToolPartStatus = Literal["pending", "running", "completed", "error"]
+AgentKind = Literal["agent", "subagent"]
 
 
 class UserMessageTimeInfo(BaseModel):
@@ -101,6 +102,9 @@ class BaseMessageInfo(BaseModel):
 
     id: str
     session_id: str
+    agent_kind: AgentKind = "agent"
+    context_id: str | None = "main"
+    parent_call_id: str | None = None
 
 
 class UserMessageInfo(BaseMessageInfo):
@@ -324,6 +328,9 @@ def build_user_message_info(
     session_id: str,
     created_at_ms: int,
     agent: str,
+    agent_kind: AgentKind = "agent",
+    context_id: str | None = "main",
+    parent_call_id: str | None = None,
     provider_id: str,
     model_id: str,
 ) -> UserMessageInfo:
@@ -332,6 +339,9 @@ def build_user_message_info(
     return UserMessageInfo(
         id=message_id,
         session_id=session_id,
+        agent_kind=agent_kind,
+        context_id=context_id,
+        parent_call_id=parent_call_id,
         time=UserMessageTimeInfo(created=created_at_ms),
         agent=agent,
         model=MessageModelRef(provider_id=provider_id, model_id=model_id),
@@ -345,6 +355,9 @@ def build_assistant_message_info(
     created_at_ms: int,
     parent_id: str,
     agent: str,
+    agent_kind: AgentKind = "agent",
+    context_id: str | None = "main",
+    parent_call_id: str | None = None,
     provider_id: str,
     model_id: str,
     cwd: str,
@@ -355,6 +368,9 @@ def build_assistant_message_info(
     return AssistantMessageInfo(
         id=message_id,
         session_id=session_id,
+        agent_kind=agent_kind,
+        context_id=context_id,
+        parent_call_id=parent_call_id,
         time=AssistantMessageTimeInfo(created=created_at_ms),
         parent_id=parent_id,
         agent=agent,

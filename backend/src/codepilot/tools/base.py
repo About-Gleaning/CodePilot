@@ -21,6 +21,10 @@ class ToolExecutionContext:
     session: Any
     workspace: Any
     agent: Any
+    runtime: Any | None = None
+    config: Any | None = None
+    tool_call_id: str | None = None
+    stop_event: Any | None = None
 
 
 @dataclass(slots=True)
@@ -33,7 +37,7 @@ class ToolPreflightResult:
 class BaseTool(ABC):
     spec: ToolSpec
 
-    def get_llm_description(self, *, agent_name: str | None = None) -> str:
+    def get_llm_description(self, *, agent_name: str | None = None, agent_readonly: bool | None = None) -> str:
         return self.spec.description
 
     async def preflight(

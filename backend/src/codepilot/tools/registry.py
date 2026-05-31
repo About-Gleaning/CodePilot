@@ -23,6 +23,7 @@ class ToolRegistry:
     ) -> list[dict[str, object]]:
         schemas: list[dict[str, object]] = []
         agent_name = getattr(agent_profile, "name", None)
+        agent_readonly = getattr(agent_profile, "readonly", None)
         for name, tool in self._tools.items():
             if allowed_tools is not None and name not in allowed_tools:
                 continue
@@ -31,7 +32,7 @@ class ToolRegistry:
                     "type": "function",
                     "function": {
                         "name": tool.spec.name,
-                        "description": tool.get_llm_description(agent_name=agent_name),
+                        "description": tool.get_llm_description(agent_name=agent_name, agent_readonly=agent_readonly),
                         "parameters": tool.spec.input_schema,
                     },
                 }

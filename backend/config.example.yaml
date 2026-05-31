@@ -23,6 +23,7 @@ llm:
 agent:
   default_agent_name: "build"
   max_loop_iterations: 50
+  subagent_max_loop_iterations: 8
   subagent_max_depth: 1
 context:
   compression_enabled: false

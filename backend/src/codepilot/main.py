@@ -37,6 +37,7 @@ from codepilot.tools import (
     LoadSkillTool,
     McpToolAdapter,
     ReadFileTool,
+    TaskTool,
     ToolDispatcher,
     ToolRegistry,
     TodoReadTool,
@@ -98,12 +99,14 @@ def create_app() -> FastAPI:
     tool_registry.register(TodoReadTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(QuestionTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
 
     hook_manager = _build_hook_manager(settings)
     llm_client = LiteLLMClient()
     tool_dispatcher = ToolDispatcher(tool_registry, hook_manager)
-    agent_profiles = build_agent_profiles(settings.agent.max_loop_iterations)
+    agent_profiles = build_agent_profiles(
+        max_iterations=settings.agent.max_loop_iterations,
+        subagent_max_iterations=settings.agent.subagent_max_loop_iterations,
+    )
     # AgentLoop 负责单轮推理与工具调用；SessionRunner 负责面向会话编排整个执行生命周期。
     agent_loop = AgentLoop(
         llm_client=llm_client,
@@ -112,6 +115,14 @@ def create_app() -> FastAPI:
         hook_manager=hook_manager,
         skill_registry=skill_registry,
     )
+    tool_registry.register(
+        TaskTool(
+            agent_loop=agent_loop,
+            agent_profiles=agent_profiles,
+            timeout_seconds=settings.tools.default_timeout_seconds,
+        )
+    )
+    tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
     session_runner = SessionRunner(
         workspace=workspace,
         config=settings,

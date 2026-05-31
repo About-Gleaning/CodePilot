@@ -170,6 +170,9 @@ type MessageRecord = {
       completed?: number;
     };
     agent?: string;
+    agent_kind?: string;
+    context_id?: string | null;
+    parent_call_id?: string | null;
     parent_id?: string;
     model?: {
       provider_id?: string;
@@ -215,6 +218,7 @@ function App() {
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [liveDelta, setLiveDelta] = useState('');
+  const [subagentLiveDeltas, setSubagentLiveDeltas] = useState<Record<string, string>>({});
   const [lastSeq, setLastSeq] = useState(0);
   const lastSeqRef = useRef(0);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -282,6 +286,7 @@ function App() {
       applyProviderAndModelState(statusRes);
       setAgentName(statusRes.agent_name || 'build');
       setMessages(replayRes.messages);
+      setSubagentLiveDeltas({});
       setSessionHistory(sessionsRes.sessions);
       connectStream(0);
     } catch (error) {
@@ -320,12 +325,28 @@ function App() {
       setEvents((prev) => [...prev, event].slice(-200));
     }
     if (event.event_type === 'llm_delta') {
-      setLiveDelta((prev) => prev + String(event.data.text || ''));
+      const text = String(event.data.text || '');
+      if (event.data.agent_kind === 'subagent') {
+        const key = String(event.data.context_id || event.data.parent_call_id || 'subagent');
+        setSubagentLiveDeltas((prev) => ({ ...prev, [key]: (prev[key] || '') + text }));
+      } else {
+        setLiveDelta((prev) => prev + text);
+      }
     }
     if (event.event_type === 'assistant_message_completed') {
-      setLiveDelta('');
       if (event.data.message && typeof event.data.message === 'object') {
-        setMessages((prev) => upsertMessage(prev, event.data.message as MessageRecord));
+        const message = event.data.message as MessageRecord;
+        if (message.info?.agent_kind === 'subagent') {
+          const key = String(message.info.context_id || message.info.parent_call_id || 'subagent');
+          setSubagentLiveDeltas((prev) => {
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
+        } else {
+          setLiveDelta('');
+        }
+        setMessages((prev) => upsertMessage(prev, message));
       }
     }
     if (event.event_type === 'user_message_created') {
@@ -442,6 +463,7 @@ function App() {
     setMessages([]);
     setEvents([]);
     setLiveDelta('');
+    setSubagentLiveDeltas({});
     setApprovalRequest(null);
     setApprovalComment('');
     setQuestionRequest(null);
@@ -465,6 +487,7 @@ function App() {
       setMessages(replay.messages);
       setEvents([]);
       setLiveDelta('');
+      setSubagentLiveDeltas({});
       setApprovalRequest(null);
       setApprovalComment('');
       setQuestionRequest(null);
@@ -768,6 +791,18 @@ function App() {
               <MarkdownContent className="message-live-text" text={liveDelta} />
             </article>
           ) : null}
+          {Object.entries(subagentLiveDeltas).map(([key, text]) => (
+            <article className="message-card assistant streaming-card subagent-card" key={key}>
+              <div className="message-meta">
+                <span className="role-badge assistant">
+                  <Bot size={13} />
+                  subagent
+                </span>
+                <span className="muted-inline">{key}</span>
+              </div>
+              <MarkdownContent className="message-live-text" text={text} />
+            </article>
+          ))}
         </section>
 
         <form className={`composer ${approvalRequest || questionRequest ? 'has-approval' : ''}`} onSubmit={handleStart}>
@@ -1153,15 +1188,19 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
 function MessageItem({ message, index }: { message: MessageRecord; index: number }) {
   const role = String(message.info?.role || 'unknown');
   const isAssistant = role === 'assistant';
+  const agentKind = String(message.info?.agent_kind || 'agent');
+  const agentName = String(message.info?.agent || '');
 
   return (
-    <article className={`message-card ${isAssistant ? 'assistant' : 'user'}`}>
+    <article className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
       <div className="message-meta">
         <span className={`role-badge ${isAssistant ? 'assistant' : 'user'}`}>
           {isAssistant ? <Bot size={13} /> : <Terminal size={13} />}
-          {role}
+          {agentKind === 'subagent' ? 'subagent' : role}
         </span>
+        {agentName ? <span className="muted-inline">{agentName}</span> : null}
         <span className="muted-inline">#{index + 1}</span>
+        {message.info?.parent_call_id ? <span className="muted-inline">task {message.info.parent_call_id}</span> : null}
         {message.info?.time?.created ? (
           <span className="muted-inline">{formatTime(message.info.time.created)}</span>
         ) : null}
@@ -1563,15 +1602,16 @@ function getEventTone(eventType: string) {
 }
 
 function buildEventSummary(event: StreamEvent) {
+  const agentPrefix = event.data.agent ? `${String(event.data.agent)} · ` : '';
   if (event.event_type === 'llm_delta') {
     const text = String(event.data.text || '');
-    return text ? text.slice(0, 48) : 'delta';
+    return `${agentPrefix}${text ? text.slice(0, 48) : 'delta'}`;
   }
   if (event.data.status) {
-    return String(event.data.status);
+    return `${agentPrefix}${String(event.data.status)}`;
   }
   if (event.data.reason) {
-    return String(event.data.reason).slice(0, 48);
+    return `${agentPrefix}${String(event.data.reason).slice(0, 48)}`;
   }
   if (event.event_type === 'context_compacted') {
     const beforeTokens = event.data.before_tokens ?? '-';
@@ -1580,9 +1620,9 @@ function buildEventSummary(event: StreamEvent) {
   }
   if (event.data.message && typeof event.data.message === 'object') {
     const message = event.data.message as MessageRecord;
-    return String(message.info?.role || 'message');
+    return `${agentPrefix}${String(message.info?.role || 'message')}`;
   }
-  return event.session_id || event.created_at;
+  return `${agentPrefix}${event.session_id || event.created_at}`;
 }
 
 function formatTime(timestamp: number) {

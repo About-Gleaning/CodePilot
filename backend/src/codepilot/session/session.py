@@ -17,10 +17,10 @@ from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.flow import ApprovalCoordinator, QuestionCoordinator, SessionMessageAppender, TurnExecutor, TurnResult
-from codepilot.session.message import AssistantMessageInfo, ToolPart, ToolPartState
+from codepilot.session.message import AssistantMessageInfo, Message, TextPart, ToolPart, ToolPartState, build_user_message_info
 from codepilot.session.state import AgentState, ApprovalResult, LLMState, PendingApproval, PendingQuestion, QuestionResult, SessionState, SessionStatus
 from codepilot.tools import ToolDispatcher, ToolRegistry
-from codepilot.utils import utc_now_iso, utc_now_millis
+from codepilot.utils import new_message_id, new_context_id, utc_now_iso, utc_now_millis
 
 
 @dataclass(slots=True)
@@ -132,13 +132,108 @@ class AgentLoop:
             )
         return await self._finish(session, runtime)
 
-    def _build_agent_state(self, session: SessionState, agent_profile: AgentProfile) -> AgentState:
+    async def run_subagent(
+        self,
+        *,
+        parent_session: SessionState,
+        workspace: Any,
+        agent_profile: AgentProfile,
+        task: str,
+        parent_call_id: str,
+        runtime: RuntimeHandles,
+        config: Any,
+        stop_event: Any,
+    ) -> SessionState:
+        """执行一次独立 subagent loop，只沉淀消息和工具事件，不发布父会话生命周期。"""
+        context_id = new_context_id()
+        child_session = SessionState(
+            session_id=parent_session.session_id,
+            title=parent_session.title,
+            workspace_id=parent_session.workspace_id,
+            workspace_path=parent_session.workspace_path,
+            agent_name=agent_profile.name,
+            provider=parent_session.provider,
+            model=parent_session.model,
+            status=SessionStatus.RUNNING,
+            created_at=utc_now_iso(),
+            updated_at=utc_now_iso(),
+            metadata={
+                "agent_context_id": context_id,
+                "parent_call_id": parent_call_id,
+                "agent_kind": agent_profile.kind,
+            },
+        )
+        agent_state = self._build_agent_state(
+            child_session,
+            agent_profile,
+            context_id=context_id,
+            parent_call_id=parent_call_id,
+        )
+        child_session.messages.append(
+            self._build_subagent_task_message(parent_session, agent_state, task)
+        )
+        ctx = _RunContext(
+            session=child_session,
+            workspace=workspace,
+            agent_profile=agent_profile,
+            runtime=runtime,
+            config=config,
+            approval_event=None,
+            approval_result_holder={"result": None},
+            question_event=None,
+            question_result_holder={"result": None},
+            stop_event=stop_event,
+            agent_state=agent_state,
+            llm_state=self._build_llm_state(parent_session, config),
+        )
+        task_message = child_session.messages.pop()
+        await self._message_appender.append(child_session, task_message, runtime)
+        await runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="user_message_created",
+                session_id=child_session.session_id,
+                created_at=utc_now_iso(),
+                data={**self._agent_event_data(agent_state), "message": task_message.model_dump()},
+            )
+        )
+        await self._run_iterations(ctx)
+        return child_session
+
+    def _build_agent_state(
+        self,
+        session: SessionState,
+        agent_profile: AgentProfile,
+        *,
+        context_id: str | None = None,
+        parent_call_id: str | None = None,
+    ) -> AgentState:
+        resolved_context_id = context_id or str(session.metadata.get("agent_context_id") or "main")
         return AgentState(
             name=agent_profile.name,
-            role="main" if agent_profile.name != "subagent" else "subagent",
+            role=agent_profile.kind,
+            kind=agent_profile.kind,
+            readonly=agent_profile.readonly,
+            context_id=resolved_context_id,
+            parent_call_id=parent_call_id or session.metadata.get("parent_call_id"),
             depth=int(session.metadata.get("agent_depth", 0)),
             parent_agent_id=session.metadata.get("parent_agent_id"),
             can_call_subagent=agent_profile.can_call_subagent,
+        )
+
+    def _build_subagent_task_message(self, session: SessionState, agent_state: AgentState, task: str) -> Message:
+        return Message(
+            info=build_user_message_info(
+                message_id=new_message_id(),
+                session_id=session.session_id,
+                created_at_ms=utc_now_millis(),
+                agent=agent_state.name,
+                agent_kind=agent_state.kind,
+                context_id=agent_state.context_id,
+                parent_call_id=agent_state.parent_call_id,
+                provider_id=session.provider,
+                model_id=session.model,
+            ),
+            parts=[TextPart(text=task, synthetic=True, metadata={"source": "task_tool"})],
         )
 
     def _build_llm_state(self, session: SessionState, config: Any) -> LLMState:
@@ -233,6 +328,7 @@ class AgentLoop:
             runtime=ctx.runtime,
             config=ctx.config,
             iteration=iteration,
+            stop_event=ctx.stop_event,
         )
 
     async def _handle_turn_result(self, ctx: _RunContext, turn_result: TurnResult, iteration: int) -> bool:
@@ -264,6 +360,9 @@ class AgentLoop:
         stop_after_approval: bool = False,
     ) -> bool:
         """处理单轮执行产生的人工审批，并按原逻辑恢复可能挂起的工具调用。"""
+        if ctx.agent_state.kind == "subagent":
+            await self._fail_subagent_human_approval(ctx, approval)
+            return False
         result = await self._wait_for_approval(ctx, approval)
         if self._is_rejected(result):
             return False
@@ -274,6 +373,25 @@ class AgentLoop:
 
         await self._resume_approved_tool_call(ctx, approval)
         return await self._run_loop_after_approved_tool(ctx, iteration)
+
+    async def _fail_subagent_human_approval(self, ctx: _RunContext, approval: PendingApproval) -> None:
+        """subagent 没有独立审批入口，遇到审批请求必须失败退出，避免前端等待不可恢复。"""
+        message = "subagent 不支持人工审批，请由父 Agent 拆分为无需人工确认的探查任务。"
+        ctx.session.status = SessionStatus.FAILED
+        ctx.session.metadata["subagent_error"] = message
+        ctx.session.updated_at = utc_now_iso()
+        await ctx.runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="error",
+                session_id=ctx.session.session_id,
+                created_at=utc_now_iso(),
+                data={
+                    **self._agent_event_data(ctx.agent_state),
+                    "message": message,
+                    "approval_id": approval.request.approval_id,
+                },
+            )
+        )
 
     async def _handle_pending_question(
         self,
@@ -387,6 +505,7 @@ class AgentLoop:
             item=approval.resume_item,
             runtime=ctx.runtime,
             config=ctx.config,
+            stop_event=ctx.stop_event,
         )
         self._merge_approved_tool_result(ctx.session, approved_tool_part)
         await ctx.runtime.event_bus.publish_stream_event(
@@ -422,7 +541,12 @@ class AgentLoop:
 
     async def _publish_loop_started(self, ctx: _RunContext) -> None:
         await ctx.runtime.event_bus.publish_stream_event(
-            StreamEvent(event_type="loop_started", session_id=ctx.session.session_id, created_at=utc_now_iso(), data={})
+            StreamEvent(
+                event_type="loop_started",
+                session_id=ctx.session.session_id,
+                created_at=utc_now_iso(),
+                data=self._agent_event_data(ctx.agent_state),
+            )
         )
 
     async def _publish_iteration_started(self, ctx: _RunContext, iteration: int) -> None:
@@ -431,7 +555,7 @@ class AgentLoop:
                 event_type="loop_iteration_started",
                 session_id=ctx.session.session_id,
                 created_at=utc_now_iso(),
-                data={"iteration": iteration},
+                data={**self._agent_event_data(ctx.agent_state), "iteration": iteration},
             )
         )
 
@@ -441,7 +565,7 @@ class AgentLoop:
                 event_type="loop_iteration_finished",
                 session_id=ctx.session.session_id,
                 created_at=utc_now_iso(),
-                data={"iteration": iteration},
+                data={**self._agent_event_data(ctx.agent_state), "iteration": iteration},
             )
         )
 
@@ -452,9 +576,17 @@ class AgentLoop:
                 event_type="loop_finished",
                 session_id=ctx.session.session_id,
                 created_at=utc_now_iso(),
-                data={"status": ctx.session.status.value},
+                data={**self._agent_event_data(ctx.agent_state), "status": ctx.session.status.value},
             )
         )
+
+    def _agent_event_data(self, agent_state: AgentState) -> dict[str, Any]:
+        return {
+            "agent": agent_state.name,
+            "agent_kind": agent_state.kind,
+            "context_id": agent_state.context_id,
+            "parent_call_id": agent_state.parent_call_id,
+        }
 
     async def _finish(self, session: SessionState, runtime: RuntimeHandles) -> SessionState:
         """统一发送会话结束事件，并返回最终会话对象。

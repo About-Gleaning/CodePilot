@@ -301,6 +301,40 @@ def test_builtin_session_title_hook_is_not_registered() -> None:
     assert title_hooks == []
 
 
+def test_subagent_approval_request_fails_without_human_waiting() -> None:
+    settings = build_settings()
+    parent_session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = RecordingEventBus()
+    hook_manager = _build_hook_manager(settings)
+    llm_client = StubLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=StubToolDispatcher(),
+        hook_manager=hook_manager,
+    )
+
+    result = asyncio.run(
+        loop.run_subagent(
+            parent_session=parent_session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="explore", system_prompt="test", kind="subagent", max_iterations=3),
+            task="读取文件前先 [[approve]]",
+            parent_call_id="call_task_1",
+            runtime=RuntimeHandles(event_bus=event_bus),
+            config=settings,
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.status == SessionStatus.FAILED
+    assert "subagent 不支持人工审批" in result.metadata["subagent_error"]
+    assert llm_client.calls == 0
+    assert "human_approval_required" not in [event.event_type for event in event_bus.stream_events]
+    assert [event.event_type for event in event_bus.stream_events].count("error") == 1
+
+
 def test_agent_loop_runs_session_hooks_around_loop() -> None:
     settings = build_settings()
     session = build_session()

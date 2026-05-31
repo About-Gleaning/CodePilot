@@ -756,6 +756,16 @@ pre {
     rgba(12, 17, 15, 0.88);
 }
 
+.message-card.subagent-card::before {
+  background: var(--cyan);
+}
+
+.message-card.subagent-card {
+  background:
+    linear-gradient(90deg, rgba(88, 199, 217, 0.06), transparent 34%),
+    rgba(12, 17, 15, 0.88);
+}
+
 .message-live-text,
 .message-text {
   margin-top: 11px;

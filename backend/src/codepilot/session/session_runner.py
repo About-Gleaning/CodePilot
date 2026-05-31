@@ -379,6 +379,8 @@ class SessionRunner:
         """在进入执行链前显式校验 agent，避免后续字典取值抛出不友好的 KeyError。"""
         if not agent_name or agent_name not in self._agent_profiles:
             raise ValueError(f"agent `{agent_name}` 不存在或不可用")
+        if getattr(self._agent_profiles[agent_name], "kind", "agent") != "agent":
+            raise ValueError(f"agent `{agent_name}` 不能直接从前端选择")
 
     def _build_user_message(self, gateway_input: GatewayInput) -> Message:
         """把网关输入转换为统一的用户消息结构，写入 session 消息列表。"""

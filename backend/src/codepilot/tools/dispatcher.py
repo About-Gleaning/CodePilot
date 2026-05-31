@@ -36,12 +36,15 @@ class ToolDispatcher:
         tool_calls: list[dict[str, Any]],
         runtime: RuntimeHandles,
         config: Any,
+        stop_event: Any | None = None,
     ) -> ToolExecutionBatch:
         result_parts: list[ToolPart] = []
         for group in self._group_tool_calls(tool_calls):
             if any(not item["spec"].can_parallel for item in group):
                 for item in group:
-                    part, approval, question = await self._execute_one(session, workspace, agent, item, runtime, config)
+                    part, approval, question = await self._execute_one(
+                        session, workspace, agent, item, runtime, config, stop_event=stop_event
+                    )
                     if approval:
                         return ToolExecutionBatch(
                             tool_parts=result_parts,
@@ -55,7 +58,10 @@ class ToolDispatcher:
                     result_parts.append(part)
             else:
                 group_results = await asyncio.gather(
-                    *[self._execute_one(session, workspace, agent, item, runtime, config) for item in group]
+                    *[
+                        self._execute_one(session, workspace, agent, item, runtime, config, stop_event=stop_event)
+                        for item in group
+                    ]
                 )
                 for item, (part, approval, question) in zip(group, group_results, strict=False):
                     if approval:
@@ -80,13 +86,16 @@ class ToolDispatcher:
         item: dict[str, Any],
         runtime: RuntimeHandles,
         config: Any,
+        stop_event: Any | None = None,
     ) -> ToolPart:
         tool = item.get("tool")
         if tool is None:
             tool = self._registry.get(item["tool_name"])
             item["tool"] = tool
             item["spec"] = tool.spec if tool else None
-        part, _, _ = await self._execute_one(session, workspace, agent, item, runtime, config, skip_approval=True)
+        part, _, _ = await self._execute_one(
+            session, workspace, agent, item, runtime, config, skip_approval=True, stop_event=stop_event
+        )
         return part
 
     def _group_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
@@ -121,16 +130,26 @@ class ToolDispatcher:
         runtime: RuntimeHandles,
         config: Any,
         skip_approval: bool = False,
+        stop_event: Any | None = None,
     ) -> tuple[ToolPart, ApprovalRequest | None, QuestionRequest | None]:
         tool: BaseTool | None = item.get("tool")
         tool_name = item["tool_name"]
         tool_args = item.get("arguments", {})
-        tool_call_id = item.get("tool_call_id")
+        tool_call_id = item.get("tool_call_id") or f"call_{utc_now_iso()}"
+        item["tool_call_id"] = tool_call_id
 
         if tool is None:
             return self._build_tool_part(tool_call_id, tool_name, self._missing_tool_result(tool_name)), None, None
 
-        tool_context = ToolExecutionContext(session=session, workspace=workspace, agent=agent)
+        tool_context = ToolExecutionContext(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            runtime=runtime,
+            config=config,
+            tool_call_id=tool_call_id,
+            stop_event=stop_event,
+        )
         if not skip_approval:
             preflight = await tool.preflight(tool_args, tool_context)
             if preflight.status == "blocked" and preflight.result is not None:
@@ -172,7 +191,12 @@ class ToolDispatcher:
                 event_type="tool_call_started",
                 session_id=session.session_id,
                 created_at=utc_now_iso(),
-                data={"tool_name": tool_name, "tool_call_id": tool_call_id, "args": tool_args},
+                data={
+                    **self._agent_event_data(agent),
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "args": tool_args,
+                },
             )
         )
 
@@ -213,10 +237,23 @@ class ToolDispatcher:
                 event_type="tool_call_finished" if result.get("status") != "error" else "tool_call_failed",
                 session_id=session.session_id,
                 created_at=utc_now_iso(),
-                data={"tool_name": tool_name, "tool_call_id": tool_call_id, "result": result},
+                data={
+                    **self._agent_event_data(agent),
+                    "tool_name": tool_name,
+                    "tool_call_id": tool_call_id,
+                    "result": result,
+                },
             )
         )
         return self._build_tool_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
+
+    def _agent_event_data(self, agent: AgentState) -> dict[str, Any]:
+        return {
+            "agent": getattr(agent, "name", None),
+            "agent_kind": getattr(agent, "kind", "agent"),
+            "context_id": getattr(agent, "context_id", None),
+            "parent_call_id": getattr(agent, "parent_call_id", None),
+        }
 
     def _build_pending_tool_part(self, tool_call_id: str | None, tool_name: str, tool_args: dict[str, Any]) -> ToolPart:
         return ToolPart(

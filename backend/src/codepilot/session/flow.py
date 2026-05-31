@@ -378,6 +378,7 @@ class TurnExecutor:
         runtime: RuntimeHandles,
         config: Any,
         iteration: int,
+        stop_event: Any | None = None,
     ) -> TurnResult:
         """按固定顺序执行 Hook、LLM、工具与后置 Hook，并返回下一步控制信号。"""
 
@@ -449,6 +450,7 @@ class TurnExecutor:
             iteration=iteration,
             tool_calls=stream_result.tool_calls,
             assistant_message=assistant_message,
+            stop_event=stop_event,
         )
 
     async def _run_loop_before_stage(
@@ -488,6 +490,7 @@ class TurnExecutor:
                 config=config,
                 llm_state=llm_state,
                 llm_client=self.llm_client,
+                context_id=agent_state.context_id,
             )
         except ContextCompressionError as exc:
             await runtime.event_bus.publish_stream_event(
@@ -495,7 +498,7 @@ class TurnExecutor:
                     event_type="assistant_message_started",
                     session_id=session.session_id,
                     created_at=utc_now_iso(),
-                    data={"iteration": iteration, "stage": "context_compression"},
+                    data={**self._agent_event_data(agent_state), "iteration": iteration, "stage": "context_compression"},
                 )
             )
             assistant_message = self._build_context_compression_error_message(session, agent_state, exc)
@@ -511,7 +514,11 @@ class TurnExecutor:
                     data={
                         **compression_result.to_event_data(),
                         "metadata": session.metadata,
-                        "messages": [message.model_dump() for message in session.messages],
+                        "messages": [
+                            message.model_dump()
+                            for message in session.messages
+                            if (message.info.context_id or "main") == compression_result.context_id
+                        ],
                     },
                 )
             )
@@ -520,7 +527,7 @@ class TurnExecutor:
                     event_type="context_compacted",
                     session_id=session.session_id,
                     created_at=utc_now_iso(),
-                    data=compression_result.to_event_data(),
+                    data={**self._agent_event_data(agent_state), **compression_result.to_event_data()},
                 )
             )
         return None
@@ -566,7 +573,7 @@ class TurnExecutor:
             skill_registry=self.skill_registry,
         )
         provider_messages = self.llm_client.build_provider_messages(
-            session.messages,
+            self._messages_for_context(session, agent_state.context_id),
             system_prompt=system_prompt,
         )
         await runtime.event_bus.publish_stream_event(
@@ -574,7 +581,7 @@ class TurnExecutor:
                 event_type="assistant_message_started",
                 session_id=session.session_id,
                 created_at=utc_now_iso(),
-                data={"iteration": iteration},
+                data={**self._agent_event_data(agent_state), "iteration": iteration},
             )
         )
         try:
@@ -583,7 +590,7 @@ class TurnExecutor:
                 llm_state=llm_state,
                 provider_messages=provider_messages,
                 tools=self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools, agent_profile=agent_profile),
-                event_bus=runtime.event_bus,
+                event_bus=_AgentEventBus(runtime.event_bus, self._agent_event_data(agent_state)),
             )
         except Exception as exc:  # noqa: BLE001
             assistant_message = self._build_llm_error_message(session, agent_state, exc)
@@ -642,6 +649,7 @@ class TurnExecutor:
         iteration: int,
         tool_calls: list[dict[str, Any]],
         assistant_message: Message,
+        stop_event: Any | None = None,
     ) -> TurnResult:
         # 没有工具调用时，本轮到此闭环：补完成标记、落消息、通知前端完成。
         if not tool_calls:
@@ -657,6 +665,7 @@ class TurnExecutor:
             tool_calls=tool_calls,
             runtime=runtime,
             config=config,
+            stop_event=stop_event,
         )
         # 工具执行结果会替换原先 pending 的 ToolPart，保证一条 assistant 消息包含完整行动轨迹。
         # 先合并再落库，避免历史记录中出现只有 pending、缺少最终结果的 assistant 行动消息。
@@ -778,10 +787,12 @@ class TurnExecutor:
             parts.append(TextPart(text=text))
         if reasoning:
             parts.append(ReasoningPart(text=reasoning))
-        for tool_call in tool_calls:
+        for index, tool_call in enumerate(tool_calls):
+            call_id = tool_call.get("tool_call_id") or f"call_{message_id}_{index}"
+            tool_call["tool_call_id"] = call_id
             parts.append(
                 ToolPart(
-                    call_id=tool_call.get("tool_call_id") or f"call_{message_id}",
+                    call_id=call_id,
                     tool=tool_call["tool_name"],
                     state={
                         "status": "pending",
@@ -798,6 +809,9 @@ class TurnExecutor:
                 created_at_ms=utc_now_millis(),
                 parent_id=self._find_latest_user_message_id(session),
                 agent=agent_state.name,
+                agent_kind=agent_state.kind,
+                context_id=agent_state.context_id,
+                parent_call_id=agent_state.parent_call_id,
                 provider_id=session.provider,
                 model_id=session.model,
                 cwd=str(Path.cwd()),
@@ -911,6 +925,18 @@ class TurnExecutor:
                 return message.info.id
         raise ValueError("assistant 消息缺少可关联的用户父消息")
 
+    def _agent_event_data(self, agent_state: AgentState) -> dict[str, Any]:
+        return {
+            "agent": agent_state.name,
+            "agent_kind": agent_state.kind,
+            "context_id": agent_state.context_id,
+            "parent_call_id": agent_state.parent_call_id,
+        }
+
+    def _messages_for_context(self, session: SessionState, context_id: str | None) -> list[Message]:
+        target_context_id = context_id or "main"
+        return [message for message in session.messages if (message.info.context_id or "main") == target_context_id]
+
     async def _publish_assistant_message_completed(
         self,
         session: SessionState,
@@ -922,6 +948,26 @@ class TurnExecutor:
                 event_type="assistant_message_completed",
                 session_id=session.session_id,
                 created_at=utc_now_iso(),
-                data={"message": assistant_message.model_dump()},
+                data={**self._agent_event_data(agent_state_from_message(assistant_message)), "message": assistant_message.model_dump()},
             )
         )
+
+
+def agent_state_from_message(message: Message) -> AgentState:
+    return AgentState(
+        name=getattr(message.info, "agent", ""),
+        kind=getattr(message.info, "agent_kind", "agent"),
+        role=getattr(message.info, "agent_kind", "agent"),
+        context_id=getattr(message.info, "context_id", None),
+        parent_call_id=getattr(message.info, "parent_call_id", None),
+    )
+
+
+class _AgentEventBus:
+    def __init__(self, event_bus: Any, agent_data: dict[str, Any]) -> None:
+        self._event_bus = event_bus
+        self._agent_data = agent_data
+
+    async def publish_stream_event(self, event: StreamEvent) -> StreamEvent:
+        event.data = {**self._agent_data, **(event.data or {})}
+        return await self._event_bus.publish_stream_event(event)

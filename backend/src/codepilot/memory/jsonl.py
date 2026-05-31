@@ -79,7 +79,11 @@ class JsonlSessionMemory:
             if record["record_type"] == "human_interaction":
                 self._apply_human_interaction(messages, record)
             if record["record_type"] == "session_compacted":
-                messages = list(record["data"].get("messages") or [])
+                data = record.get("data") if isinstance(record.get("data"), dict) else {}
+                if data.get("scope") == "context":
+                    messages = self._replace_context_messages(messages, str(data.get("context_id") or "main"), data.get("messages") or [])
+                else:
+                    messages = list(data.get("messages") or [])
             if record["record_type"] in {"session_started", "session_status_changed", "session_finished", "session_failed"}:
                 # 状态节点只保存运行态字段，回放时与首行 session_meta 合成完整 SessionState。
                 session_data = {**session_data, **(record.get("data") or {})}
@@ -207,6 +211,27 @@ class JsonlSessionMemory:
             "answers": result.get("answers") if isinstance(result.get("answers"), dict) else {},
             "output": data.get("output") or "用户已回答 question 工具提出的问题。",
         }
+
+    def _replace_context_messages(
+        self,
+        messages: list[dict[str, Any]],
+        context_id: str,
+        replacement: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        replaced = False
+        result: list[dict[str, Any]] = []
+        for message in messages:
+            info = message.get("info") if isinstance(message.get("info"), dict) else {}
+            message_context_id = str(info.get("context_id") or "main")
+            if message_context_id != context_id:
+                result.append(message)
+                continue
+            if not replaced:
+                result.extend(item for item in replacement if isinstance(item, dict))
+                replaced = True
+        if not replaced:
+            result.extend(item for item in replacement if isinstance(item, dict))
+        return result
 
     async def _upsert_session_meta(self, path: Path, record: dict[str, Any]) -> None:
         """创建或更新首行 session_meta，避免全局展示信息散落在状态节点中。"""
@@ -345,7 +370,7 @@ class JsonlSessionMemory:
         created_at = ""
         updated_at = ""
         status = ""
-        message_count = 0
+        summary_messages: list[dict[str, Any]] = []
         preview = ""
         session_meta = self._require_session_meta(records)
         session_data.update(session_meta.get("data") or {})
@@ -357,12 +382,18 @@ class JsonlSessionMemory:
             if record_created_at and record.get("record_type") != "session_meta":
                 updated_at = record_created_at
             if record.get("record_type") == "message":
-                message_count += 1
+                data = record.get("data")
+                if isinstance(data, dict):
+                    summary_messages.append(data)
                 if not preview:
-                    preview = self._message_preview(record.get("data"))
+                    preview = self._message_preview(data)
             if record.get("record_type") == "session_compacted":
-                messages = record.get("data", {}).get("messages") or []
-                message_count = len(messages)
+                data = record.get("data") if isinstance(record.get("data"), dict) else {}
+                messages = data.get("messages") or []
+                if data.get("scope") == "context":
+                    summary_messages = self._replace_context_messages(summary_messages, str(data.get("context_id") or "main"), messages)
+                else:
+                    summary_messages = list(messages)
                 if not preview:
                     preview = self._first_message_preview(messages)
             if record.get("record_type") in {"session_started", "session_status_changed", "session_finished", "session_failed"}:
@@ -380,7 +411,7 @@ class JsonlSessionMemory:
             "agent_name": session_data.get("agent_name") or "",
             "provider": session_data.get("provider"),
             "model": session_data.get("model"),
-            "message_count": message_count,
+            "message_count": len(summary_messages),
             "preview": self._truncate_preview(preview),
         }
 

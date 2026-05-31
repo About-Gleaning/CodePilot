@@ -5,7 +5,7 @@ from pathlib import Path
 
 from codepilot.config.settings import AppSettings, ContextModelThresholdSettings
 from codepilot.context import ContextCompressor, TOOL_RESULT_PLACEHOLDER
-from codepilot.events import SessionCompactedEvent, SessionMetaEvent
+from codepilot.events import MessageCreatedEvent, SessionCompactedEvent, SessionMetaEvent
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import LLMState, Message, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
 from codepilot.utils import utc_now_iso
@@ -46,13 +46,24 @@ def build_session(messages: list[Message]) -> SessionState:
     )
 
 
-def user_message(message_id: str, text: str) -> Message:
+def user_message(
+    message_id: str,
+    text: str,
+    *,
+    agent: str = "build",
+    agent_kind: str = "agent",
+    context_id: str = "main",
+    parent_call_id: str | None = None,
+) -> Message:
     return Message(
         info=build_user_message_info(
             message_id=message_id,
             session_id="session_1",
             created_at_ms=1_746_000_000_000,
-            agent="build",
+            agent=agent,
+            agent_kind=agent_kind,  # type: ignore[arg-type]
+            context_id=context_id,
+            parent_call_id=parent_call_id,
             provider_id="openai",
             model_id="gpt-5.3-codex",
         ),
@@ -60,7 +71,16 @@ def user_message(message_id: str, text: str) -> Message:
     )
 
 
-def assistant_message(message_id: str, text: str, tool_output: dict[str, object] | None = None) -> Message:
+def assistant_message(
+    message_id: str,
+    text: str,
+    tool_output: dict[str, object] | None = None,
+    *,
+    agent: str = "build",
+    agent_kind: str = "agent",
+    context_id: str = "main",
+    parent_call_id: str | None = None,
+) -> Message:
     parts: list[object] = [TextPart(text=text)]
     if tool_output is not None:
         parts.append(
@@ -80,7 +100,10 @@ def assistant_message(message_id: str, text: str, tool_output: dict[str, object]
             session_id="session_1",
             created_at_ms=1_746_000_000_001,
             parent_id="user_1",
-            agent="build",
+            agent=agent,
+            agent_kind=agent_kind,  # type: ignore[arg-type]
+            context_id=context_id,
+            parent_call_id=parent_call_id,
             provider_id="openai",
             model_id="gpt-5.3-codex",
             cwd="/tmp/codepilot",
@@ -130,6 +153,76 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
         assert [message.info.id for message in session.messages[1:]] == ["user_2", "assistant_2"]
         assert "历史上下文摘要" in session.messages[0].text_content()
         assert session.metadata["context_compression"]["compacted_until_message_id"] == "assistant_1"
+
+    asyncio.run(run_case())
+
+
+def test_context_compressor_only_replaces_target_context_messages() -> None:
+    async def run_case() -> None:
+        session = build_session(
+            [
+                user_message("user_1", "第一轮需求"),
+                assistant_message("assistant_1", "第一轮回答"),
+                user_message(
+                    "sub_user_1",
+                    "读取 README",
+                    agent="explore",
+                    agent_kind="subagent",
+                    context_id="ctx_sub",
+                    parent_call_id="call_task_1",
+                ),
+                assistant_message(
+                    "sub_assistant_1",
+                    "README 结论",
+                    agent="explore",
+                    agent_kind="subagent",
+                    context_id="ctx_sub",
+                    parent_call_id="call_task_1",
+                ),
+                user_message(
+                    "sub_user_2",
+                    "读取配置",
+                    agent="explore",
+                    agent_kind="subagent",
+                    context_id="ctx_sub",
+                    parent_call_id="call_task_1",
+                ),
+                assistant_message(
+                    "sub_assistant_2",
+                    "配置结论",
+                    agent="explore",
+                    agent_kind="subagent",
+                    context_id="ctx_sub",
+                    parent_call_id="call_task_1",
+                ),
+                user_message("user_2", "第二轮需求"),
+                assistant_message("assistant_2", "第二轮回答"),
+            ]
+        )
+        session.metadata["agent_context_id"] = "ctx_sub"
+        session.metadata["agent_kind"] = "subagent"
+        session.metadata["parent_call_id"] = "call_task_1"
+        compressor = ContextCompressor(token_estimator=FixedTokenEstimator(100))
+
+        result = await compressor.compress(
+            session=session,
+            config=compression_settings(),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+            llm_client=StubLLMClient(),  # type: ignore[arg-type]
+            context_id="ctx_sub",
+        )
+
+        assert result.changed is True
+        assert result.context_id == "ctx_sub"
+        assert [message.info.id for message in session.messages if message.info.context_id == "main"] == [
+            "user_1",
+            "assistant_1",
+            "user_2",
+            "assistant_2",
+        ]
+        sub_context_ids = [message.info.context_id for message in session.messages if message.info.context_id == "ctx_sub"]
+        assert sub_context_ids == ["ctx_sub", "ctx_sub", "ctx_sub"]
+        assert "历史上下文摘要" in next(message for message in session.messages if message.info.context_id == "ctx_sub").text_content()
 
     asyncio.run(run_case())
 
@@ -201,5 +294,68 @@ def test_session_compacted_record_replaces_replayed_messages(tmp_path: Path) -> 
         assert [message["info"]["id"] for message in replay["messages"]] == ["user_summary"]
         compacted_record = next(record for record in replay["records"] if record["record_type"] == "session_compacted")
         assert compacted_record["data"]["metadata"]["context_compression"]["summary_message_id"] == "user_summary"
+
+    asyncio.run(run_case())
+
+
+def test_context_scoped_session_compacted_record_replaces_only_matching_context(tmp_path: Path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        main_message = user_message("user_main", "主任务")
+        sub_message = user_message(
+            "sub_user",
+            "子任务",
+            agent="explore",
+            agent_kind="subagent",
+            context_id="ctx_sub",
+            parent_call_id="call_task_1",
+        )
+        compacted_sub_message = user_message(
+            "sub_summary",
+            "子任务摘要",
+            agent="explore",
+            agent_kind="subagent",
+            context_id="ctx_sub",
+            parent_call_id="call_task_1",
+        )
+
+        await memory.handle_domain_event(
+            SessionMetaEvent(
+                session_id="session_1",
+                created_at=utc_now_iso(),
+                data={
+                    "title": "上下文压缩",
+                    "workspace_id": "ws_1",
+                    "workspace_path": "/tmp/codepilot",
+                    "initial_user_message_id": "user_main",
+                    "updated_at": utc_now_iso(),
+                },
+            )
+        )
+        for message in [main_message, sub_message]:
+            await memory.handle_domain_event(
+                MessageCreatedEvent(
+                    session_id="session_1",
+                    created_at=utc_now_iso(),
+                    data={"record_type": "message"},
+                    message=message,
+                )
+            )
+        await memory.handle_domain_event(
+            SessionCompactedEvent(
+                session_id="session_1",
+                created_at=utc_now_iso(),
+                data={
+                    "scope": "context",
+                    "context_id": "ctx_sub",
+                    "messages": [compacted_sub_message.model_dump()],
+                    "metadata": {"context_compression": {"summary_message_id": "sub_summary"}},
+                },
+            )
+        )
+
+        replay = await memory.replay("session_1")
+
+        assert [message["info"]["id"] for message in replay["messages"]] == ["user_main", "sub_summary"]
 
     asyncio.run(run_case())

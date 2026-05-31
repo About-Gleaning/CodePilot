@@ -51,6 +51,7 @@ class LLMSettings(BaseModel):
 class AgentSettings(BaseModel):
     default_agent_name: str = "build"
     max_loop_iterations: int = 50
+    subagent_max_loop_iterations: int = 8
 
 
 class ContextModelThresholdSettings(BaseModel):

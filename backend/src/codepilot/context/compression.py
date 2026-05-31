@@ -26,6 +26,8 @@ class ContextCompressionError(RuntimeError):
 @dataclass(slots=True)
 class CompressionResult:
     changed: bool = False
+    scope: str = "context"
+    context_id: str | None = None
     before_tokens: int = 0
     after_tokens: int = 0
     before_message_count: int = 0
@@ -37,6 +39,8 @@ class CompressionResult:
     def to_event_data(self) -> dict[str, Any]:
         return {
             "changed": self.changed,
+            "scope": self.scope,
+            "context_id": self.context_id,
             "before_tokens": self.before_tokens,
             "after_tokens": self.after_tokens,
             "before_message_count": self.before_message_count,
@@ -89,15 +93,19 @@ class ContextCompressor:
         config: AppSettings,
         llm_state: LLMState,
         llm_client: LiteLLMClient,
+        context_id: str | None = None,
     ) -> CompressionResult:
         settings = config.context
-        provider_messages = llm_client.build_provider_messages(session.messages)
+        target_context_id = context_id or "main"
+        context_messages = self._messages_for_context(session.messages, target_context_id)
+        provider_messages = llm_client.build_provider_messages(context_messages)
         before_tokens = self._token_estimator.count_messages(llm_state, provider_messages)
         result = CompressionResult(
+            context_id=target_context_id,
             before_tokens=before_tokens,
             after_tokens=before_tokens,
-            before_message_count=len(session.messages),
-            after_message_count=len(session.messages),
+            before_message_count=len(context_messages),
+            after_message_count=len(context_messages),
         )
         if not settings.compression_enabled:
             return result
@@ -112,7 +120,7 @@ class ContextCompressor:
             config=config,
             llm_state=llm_state,
             llm_client=llm_client,
-            messages=deepcopy(session.messages),
+            messages=deepcopy(context_messages),
             token_estimator=self._token_estimator,
         )
         strategies: list[CompressionStrategy] = []
@@ -135,10 +143,10 @@ class ContextCompressor:
         if not result.changed:
             return result
 
-        session.messages = ctx.messages
-        provider_messages_after = llm_client.build_provider_messages(session.messages)
+        session.messages = self._replace_context_messages(session.messages, target_context_id, ctx.messages)
+        provider_messages_after = llm_client.build_provider_messages(ctx.messages)
         result.after_tokens = self._token_estimator.count_messages(llm_state, provider_messages_after)
-        result.after_message_count = len(session.messages)
+        result.after_message_count = len(ctx.messages)
         result.compacted_until_message_id = compacted_until_message_id
         result.summary_message_id = summary_message_id
         session.metadata[COMPRESSION_METADATA_KEY] = {
@@ -153,6 +161,28 @@ class ContextCompressor:
             "strategies": list(result.strategies),
         }
         session.updated_at = utc_now_iso()
+        return result
+
+    def _messages_for_context(self, messages: list[Message], context_id: str) -> list[Message]:
+        return [message for message in messages if (message.info.context_id or "main") == context_id]
+
+    def _replace_context_messages(
+        self,
+        messages: list[Message],
+        context_id: str,
+        replacement: list[Message],
+    ) -> list[Message]:
+        replaced = False
+        result: list[Message] = []
+        for message in messages:
+            if (message.info.context_id or "main") != context_id:
+                result.append(message)
+                continue
+            if not replaced:
+                result.extend(replacement)
+                replaced = True
+        if not replaced:
+            result.extend(replacement)
         return result
 
     def _resolve_threshold(
@@ -255,6 +285,9 @@ class LLMSummaryCompressionStrategy:
                 session_id=session.session_id,
                 created_at_ms=utc_now_millis(),
                 agent=session.agent_name,
+                agent_kind=session.metadata.get("agent_kind") or "agent",
+                context_id=session.metadata.get("agent_context_id") or "main",
+                parent_call_id=session.metadata.get("parent_call_id"),
                 provider_id=llm_state.provider,
                 model_id=llm_state.model,
             ),

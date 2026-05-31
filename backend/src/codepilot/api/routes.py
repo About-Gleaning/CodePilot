@@ -108,7 +108,11 @@ def build_api_router(app_state: Any) -> APIRouter:
                 "workspace_path": str(app_state.workspace.workspace_path),
                 "codepilot_home": str(app_state.workspace.codepilot_home),
                 "activated_providers": activated_providers,
-                "agents": list(app_state.agent_profiles.keys()),
+                "agents": [
+                    name
+                    for name, profile in app_state.agent_profiles.items()
+                    if getattr(profile, "kind", "agent") == "agent"
+                ],
                 "sse": settings.sse.model_dump(),
             }
         )

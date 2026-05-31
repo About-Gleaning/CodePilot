@@ -18,3 +18,7 @@ def new_session_id() -> str:
 
 def new_message_id() -> str:
     return f"msg_{uuid4().hex}"
+
+
+def new_context_id() -> str:
+    return f"ctx_{uuid4().hex}"

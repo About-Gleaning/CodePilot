@@ -29,6 +29,12 @@ Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要
 
 工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，禁止访问工作区外路径；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
 
+## Agent & Subagent Runtime Guidelines
+
+`session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。
+
+subagent 只能通过 `task` 工具由主 Agent 同步派发，不能从前端 Agent 下拉直接选择，也不能递归调用 `task`。subagent 的消息和 stream event 必须带上 `agent_kind`、`context_id` 和 `parent_call_id`，便于前端展示、jsonl 回放和审计时恢复父子关系。`SessionCompactedEvent` 若只压缩某个上下文，必须写入 `scope="context"` 和对应 `context_id`，回放时只替换该上下文消息，不能覆盖整个 session。
+
 ## Skill Development Guidelines
 
 运行期 skills 默认从 `storage.codepilot_home/skills` 扫描，每个 skill 是一个含 `SKILL.md` 的一级子目录。system prompt 只注册可用 skill 的名称和描述；完整规范必须通过 `load_skill` 工具按需加载。`load_skill` 只读取 `SKILL.md`，不执行附带脚本，也不把 skill 清单放入工具描述，避免 system prompt 与工具 schema 出现两套来源。
