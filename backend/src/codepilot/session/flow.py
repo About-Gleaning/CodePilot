@@ -11,15 +11,15 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Literal
 
 from codepilot.context import ContextCompressionError, ContextCompressor
-from codepilot.events import HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, StreamEvent
+from codepilot.events import SessionCompactedEvent, StreamEvent
 from codepilot.hooks import HookContext, HookManager, HookResult, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
+from codepilot.session.interactions import SessionMessageAppender
 from codepilot.session.message import (
     AssistantMessageError,
     AssistantMessageInfo,
@@ -31,16 +31,12 @@ from codepilot.session.message import (
     ToolPart,
     AssistantMessageTokens,
     build_assistant_message_info,
-    build_user_message_info,
 )
 from codepilot.session.state import (
     AgentState,
-    ApprovalRequest,
-    ApprovalResult,
     LLMState,
     PendingApproval,
     PendingQuestion,
-    QuestionResult,
     SessionState,
     SessionStatus,
 )
@@ -58,303 +54,6 @@ class TurnResult:
     pending_approval: PendingApproval | None = None
     pending_question: PendingQuestion | None = None
     stop_after_approval: bool = False
-
-
-@dataclass(slots=True)
-class SessionMessageAppender:
-    """统一维护消息落入 session 与对应领域事件发布。"""
-
-    async def append(self, session: SessionState, message: Message, runtime: RuntimeHandles) -> None:
-        session.messages.append(message)
-        session.updated_at = utc_now_iso()
-        await runtime.event_bus.publish_domain_event(
-            MessageCreatedEvent(
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data={"record_type": "message"},
-                message=message,
-            )
-        )
-
-    async def append_batch(self, session: SessionState, messages: list[Message], runtime: RuntimeHandles) -> None:
-        for message in messages:
-            await self.append(session, message, runtime)
-
-    async def apply_hook_result(self, session: SessionState, result: HookResult, runtime: RuntimeHandles) -> None:
-        await self.append_batch(session, result.messages_to_append, runtime)
-        for event in result.events_to_emit:
-            await runtime.event_bus.publish_stream_event(event)
-        session.metadata.update(result.context_patch)
-        session.updated_at = utc_now_iso()
-        if result.fail_session:
-            session.status = SessionStatus.FAILED
-
-
-@dataclass(slots=True)
-class ApprovalCoordinator:
-    """集中处理人工审批生命周期，避免审批状态散落在主执行流中。"""
-
-    message_appender: SessionMessageAppender
-
-    async def wait(
-        self,
-        session: SessionState,
-        approval: PendingApproval,
-        agent_state: AgentState,
-        runtime: RuntimeHandles,
-        approval_event: Any,
-        approval_result_holder: dict[str, ApprovalResult | None],
-    ) -> ApprovalResult | None:
-        """统一处理审批等待、结果广播与拒绝后的系统消息沉淀。"""
-        session.status = SessionStatus.WAITING_HUMAN
-        session.metadata["pending_human_type"] = "approval"
-        session.updated_at = utc_now_iso()
-        approval_result_holder["result"] = None
-
-        resume_item = approval.resume_item or {}
-        await runtime.event_bus.publish_domain_event(
-            HumanInteractionEvent(
-                session_id=session.session_id,
-                interaction_id=approval.request.approval_id,
-                created_at=utc_now_iso(),
-                data={
-                    "kind": "approval",
-                    "status": "pending",
-                    "interaction_id": approval.request.approval_id,
-                    "message_id": self._pending_tool_message_id(session, resume_item),
-                    "call_id": resume_item.get("tool_call_id"),
-                    "request": approval.request.model_dump(),
-                },
-            )
-        )
-        await runtime.event_bus.publish_domain_event(
-            SessionLifecycleEvent(
-                session_id=session.session_id,
-                status=session.status.value,
-                created_at=utc_now_iso(),
-                data=session.model_dump(exclude={"messages"}),
-            )
-        )
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="human_approval_required",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data=approval.request.model_dump(),
-            )
-        )
-
-        # 审批期间必须暂停会话推进，直到外部通过 holder 写入结果并唤醒事件。
-        approval_event.clear()
-        await approval_event.wait()
-        result = approval_result_holder.get("result")
-        if result is None:
-            return None
-
-        await runtime.event_bus.publish_domain_event(
-            HumanInteractionEvent(
-                session_id=session.session_id,
-                interaction_id=result.approval_id,
-                created_at=utc_now_iso(),
-                data={
-                    "kind": "approval",
-                    "status": "approved" if result.approved else "rejected",
-                    "interaction_id": result.approval_id,
-                    "result": result.model_dump(),
-                },
-            )
-        )
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="human_approval_resolved",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data=result.model_dump(),
-            )
-        )
-
-        if result.approved:
-            session.metadata.pop("pending_human_type", None)
-            session.status = SessionStatus.RUNNING
-            session.updated_at = utc_now_iso()
-            return result
-
-        # 拒绝审批会被沉淀成一条用户反馈消息，让后续历史能解释会话为何中止。
-        await self.message_appender.append(
-            session,
-            self._build_human_refusal_message(session, agent_state, approval.request, result),
-            runtime,
-        )
-        session.metadata.pop("pending_human_type", None)
-        session.status = SessionStatus.CANCELLED
-        session.updated_at = utc_now_iso()
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="session_status_changed",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data={"status": SessionStatus.CANCELLED.value},
-            )
-        )
-        return result
-
-    def _build_human_refusal_message(
-        self,
-        session: SessionState,
-        agent_state: AgentState,
-        approval: ApprovalRequest,
-        result: ApprovalResult,
-    ) -> Message:
-        return Message(
-            info=build_user_message_info(
-                message_id=new_message_id(),
-                session_id=session.session_id,
-                created_at_ms=utc_now_millis(),
-                agent=agent_state.name,
-                provider_id=session.provider,
-                model_id=session.model,
-            ),
-            parts=[
-                TextPart(
-                    text=f"人工拒绝继续执行：{result.comment or '未提供备注'}",
-                    metadata={"approval_id": approval.approval_id, "approved": result.approved},
-                ),
-            ],
-        )
-
-    def _pending_tool_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
-        """定位承载 pending 工具片段的 assistant 消息，hook 审批允许为空。"""
-        call_id = resume_item.get("tool_call_id")
-        if not call_id:
-            return None
-        for message in reversed(session.messages):
-            if message.info.role != "assistant":
-                continue
-            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
-                return message.info.id
-        return None
-
-
-@dataclass(slots=True)
-class QuestionCoordinator:
-    """集中处理 question 工具等待生命周期，与审批语义保持隔离。"""
-
-    message_appender: SessionMessageAppender
-
-    async def wait(
-        self,
-        session: SessionState,
-        question: PendingQuestion,
-        agent_state: AgentState,
-        runtime: RuntimeHandles,
-        question_event: Any,
-        question_result_holder: dict[str, QuestionResult | None],
-    ) -> QuestionResult | None:
-        session.status = SessionStatus.WAITING_HUMAN
-        session.metadata["pending_human_type"] = "question"
-        session.updated_at = utc_now_iso()
-        question_result_holder["result"] = None
-
-        resume_item = question.resume_item or {}
-        await runtime.event_bus.publish_domain_event(
-            HumanInteractionEvent(
-                session_id=session.session_id,
-                interaction_id=question.request.question_id,
-                created_at=utc_now_iso(),
-                data={
-                    "kind": "question",
-                    "status": "pending",
-                    "interaction_id": question.request.question_id,
-                    "message_id": self._pending_tool_message_id(session, resume_item),
-                    "call_id": resume_item.get("tool_call_id"),
-                    "request": question.request.model_dump(),
-                },
-            )
-        )
-        await runtime.event_bus.publish_domain_event(
-            SessionLifecycleEvent(
-                session_id=session.session_id,
-                status=session.status.value,
-                created_at=utc_now_iso(),
-                data=session.model_dump(exclude={"messages"}),
-            )
-        )
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="human_question_required",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data=question.request.model_dump(),
-            )
-        )
-
-        question_event.clear()
-        await question_event.wait()
-        result = question_result_holder.get("result")
-        if result is None:
-            return None
-
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="human_question_resolved",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data={**result.model_dump(), "continue_loop": not result.declined},
-            )
-        )
-        if result.declined:
-            await self.message_appender.append(
-                session,
-                self._build_question_decline_message(session, agent_state, question, result),
-                runtime,
-            )
-            session.metadata.pop("pending_human_type", None)
-            session.status = SessionStatus.COMPLETED
-            session.updated_at = utc_now_iso()
-            return result
-
-        session.metadata.pop("pending_human_type", None)
-        session.status = SessionStatus.RUNNING
-        session.updated_at = utc_now_iso()
-        return result
-
-    def _pending_tool_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
-        """定位承载 pending question 工具片段的 assistant 消息。"""
-        call_id = resume_item.get("tool_call_id")
-        if not call_id:
-            return None
-        for message in reversed(session.messages):
-            if message.info.role != "assistant":
-                continue
-            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
-                return message.info.id
-        return None
-
-    def _build_question_decline_message(
-        self,
-        session: SessionState,
-        agent_state: AgentState,
-        question: PendingQuestion,
-        result: QuestionResult,
-    ) -> Message:
-        question_summary = "；".join(str(item.get("question", "")) for item in question.request.questions if isinstance(item, dict))
-        suffix = f"。问题：{question_summary}" if question_summary else ""
-        return Message(
-            info=build_user_message_info(
-                message_id=new_message_id(),
-                session_id=session.session_id,
-                created_at_ms=utc_now_millis(),
-                agent=agent_state.name,
-                provider_id=session.provider,
-                model_id=session.model,
-            ),
-            parts=[
-                TextPart(
-                    text=f"用户拒绝回答 question 工具提出的问题{suffix}",
-                    metadata={"question_id": result.question_id, "declined": True},
-                ),
-            ],
-        )
 
 
 @dataclass(slots=True)
@@ -504,7 +203,7 @@ class TurnExecutor:
             )
             assistant_message = self._build_context_compression_error_message(session, agent_state, exc)
             await self.message_appender.append(session, assistant_message, runtime)
-            await self._publish_assistant_message_completed(session, assistant_message, runtime)
+            await self.publish_assistant_message_completed(session, assistant_message, runtime)
             return TurnResult(status="failed")
 
         if compression_result.changed:
@@ -596,7 +295,7 @@ class TurnExecutor:
         except Exception as exc:  # noqa: BLE001
             assistant_message = self._build_llm_error_message(session, agent_state, exc)
             await self.message_appender.append(session, assistant_message, runtime)
-            await self._publish_assistant_message_completed(session, assistant_message, runtime)
+            await self.publish_assistant_message_completed(session, assistant_message, runtime)
             return TurnResult(status="failed")
         assistant_message = self._build_assistant_message(
             session=session,
@@ -636,7 +335,7 @@ class TurnExecutor:
             # LLM_AFTER 拦截时只沉淀模型已生成的草稿；即使包含工具调用，也不能继续执行工具。
             self._append_step_finish(assistant_message, reason="stopped")
             await self.message_appender.append(session, assistant_message, runtime)
-            await self._publish_assistant_message_completed(session, assistant_message, runtime)
+            await self.publish_assistant_message_completed(session, assistant_message, runtime)
             return TurnResult(status="stopped")
         return None
 
@@ -657,7 +356,7 @@ class TurnExecutor:
         if not tool_calls:
             self._append_step_finish(assistant_message, reason="completed")
             await self.message_appender.append(session, assistant_message, runtime)
-            await self._publish_assistant_message_completed(session, assistant_message, runtime)
+            await self.publish_assistant_message_completed(session, assistant_message, runtime)
             return TurnResult(status="completed")
 
         tool_batch = await self.tool_dispatcher.execute_tool_calls(
@@ -677,7 +376,7 @@ class TurnExecutor:
             reason="tool_pending" if tool_batch.pending_approval or tool_batch.pending_question else "tool_completed",
         )
         await self.message_appender.append(session, assistant_message, runtime)
-        await self._publish_assistant_message_completed(session, assistant_message, runtime)
+        await self.publish_assistant_message_completed(session, assistant_message, runtime)
         if tool_batch.pending_approval:
             return TurnResult(status="needs_approval", pending_approval=tool_batch.pending_approval)
         if tool_batch.pending_question:
@@ -732,7 +431,7 @@ class TurnExecutor:
         config: Any,
         metadata: dict[str, Any] | None = None,
     ) -> HookResult:
-        return await self._run_hook(
+        return await self.run_hook(
             hook_type,
             session=session,
             workspace=workspace,
@@ -743,7 +442,7 @@ class TurnExecutor:
             metadata=metadata,
         )
 
-    async def _run_hook(
+    async def run_hook(
         self,
         hook_type: HookType,
         session: SessionState,
@@ -772,6 +471,30 @@ class TurnExecutor:
         result = await self.hook_manager.run(hook_type, ctx)
         await self.message_appender.apply_hook_result(session, result, runtime)
         return result
+
+    async def _run_hook(
+        self,
+        hook_type: HookType,
+        session: SessionState,
+        workspace: Any,
+        agent_state: AgentState,
+        llm_state: LLMState,
+        runtime: RuntimeHandles,
+        config: Any,
+        current_message: Message | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> HookResult:
+        return await self.run_hook(
+            hook_type,
+            session=session,
+            workspace=workspace,
+            agent_state=agent_state,
+            llm_state=llm_state,
+            runtime=runtime,
+            config=config,
+            current_message=current_message,
+            metadata=metadata,
+        )
 
     def _build_assistant_message(
         self,
@@ -817,7 +540,7 @@ class TurnExecutor:
                 parent_call_id=agent_state.parent_call_id,
                 provider_id=session.provider,
                 model_id=session.model,
-                cwd=str(Path.cwd()),
+                cwd=session.workspace_path,
                 root=session.workspace_path,
             ),
             parts=parts,
@@ -945,7 +668,25 @@ class TurnExecutor:
         target_context_id = context_id or "main"
         return [message for message in session.messages if (message.info.context_id or "main") == target_context_id]
 
-    async def _publish_assistant_message_completed(
+    def build_finished_assistant_message(
+        self,
+        session: SessionState,
+        agent_state: AgentState,
+        *,
+        text: str,
+        reason: str,
+    ) -> Message:
+        message = self._build_assistant_message(
+            session=session,
+            agent_state=agent_state,
+            text=text,
+            reasoning="",
+            tool_calls=[],
+        )
+        self._append_step_finish(message, reason=reason)
+        return message
+
+    async def publish_assistant_message_completed(
         self,
         session: SessionState,
         assistant_message: Message,

@@ -5,13 +5,13 @@ from typing import Any
 
 from dataclasses import dataclass, field
 
-from codepilot.events import StreamEvent
 from codepilot.hooks import HookContext, HookManager, HookType, RuntimeHandles
 from codepilot.logging import get_logger
-from codepilot.session import AgentState, ApprovalRequest, AssistantMessageError, PendingApproval, PendingQuestion, QuestionRequest, SessionState
-from codepilot.session.message import ToolPart, ToolPartState
+from codepilot.session import AgentState, ApprovalRequest, PendingApproval, PendingQuestion, QuestionRequest, SessionState
+from codepilot.session.message import ToolPart
 from codepilot.tools.base import BaseTool, ToolExecutionContext
 from codepilot.tools.registry import ToolRegistry
+from codepilot.tools.results import ToolEventPublisher, ToolResultBuilder
 from codepilot.utils import utc_now_iso
 
 
@@ -27,6 +27,8 @@ class ToolDispatcher:
         self._registry = registry
         self._hook_manager = hook_manager
         self._logger = get_logger("codepilot.tools")
+        self._result_builder = ToolResultBuilder()
+        self._event_publisher = ToolEventPublisher()
 
     async def execute_tool_calls(
         self,
@@ -139,7 +141,11 @@ class ToolDispatcher:
         item["tool_call_id"] = tool_call_id
 
         if tool is None:
-            return self._build_tool_part(tool_call_id, tool_name, self._missing_tool_result(tool_name)), None, None
+            return self._result_builder.completed_part(
+                tool_call_id,
+                tool_name,
+                self._result_builder.missing_tool_result(tool_name),
+            ), None, None
 
         tool_context = ToolExecutionContext(
             session=session,
@@ -153,7 +159,7 @@ class ToolDispatcher:
         if not skip_approval:
             preflight = await tool.preflight(tool_args, tool_context)
             if preflight.status == "blocked" and preflight.result is not None:
-                return self._build_tool_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None, None
+                return self._result_builder.completed_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None, None
             if preflight.status == "requires_approval":
                 approval = ApprovalRequest(
                     approval_id=f"approval_tool_{tool_call_id}",
@@ -161,7 +167,7 @@ class ToolDispatcher:
                     action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
                     created_at=utc_now_iso(),
                 )
-                return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval, None
+                return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), approval, None
 
         if tool.spec.requires_approval and not skip_approval:
             approval = ApprovalRequest(
@@ -170,7 +176,7 @@ class ToolDispatcher:
                 action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
                 created_at=utc_now_iso(),
             )
-            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), approval, None
+            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), approval, None
 
         ctx = HookContext(
             hook_type=HookType.TOOL_BEFORE.value,
@@ -184,20 +190,15 @@ class ToolDispatcher:
         )
         hook_result = await self._hook_manager.run(HookType.TOOL_BEFORE, ctx)
         if hook_result.requires_human_input and hook_result.human_request:
-            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), hook_result.human_request, None
+            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), hook_result.human_request, None
 
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="tool_call_started",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data={
-                    **self._agent_event_data(agent),
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "args": tool_args,
-                },
-            )
+        await self._event_publisher.publish_started(
+            session=session,
+            runtime=runtime,
+            agent=agent,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_args=tool_args,
         )
 
         try:
@@ -206,10 +207,10 @@ class ToolDispatcher:
                 timeout=tool.spec.timeout_seconds,
             )
         except TimeoutError:
-            result = self._error_result(tool_name, "ToolTimeoutError", "工具执行超时")
+            result = self._result_builder.error_result(tool_name, "ToolTimeoutError", "工具执行超时")
         except Exception as exc:  # noqa: BLE001
             self._logger.exception("tool failed", tool_name=tool_name, error=str(exc))
-            result = self._error_result(tool_name, exc.__class__.__name__, str(exc))
+            result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
 
         if result.get("status") == "question_required":
             question = QuestionRequest(
@@ -217,7 +218,7 @@ class ToolDispatcher:
                 questions=[question for question in result.get("questions", []) if isinstance(question, dict)],
                 created_at=utc_now_iso(),
             )
-            return self._build_pending_tool_part(tool_call_id, tool_name, tool_args), None, question
+            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), None, question
 
         after_ctx = HookContext(
             hook_type=HookType.TOOL_AFTER.value,
@@ -232,76 +233,12 @@ class ToolDispatcher:
         )
         await self._hook_manager.run(HookType.TOOL_AFTER, after_ctx)
 
-        await runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="tool_call_finished" if result.get("status") != "error" else "tool_call_failed",
-                session_id=session.session_id,
-                created_at=utc_now_iso(),
-                data={
-                    **self._agent_event_data(agent),
-                    "tool_name": tool_name,
-                    "tool_call_id": tool_call_id,
-                    "result": result,
-                },
-            )
+        await self._event_publisher.publish_finished(
+            session=session,
+            runtime=runtime,
+            agent=agent,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=result,
         )
-        return self._build_tool_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
-
-    def _agent_event_data(self, agent: AgentState) -> dict[str, Any]:
-        return {
-            "agent": getattr(agent, "name", None),
-            "agent_kind": getattr(agent, "kind", "agent"),
-            "context_id": getattr(agent, "context_id", None),
-            "parent_call_id": getattr(agent, "parent_call_id", None),
-        }
-
-    def _build_pending_tool_part(self, tool_call_id: str | None, tool_name: str, tool_args: dict[str, Any]) -> ToolPart:
-        return ToolPart(
-            call_id=tool_call_id or f"call_{utc_now_iso()}",
-            tool=tool_name,
-            state=ToolPartState(
-                status="pending",
-                input=tool_args,
-                time={"created": utc_now_iso()},
-            ),
-        )
-
-    def _build_tool_part(
-        self,
-        tool_call_id: str | None,
-        tool_name: str,
-        result: dict[str, Any],
-        tool_args: dict[str, Any] | None = None,
-    ) -> ToolPart:
-        status = "error" if result.get("status") == "error" else "completed"
-        return ToolPart(
-            call_id=tool_call_id or f"call_{utc_now_iso()}",
-            tool=tool_name,
-            state=ToolPartState(
-                status=status,
-                input=tool_args or {},
-                title=result.get("title"),
-                output=result,
-                error=self._build_tool_error(result) if status == "error" else None,
-                time={"start": utc_now_iso(), "end": utc_now_iso()},
-                attachments=result.get("attachments") or [],
-            ),
-        )
-
-    def _missing_tool_result(self, tool_name: str) -> dict[str, Any]:
-        return self._error_result(tool_name, "ToolNotFoundError", f"工具不存在：{tool_name}")
-
-    def _error_result(self, tool_name: str, error_type: str, error_message: str) -> dict[str, Any]:
-        return {
-            "status": "error",
-            "tool_name": tool_name,
-            "error_type": error_type,
-            "error_message": error_message,
-            "recoverable": True,
-        }
-
-    def _build_tool_error(self, result: dict[str, Any]) -> AssistantMessageError:
-        return AssistantMessageError(
-            code=str(result.get("error_type") or "ToolError"),
-            message=str(result.get("error_message") or "工具执行失败"),
-        )
+        return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None

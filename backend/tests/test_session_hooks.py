@@ -410,7 +410,7 @@ def test_agent_loop_runs_session_hooks_around_loop() -> None:
     assert assistant_message.info.model.provider_id == "openai"
     assert assistant_message.info.model.model_id == "gpt-5.3-codex"
     assert assistant_message.info.path.root == "/tmp/codepilot"
-    assert isinstance(assistant_message.info.path.cwd, str)
+    assert assistant_message.info.path.cwd == "/tmp/codepilot"
     assert isinstance(assistant_message.info.time.created, int)
     assert isinstance(assistant_message.info.time.completed, int)
     assert assistant_message.info.finish == "completed"
@@ -727,6 +727,25 @@ class ToolCallLiteLLMClient(StubLiteLLMClient):
         )
 
 
+class NoIdToolCallLiteLLMClient(StubLiteLLMClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tool_call = {"tool_name": "approval_tool", "arguments": {}}
+
+    async def stream_chat(
+        self,
+        session: SessionState,
+        llm_state: Any,
+        provider_messages: list[Any],
+        tools: list[dict[str, Any]],
+        event_bus: EventBus,
+    ) -> Any:
+        self.calls += 1
+        if self.calls > 1:
+            return SimpleNamespace(text="工具执行完成", reasoning="", tool_calls=[])
+        return SimpleNamespace(text="需要调用工具", reasoning="", tool_calls=[self.tool_call])
+
+
 class ContinueToolCallLiteLLMClient(StubLiteLLMClient):
     async def stream_chat(
         self,
@@ -853,6 +872,42 @@ def test_agent_loop_appends_assistant_message_and_skips_tools_when_llm_after_req
     assert assistant_message.tool_parts()[0].state.status == "pending"
 
 
+def test_agent_loop_reuses_generated_tool_call_id_for_execution() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    llm_client = NoIdToolCallLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=ContinueToolDispatcher(),
+        hook_manager=hook_manager,
+    )
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assistant_message = result.messages[1]
+    tool_parts = assistant_message.tool_parts()
+    assert len(tool_parts) == 1
+    assert tool_parts[0].call_id.startswith(f"call_{assistant_message.info.id}_")
+    assert tool_parts[0].state.status == "completed"
+    assert llm_client.tool_call["tool_call_id"] == tool_parts[0].call_id
+
+
 def test_agent_loop_stops_after_completed_tools_when_loop_after_requests_stop() -> None:
     settings = build_settings()
     session = build_session()
@@ -957,6 +1012,60 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
     assert session.messages[-2].tool_parts()[0].state.status == "pending"
 
 
+def test_agent_loop_fast_approval_reply_does_not_lose_wakeup() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(ApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=ToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    approval_event = asyncio.Event()
+    approval_result_holder = {"result": None}
+
+    def reply_immediately(event: Any) -> None:
+        if event.event_type.value != "human_interaction" or event.data.get("kind") != "approval":
+            return
+        if event.data.get("status") != "pending":
+            return
+        approval_result_holder["result"] = ApprovalResult(
+            approval_id=event.data["request"]["approval_id"],
+            approved=False,
+            comment="同步拒绝",
+            created_at="2026-04-30T00:00:01Z",
+        )
+        approval_event.set()
+
+    event_bus.subscribe_domain(reply_immediately)
+
+    result = asyncio.run(
+        asyncio.wait_for(
+            loop.run(
+                session=session,
+                workspace=workspace,
+                agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+                runtime=runtime,
+                config=settings,
+                approval_event=approval_event,
+                approval_result_holder=approval_result_holder,
+                stop_event=asyncio.Event(),
+            ),
+            timeout=1,
+        )
+    )
+
+    assert result.status == SessionStatus.CANCELLED
+    assert result.messages[-1].text_content() == "人工拒绝继续执行：同步拒绝"
+
+
 def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     settings = build_settings()
     session = build_session()
@@ -1024,6 +1133,14 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     assert resolved_event.data["message_id"] == result.messages[-2].info.id
     assert resolved_event.data["call_id"] == "call_question_1"
     assert resolved_event.data["result"]["answers"]["target"]["values"] == ["backend"]
+    completed_event = next(
+        event for event in reversed(stream_events)
+        if event.event_type == "assistant_message_completed" and event.data["message"]["info"]["finish"] == "tool_completed"
+    )
+    assert completed_event.data["agent"] == "build"
+    assert completed_event.data["agent_kind"] == "agent"
+    assert completed_event.data["context_id"] == "main"
+    assert completed_event.data["parent_call_id"] is None
     question_message = result.messages[-2]
     question_part = question_message.tool_parts()[0]
     assert question_part.tool == "question"
@@ -1095,6 +1212,62 @@ def test_agent_loop_question_decline_appends_user_message_and_stops() -> None:
     resolved = next(event for event in stream_events if event.event_type == "human_question_resolved")
     assert resolved.data["declined"] is True
     assert resolved.data["continue_loop"] is False
+
+
+def test_agent_loop_fast_question_reply_does_not_lose_wakeup() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(QuestionTool(timeout_seconds=1))
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=QuestionToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    question_event = asyncio.Event()
+    question_result_holder = {"result": None}
+
+    def reply_immediately(event: Any) -> None:
+        if event.event_type.value != "human_interaction" or event.data.get("kind") != "question":
+            return
+        if event.data.get("status") != "pending":
+            return
+        question_result_holder["result"] = QuestionResult(
+            question_id=event.data["request"]["question_id"],
+            answers={"target": {"values": ["backend"], "note": ""}},
+            created_at="2026-04-30T00:00:01Z",
+        )
+        question_event.set()
+
+    event_bus.subscribe_domain(reply_immediately)
+
+    result = asyncio.run(
+        asyncio.wait_for(
+            loop.run(
+                session=session,
+                workspace=workspace,
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["question"], max_iterations=3),
+                runtime=runtime,
+                config=settings,
+                approval_event=asyncio.Event(),
+                approval_result_holder={"result": None},
+                stop_event=asyncio.Event(),
+                question_event=question_event,
+                question_result_holder=question_result_holder,
+            ),
+            timeout=1,
+        )
+    )
+
+    assert result.status == SessionStatus.COMPLETED
+    assert result.messages[-2].tool_parts()[0].state.status == "completed"
+    assert result.messages[-1].text_content() == "收到答案"
 
 
 def test_agent_loop_appends_assistant_message_when_max_iterations_exceeded() -> None:

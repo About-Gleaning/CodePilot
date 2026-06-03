@@ -16,8 +16,18 @@ from codepilot.hooks import HookManager, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
-from codepilot.session.flow import ApprovalCoordinator, QuestionCoordinator, SessionMessageAppender, TurnExecutor, TurnResult
-from codepilot.session.message import AssistantMessageInfo, Message, TextPart, ToolPart, ToolPartState, build_user_message_info
+from codepilot.session.interactions import ApprovalCoordinator, QuestionCoordinator, SessionMessageAppender, find_tool_message_id
+from codepilot.session.message_ops import (
+    build_question_tool_output,
+    merge_approved_tool_result,
+    merge_question_result,
+    summarize_question_answers,
+)
+from codepilot.session.flow import (
+    TurnExecutor,
+    TurnResult,
+)
+from codepilot.session.message import Message, TextPart, build_user_message_info
 from codepilot.session.state import AgentState, ApprovalResult, LLMState, PendingApproval, PendingQuestion, QuestionResult, SessionState, SessionStatus
 from codepilot.tools import ToolDispatcher, ToolRegistry
 from codepilot.utils import new_message_id, new_context_id, utc_now_iso, utc_now_millis
@@ -121,7 +131,7 @@ class AgentLoop:
                 await self._run_iterations(ctx)
         finally:
             # SESSION_AFTER 放在 finally 中，保证无论是成功、失败还是取消，都能执行收尾 Hook。
-            await self._turn_executor._run_hook(
+            await self._turn_executor.run_hook(
                 HookType.SESSION_AFTER,
                 session=session,
                 workspace=workspace,
@@ -250,7 +260,7 @@ class AgentLoop:
     async def _run_session_before(self, ctx: _RunContext) -> bool:
         """执行会话前置 Hook，并返回是否应该进入主循环。"""
         # SESSION_BEFORE 是整场会话的入口钩子，适合做全局预处理或提前人工确认。
-        session_before = await self._turn_executor._run_hook(
+        session_before = await self._turn_executor.run_hook(
             HookType.SESSION_BEFORE,
             session=ctx.session,
             workspace=ctx.workspace,
@@ -307,16 +317,14 @@ class AgentLoop:
     async def _append_max_iterations_message(self, ctx: _RunContext) -> None:
         """超过最大轮次时沉淀一条 assistant 消息，明确解释推理为何停止。"""
         max_iterations = ctx.agent_profile.max_iterations
-        assistant_message = self._turn_executor._build_assistant_message(
+        assistant_message = self._turn_executor.build_finished_assistant_message(
             session=ctx.session,
             agent_state=ctx.agent_state,
             text=f"已超过最大轮推理次数限制（{max_iterations} 轮），停止推理。",
-            reasoning="",
-            tool_calls=[],
+            reason="max_iterations",
         )
-        self._turn_executor._append_step_finish(assistant_message, reason="max_iterations")
         await self._message_appender.append(ctx.session, assistant_message, ctx.runtime)
-        await self._turn_executor._publish_assistant_message_completed(ctx.session, assistant_message, ctx.runtime)
+        await self._turn_executor.publish_assistant_message_completed(ctx.session, assistant_message, ctx.runtime)
 
     async def _execute_turn(self, ctx: _RunContext, iteration: int) -> TurnResult:
         return await self._turn_executor.execute(
@@ -409,15 +417,8 @@ class AgentLoop:
         await self._publish_question_resume_status(ctx)
         if question.resume_item is None:
             return True
-        self._merge_question_result(ctx.session, question, result)
-        await ctx.runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="assistant_message_completed",
-                session_id=ctx.session.session_id,
-                created_at=utc_now_iso(),
-                data={"message": ctx.session.messages[-1].model_dump()},
-            )
-        )
+        merge_question_result(ctx.session, question, result)
+        await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
     async def _publish_question_resolved(
@@ -438,11 +439,11 @@ class AgentLoop:
                     "kind": "question",
                     "status": status,
                     "interaction_id": result.question_id,
-                    "message_id": self._pending_question_message_id(ctx.session, resume_item),
+                    "message_id": find_tool_message_id(ctx.session, resume_item.get("tool_call_id")),
                     "call_id": resume_item.get("tool_call_id"),
                     "request": question.request.model_dump(),
                     "result": result.model_dump(),
-                    "tool_output": self._build_question_tool_output(question, result),
+                    "tool_output": build_question_tool_output(question, result),
                 },
             )
         )
@@ -460,18 +461,6 @@ class AgentLoop:
                 },
             )
         )
-
-    def _pending_question_message_id(self, session: SessionState, resume_item: dict[str, Any]) -> str | None:
-        """定位承载 pending question 工具片段的 assistant 消息。"""
-        call_id = resume_item.get("tool_call_id")
-        if not call_id:
-            return None
-        for message in reversed(session.messages):
-            if message.info.role != "assistant":
-                continue
-            if any(isinstance(part, ToolPart) and part.call_id == call_id for part in message.parts):
-                return message.info.id
-        return None
 
     async def _wait_for_approval(self, ctx: _RunContext, approval: PendingApproval) -> ApprovalResult | None:
         return await self._approval_coordinator.wait(
@@ -507,15 +496,8 @@ class AgentLoop:
             config=ctx.config,
             stop_event=ctx.stop_event,
         )
-        self._merge_approved_tool_result(ctx.session, approved_tool_part)
-        await ctx.runtime.event_bus.publish_stream_event(
-            StreamEvent(
-                event_type="assistant_message_completed",
-                session_id=ctx.session.session_id,
-                created_at=utc_now_iso(),
-                data={"message": ctx.session.messages[-1].model_dump()},
-            )
-        )
+        merge_approved_tool_result(ctx.session, approved_tool_part)
+        await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
 
     async def _run_loop_after_approved_tool(self, ctx: _RunContext, iteration: int) -> bool:
         loop_after = await self._turn_executor.run_loop_after(
@@ -612,117 +594,3 @@ class AgentLoop:
             )
         )
         return session
-
-    def _merge_approved_tool_result(self, session: SessionState, approved_tool_part: ToolPart) -> None:
-        """把审批后执行得到的工具结果合并回最后一条 assistant 消息。
-
-        正常情况下，模型先产出一条带工具调用的 assistant 消息，
-        工具结果会在后续步骤补进去。这里专门处理“工具因为审批而延后执行”的场景。
-
-        合并策略很简单：
-        - 如果已经存在同 `call_id` 的工具片段，就原地替换。
-        - 如果还不存在，就把结果追加到消息末尾。
-        """
-        if not session.messages:
-            return
-        latest_message = session.messages[-1]
-        if latest_message.info.role != "assistant":
-            return
-        merged_parts: list[object] = []
-        replaced = False
-        for part in latest_message.parts:
-            # 通过 call_id 精确匹配待替换的工具片段，避免误改同一条消息中的其他工具结果。
-            if isinstance(part, ToolPart) and part.call_id == approved_tool_part.call_id:
-                merged_parts.append(approved_tool_part)
-                replaced = True
-                continue
-            merged_parts.append(part)
-        if not replaced:
-            # 理论上大多数时候会命中替换分支；如果没命中，说明结果尚未写入过，直接追加即可。
-            merged_parts.append(approved_tool_part)
-        latest_message.parts = merged_parts
-        assert isinstance(latest_message.info, AssistantMessageInfo)
-        # 工具结果补齐后，把消息完成时间和结束原因同步更新，方便前端正确展示状态。
-        latest_message.info.time.completed = utc_now_millis()
-        latest_message.info.finish = "tool_completed"
-
-    def _merge_question_result(self, session: SessionState, question: PendingQuestion, result: QuestionResult) -> None:
-        """把用户答案作为原 question 工具调用结果回填，供下一轮 LLM 以 tool 消息读取。"""
-        if not session.messages or question.resume_item is None:
-            return
-        latest_message = session.messages[-1]
-        if latest_message.info.role != "assistant":
-            return
-        call_id = question.resume_item.get("tool_call_id")
-        output = self._build_question_tool_output(question, result)
-        for index, part in enumerate(latest_message.parts):
-            if isinstance(part, ToolPart) and part.call_id == call_id:
-                latest_message.parts[index] = ToolPart(
-                    call_id=part.call_id,
-                    tool=part.tool,
-                    state=ToolPartState(
-                        status="completed",
-                        input=part.state.input,
-                        output=output,
-                        time=part.state.time,
-                    ),
-                )
-                assert isinstance(latest_message.info, AssistantMessageInfo)
-                latest_message.info.time.completed = utc_now_millis()
-                latest_message.info.finish = "tool_completed"
-                return
-
-    def _build_question_tool_output(self, question: PendingQuestion, result: QuestionResult) -> dict[str, Any]:
-        """统一生成 question 工具结果，供内存合并和 JSONL 回放共用。"""
-        return {
-            "status": "ok",
-            "tool_name": "question",
-            "question_id": result.question_id,
-            "answers": result.answers,
-            "output": summarize_question_answers(question.request.questions, result.answers),
-        }
-
-def summarize_question_answers(questions: list[dict[str, Any]], answers: dict[str, Any]) -> str:
-    """把结构化答案转成自然语言，避免 LLM 直接读取前端内部 JSON。"""
-    if not answers:
-        return "用户未提供具体答案。"
-
-    lines = ["用户已回答 question 工具提出的问题："]
-    for index, question in enumerate(questions, start=1):
-        question_id = str(question.get("id") or "")
-        question_text = str(question.get("question") or "").strip() or question_id or f"问题 {index}"
-        answer = answers.get(question_id)
-        answer_record = answer if isinstance(answer, dict) else {}
-        values = answer_record.get("values")
-        selected_values = [str(value) for value in values] if isinstance(values, list) else []
-        option_labels = _resolve_question_option_labels(question, selected_values)
-        note = str(answer_record.get("note") or "").strip()
-
-        lines.append("")
-        lines.append(f"{index}. {question_text}")
-        if option_labels:
-            response = f"回答：{'、'.join(option_labels)}。"
-        else:
-            response = "回答：未选择。"
-        if note:
-            response += f"备注：{_ensure_sentence_end(note)}"
-        lines.append(response)
-    return "\n".join(lines)
-
-
-def _resolve_question_option_labels(question: dict[str, Any], selected_values: list[str]) -> list[str]:
-    option_map: dict[str, str] = {}
-    raw_options = question.get("options")
-    if isinstance(raw_options, list):
-        for raw_option in raw_options:
-            if not isinstance(raw_option, dict):
-                continue
-            value = str(raw_option.get("value") or "")
-            label = str(raw_option.get("label") or "").strip()
-            if value and label:
-                option_map[value] = label
-    return [option_map.get(value, value) for value in selected_values]
-
-
-def _ensure_sentence_end(text: str) -> str:
-    return text if text.endswith(("。", "！", "？", ".", "!", "?")) else f"{text}。"

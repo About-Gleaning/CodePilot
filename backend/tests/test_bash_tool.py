@@ -246,3 +246,36 @@ def test_dispatcher_pauses_and_resumes_approved_bash_command(tmp_path: Path) -> 
     assert pending.tool_parts == []
     assert isinstance(pending.pending_approval.request.action, dict)
     assert approved_part.state.output["stdout"] == "approved\n"
+
+
+def test_dispatcher_returns_blocked_preflight_result(tmp_path: Path) -> None:
+    async def run_case() -> Any:
+        registry = ToolRegistry()
+        registry.register(BashTool(settings=BashToolSettings(approval_mode="none", blacklist=[["rm"]]), timeout_seconds=5))
+        dispatcher = ToolDispatcher(registry, HookManager())
+        session = SimpleNamespace(session_id="session_1", messages=[])
+        workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
+        agent = SimpleNamespace(name="build")
+        runtime = RuntimeHandles(event_bus=EventBus())
+
+        return await dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            tool_calls=[{"tool_call_id": "call_1", "tool_name": "bash_tool", "arguments": {"command": "rm -rf x"}}],
+            runtime=runtime,
+            config=SimpleNamespace(),
+        )
+
+    batch = asyncio.run(run_case())
+
+    assert batch.pending_approval is None
+    assert batch.pending_question is None
+    assert len(batch.tool_parts) == 1
+    part = batch.tool_parts[0]
+    assert part.call_id == "call_1"
+    assert part.tool == "bash_tool"
+    assert part.state.status == "completed"
+    assert part.state.input == {"command": "rm -rf x"}
+    assert part.state.output["status"] == "blocked"
+    assert part.state.output["error_type"] == "BashCommandBlocked"

@@ -7,8 +7,10 @@ from __future__ import annotations
 """
 
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -147,7 +149,14 @@ def create_app() -> FastAPI:
         session_runner=session_runner,
     )
 
-    app = FastAPI(title="CodePilot", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await app_state.session_runner.shutdown()
+
+    app = FastAPI(title="CodePilot", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -157,10 +166,6 @@ def create_app() -> FastAPI:
     # 统一把运行时上下文挂到 app.state，供路由层按需访问，而不是重复创建依赖对象。
     app.state.context = app_state
     app.include_router(build_api_router(app_state))
-
-    @app.on_event("shutdown")
-    async def on_shutdown() -> None:
-        await app_state.session_runner.shutdown()
 
     return app
 
