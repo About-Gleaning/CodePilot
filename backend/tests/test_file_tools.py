@@ -6,8 +6,26 @@ from types import SimpleNamespace
 
 from codepilot.session.agents import build_agent_profiles
 from codepilot.skills import SkillRegistry
-from codepilot.tools import EditFileTool, LoadSkillTool, QuestionTool, ReadFileTool, TodoReadTool, TodoWriteTool, ToolRegistry, WriteFileTool, WritePlanTool
+from codepilot.tools import (
+    EditFileTool,
+    LoadSkillTool,
+    QuestionTool,
+    ReadFileTool,
+    TodoReadTool,
+    TodoWriteTool,
+    ToolRegistry,
+    WebFetchTool,
+    WriteFileTool,
+    WritePlanTool,
+)
 from codepilot.tools.base import ToolExecutionContext
+from codepilot.tools.webfetch_tool import FetchedPage
+
+
+# 测试场景说明
+# 场景1：正常流程 - 工具按预期读写文件、管理 todo、抽取 URL 核心正文。
+# 场景2：边界情况 - 行数限制、空状态、长网页内容截断。
+# 场景3：异常处理 - 拒绝越权路径、非法 URL、内网地址和不可抽取网页。
 
 
 def build_context(workspace_path: Path, workspace_dir: Path, *, agent_name: str = "build") -> ToolExecutionContext:
@@ -225,14 +243,16 @@ def test_agent_tool_permissions_are_scoped() -> None:
 
     assert {"bash_tool", "read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
     assert "load_skill" in profiles["build"].allowed_tools
+    assert "webfetch" in profiles["build"].allowed_tools
     assert "write_plan" in profiles["plan"].allowed_tools
     assert "load_skill" in profiles["plan"].allowed_tools
+    assert "webfetch" in profiles["plan"].allowed_tools
     assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["build"].allowed_tools)
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["plan"].allowed_tools)
-    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill"]
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "webfetch"]
     assert profiles["build"].kind == "agent"
     assert profiles["plan"].kind == "agent"
     assert profiles["explore"].kind == "subagent"
@@ -253,6 +273,7 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
     registry.register(TodoWriteTool(timeout_seconds=1))
     registry.register(TodoReadTool(timeout_seconds=1))
     registry.register(QuestionTool(timeout_seconds=1))
+    registry.register(WebFetchTool(timeout_seconds=1))
 
     schemas = registry.get_llm_tool_schemas()
 
@@ -260,6 +281,93 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
     assert all(isinstance(description, str) and description for description in descriptions)
     assert any("读取 workspace 内" in description for description in descriptions)
     assert any("写入当前 plan agent 会话" in description for description in descriptions)
+    assert any("去除导航栏" in description for description in descriptions)
+
+
+def test_webfetch_extracts_core_markdown_from_html() -> None:
+    async def fake_fetch(url: str) -> FetchedPage:
+        return FetchedPage(
+            final_url=url,
+            html="""
+            <html>
+              <body>
+                <nav>首页 文档 登录</nav>
+                <main>
+                  <article>
+                    <h1>核心标题</h1>
+                    <p>这是页面最重要的正文内容。</p>
+                    <p>第二段包含更多可阅读信息。</p>
+                  </article>
+                </main>
+                <footer>版权信息</footer>
+              </body>
+            </html>
+            """,
+        )
+
+    tool = WebFetchTool(timeout_seconds=1)
+    tool._resolve_host_addresses = lambda hostname, port: {"93.184.216.34"}  # type: ignore[method-assign]
+    tool._fetch_html = fake_fetch  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"url": "https://example.com/post"}, build_context(Path.cwd(), Path.cwd() / ".codepilot"))
+
+    assert result["status"] == "ok"
+    assert "核心标题" in str(result["output"])
+    assert "这是页面最重要的正文内容" in str(result["output"])
+    assert "首页 文档 登录" not in str(result["output"])
+    assert "版权信息" not in str(result["output"])
+
+
+def test_webfetch_rejects_non_http_url() -> None:
+    result = run_tool(
+        WebFetchTool(timeout_seconds=1),
+        {"url": "file:///etc/passwd"},
+        build_context(Path.cwd(), Path.cwd() / ".codepilot"),
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "WebFetchUrlSchemeUnsupported"
+
+
+def test_webfetch_rejects_private_host() -> None:
+    tool = WebFetchTool(timeout_seconds=1)
+    tool._resolve_host_addresses = lambda hostname, port: {"127.0.0.1"}  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"url": "http://localhost:8000"}, build_context(Path.cwd(), Path.cwd() / ".codepilot"))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "WebFetchHostForbidden"
+
+
+def test_webfetch_truncates_long_output() -> None:
+    async def fake_fetch(url: str) -> FetchedPage:
+        return FetchedPage(final_url=url, html="<html><body><article><p>正文</p></article></body></html>")
+
+    tool = WebFetchTool(timeout_seconds=1)
+    tool._resolve_host_addresses = lambda hostname, port: {"93.184.216.34"}  # type: ignore[method-assign]
+    tool._fetch_html = fake_fetch  # type: ignore[method-assign]
+    tool._extract_markdown = lambda html, url: "内容" * 30_000  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"url": "https://example.com/long"}, build_context(Path.cwd(), Path.cwd() / ".codepilot"))
+
+    assert result["status"] == "ok"
+    assert result["truncated"] is True
+    assert len(str(result["output"])) == 50_000
+
+
+def test_webfetch_reports_empty_extracted_content() -> None:
+    async def fake_fetch(url: str) -> FetchedPage:
+        return FetchedPage(final_url=url, html="<html><body><nav>只有导航</nav></body></html>")
+
+    tool = WebFetchTool(timeout_seconds=1)
+    tool._resolve_host_addresses = lambda hostname, port: {"93.184.216.34"}  # type: ignore[method-assign]
+    tool._fetch_html = fake_fetch  # type: ignore[method-assign]
+    tool._extract_markdown = lambda html, url: ""  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"url": "https://example.com/empty"}, build_context(Path.cwd(), Path.cwd() / ".codepilot"))
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "WebFetchContentEmpty"
 
 
 def test_tool_descriptions_do_not_reference_stale_schema_terms() -> None:

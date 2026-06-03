@@ -29,6 +29,7 @@ from codepilot.session.message import (
     StepStartPart,
     TextPart,
     ToolPart,
+    AssistantMessageTokens,
     build_assistant_message_info,
     build_user_message_info,
 )
@@ -603,6 +604,7 @@ class TurnExecutor:
             text=stream_result.text,
             reasoning=stream_result.reasoning,
             tool_calls=stream_result.tool_calls,
+            tokens=getattr(stream_result, "tokens", None),
         )
         return stream_result, assistant_message
 
@@ -778,6 +780,7 @@ class TurnExecutor:
         text: str,
         reasoning: str,
         tool_calls: list[dict[str, Any]],
+        tokens: AssistantMessageTokens | None = None,
     ) -> Message:
         """把模型流式结果收敛为统一的 assistant Message。"""
 
@@ -802,7 +805,7 @@ class TurnExecutor:
                     },
                 )
             )
-        return Message(
+        message = Message(
             info=build_assistant_message_info(
                 message_id=message_id,
                 session_id=session.session_id,
@@ -819,6 +822,9 @@ class TurnExecutor:
             ),
             parts=parts,
         )
+        assert isinstance(message.info, AssistantMessageInfo)
+        message.info.tokens = tokens
+        return message
 
     def _build_llm_error_message(self, session: SessionState, agent_state: AgentState, exc: Exception) -> Message:
         """把模型调用异常转换成可展示、可追踪的 assistant 错误消息。"""
@@ -830,6 +836,7 @@ class TurnExecutor:
             text=f"LLM 调用失败，AgentLoop 已停止：{error.message}",
             reasoning="",
             tool_calls=[],
+            tokens=None,
         )
         assert isinstance(message.info, AssistantMessageInfo)
         message.info.error = error
@@ -850,6 +857,7 @@ class TurnExecutor:
             text=f"上下文压缩失败，AgentLoop 已停止：{error.message}",
             reasoning="",
             tool_calls=[],
+            tokens=None,
         )
         assert isinstance(message.info, AssistantMessageInfo)
         message.info.error = error
@@ -916,7 +924,7 @@ class TurnExecutor:
         assert isinstance(assistant_message.info, AssistantMessageInfo)
         assistant_message.info.time.completed = utc_now_millis()
         assistant_message.info.finish = reason
-        assistant_message.parts.append(StepFinishPart(reason=reason))
+        assistant_message.parts.append(StepFinishPart(reason=reason, tokens=assistant_message.info.tokens))
 
     def _find_latest_user_message_id(self, session: SessionState) -> str:
         # assistant 回复必须显式挂到最近一条用户消息下，避免控制消息把父子关系串乱。

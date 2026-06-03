@@ -45,6 +45,7 @@ from codepilot.tools import (
     WriteFileTool,
     WritePlanTool,
     QuestionTool,
+    WebFetchTool,
 )
 
 
@@ -99,6 +100,7 @@ def create_app() -> FastAPI:
     tool_registry.register(TodoReadTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(QuestionTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
 
     hook_manager = _build_hook_manager(settings)
     llm_client = LiteLLMClient()

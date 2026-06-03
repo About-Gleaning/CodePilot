@@ -11,6 +11,7 @@ import {
   CircleDot,
   FileText,
   HardDrive,
+  History,
   ListTree,
   MessageSquareText,
   OctagonAlert,
@@ -22,6 +23,7 @@ import {
   Sparkles,
   Square,
   Terminal,
+  Zap,
   X,
 } from 'lucide-react';
 
@@ -178,6 +180,7 @@ type MessageRecord = {
       provider_id?: string;
       model_id?: string;
     };
+    tokens?: TokenUsage | null;
     path?: {
       cwd?: string;
       root?: string;
@@ -190,11 +193,48 @@ type MessagePart = Record<string, unknown> & {
   type?: string;
 };
 
+type TokenUsage = {
+  input?: number | null;
+  output?: number | null;
+  reasoning?: number | null;
+  cache?: {
+    read?: number | null;
+    write?: number | null;
+  } | null;
+};
+
+type TokenSummary = {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+};
+
 type ToolState = Record<string, unknown> & {
   status?: string;
   input?: Record<string, unknown>;
   output?: Record<string, unknown> | null;
   error?: Record<string, unknown> | null;
+};
+
+type EventTone = 'neutral' | 'running' | 'ok' | 'warn' | 'danger';
+
+type EventViewModel = {
+  title: string;
+  summary: string;
+  tone: EventTone;
+  icon: React.ReactNode;
+  chips: string[];
+  time: string;
+};
+
+type EventStats = {
+  tools: number;
+  failed: number;
+  blockers: number;
+  compacted: number;
+  latest: StreamEvent | null;
 };
 
 function App() {
@@ -216,6 +256,7 @@ function App() {
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [liveDelta, setLiveDelta] = useState('');
   const [subagentLiveDeltas, setSubagentLiveDeltas] = useState<Record<string, string>>({});
@@ -499,6 +540,7 @@ function App() {
       lastSeqRef.current = 0;
       connectStream(0);
       await refreshSessionHistory();
+      setIsHistoryOpen(false);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '加载会话失败');
     } finally {
@@ -708,6 +750,10 @@ function App() {
   const statusText = status?.status || 'IDLE';
   const activeQuestion = questionRequest?.questions[activeQuestionIndex] || null;
   const activeAnswer = activeQuestion ? questionAnswers[activeQuestion.id] || { values: [], note: '' } : null;
+  const tokenSummary = summarizeTokenUsage(messages);
+  const totalTokens = tokenSummary.input + tokenSummary.output + tokenSummary.reasoning;
+  const eventStats = summarizeEventStats(events);
+  const latestEventView = eventStats.latest ? buildEventViewModel(eventStats.latest) : null;
 
   return (
     <div className="workspace-shell">
@@ -726,24 +772,50 @@ function App() {
           <PanelTitle
             icon={<Radio size={16} />}
             title="会话"
-            badge={`seq ${lastSeq}`}
             action={
-              <button type="button" className="button secondary session-new-button" onClick={handleNewTask} title="新会话" aria-label="新会话">
-                <Plus size={14} />
-              </button>
+              <>
+                <button
+                  type="button"
+                  className="button secondary icon-button session-history-button"
+                  onClick={() => setIsHistoryOpen(true)}
+                  title="历史记录"
+                  aria-label="打开历史记录"
+                >
+                  <History size={14} />
+                  <span>{sessionHistory.length}</span>
+                </button>
+                <button
+                  type="button"
+                  className="button secondary session-new-button"
+                  onClick={handleNewTask}
+                  title="新会话"
+                  aria-label="新会话"
+                >
+                  <Plus size={14} />
+                </button>
+              </>
             }
           />
-          <div className={`status-pill ${getStatusClass(statusText)}`}>
-            <CircleDot size={12} />
-            <span>{statusText}</span>
+          <div className="session-status-card">
+            <div className={`status-pill ${getStatusClass(statusText)}`}>
+              <CircleDot size={12} />
+              <span>{statusText}</span>
+            </div>
+            <div className="session-id-block">
+              <span>session</span>
+              <code title={status?.session_id || '-'}>{status?.session_id || '-'}</code>
+            </div>
           </div>
-          <InfoRow label="session" value={status?.session_id || '-'} mono />
-          <SessionHistoryList
-            sessions={sessionHistory}
-            currentSessionId={currentSessionId}
-            loadingSessionId={loadingSessionId}
-            onLoad={handleLoadSession}
-          />
+          <RuntimeSignal statusText={statusText} latestEvent={latestEventView} />
+          <div className="session-metrics runtime-metrics" aria-label="运行统计">
+            <Metric icon={<MessageSquareText size={14} />} label="消息" value={String(messages.length)} />
+            <Metric icon={<ListTree size={14} />} label="事件" value={String(events.length)} />
+            <Metric icon={<Play size={14} />} label="工具" value={String(eventStats.tools)} />
+            <Metric icon={<AlertTriangle size={14} />} label="失败" value={String(eventStats.failed)} />
+            <Metric icon={<ShieldCheck size={14} />} label="阻塞" value={String(eventStats.blockers)} />
+            <Metric icon={<FileText size={14} />} label="压缩" value={String(eventStats.compacted)} />
+          </div>
+          <TokenMeter summary={tokenSummary} total={totalTokens} />
         </section>
       </aside>
 
@@ -753,10 +825,6 @@ function App() {
             <span className="eyebrow">interactive session</span>
             <h2>消息流</h2>
             <p className="stage-subtitle">实时观察 Agent 输出、工具执行和人工审批状态。</p>
-          </div>
-          <div className="header-metrics">
-            <Metric icon={<MessageSquareText size={14} />} label="messages" value={String(messages.length)} />
-            <Metric icon={<ListTree size={14} />} label="events" value={String(events.length)} />
           </div>
         </header>
 
@@ -1003,7 +1071,8 @@ function App() {
 
       <aside className="rail rail-right">
         <section className="panel event-panel">
-          <PanelTitle icon={<ListTree size={16} />} title="事件流" badge={`${events.length}/200`} />
+          <PanelTitle icon={<ListTree size={16} />} title="任务雷达" badge={`${events.length}/200`} />
+          <EventRadarHeader stats={eventStats} latestEvent={latestEventView} />
           <div className="event-list">
             {events.length === 0 ? (
               <p className="quiet-copy">等待关键事件。</p>
@@ -1016,6 +1085,15 @@ function App() {
           </div>
         </section>
       </aside>
+
+      <HistoryModal
+        isOpen={isHistoryOpen}
+        sessions={sessionHistory}
+        currentSessionId={currentSessionId}
+        loadingSessionId={loadingSessionId}
+        onClose={() => setIsHistoryOpen(false)}
+        onLoad={handleLoadSession}
+      />
     </div>
   );
 }
@@ -1035,28 +1113,21 @@ function PanelTitle({ icon, title, badge, action }: { icon: React.ReactNode; tit
   );
 }
 
-function InfoRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
-  return (
-    <div className="info-row">
-      <span>{label}</span>
-      <strong className={mono ? 'mono' : undefined}>{value}</strong>
-    </div>
-  );
-}
-
 function SessionHistoryList({
   sessions,
   currentSessionId,
   loadingSessionId,
   onLoad,
+  variant = 'compact',
 }: {
   sessions: SessionSummary[];
   currentSessionId: string | null;
   loadingSessionId: string | null;
   onLoad: (sessionId: string) => void;
+  variant?: 'compact' | 'modal';
 }) {
   return (
-    <div className="session-history">
+    <div className={`session-history session-history-${variant}`}>
       <div className="session-history-heading">
         <span>历史记录</span>
         <code>{sessions.length}</code>
@@ -1072,6 +1143,7 @@ function SessionHistoryList({
               <article className={`session-item ${isCurrent ? 'is-current' : ''}`} key={session.session_id}>
                 <div className="session-item-main">
                   <strong>{session.title || session.preview || session.session_id}</strong>
+                  {variant === 'modal' && session.preview ? <p>{session.preview}</p> : null}
                   <span>{formatSessionTime(session.updated_at || session.created_at)}</span>
                 </div>
                 <div className="session-item-meta">
@@ -1091,6 +1163,70 @@ function SessionHistoryList({
           })
         )}
       </div>
+    </div>
+  );
+}
+
+function HistoryModal({
+  isOpen,
+  sessions,
+  currentSessionId,
+  loadingSessionId,
+  onClose,
+  onLoad,
+}: {
+  isOpen: boolean;
+  sessions: SessionSummary[];
+  currentSessionId: string | null;
+  loadingSessionId: string | null;
+  onClose: () => void;
+  onLoad: (sessionId: string) => void;
+}) {
+  useEffect(() => {
+    if (!isOpen) {
+      return;
+    }
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        onClose();
+      }
+    }
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  return (
+    <div
+      className="history-modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <section className="history-modal panel" role="dialog" aria-modal="true" aria-labelledby="history-modal-title">
+        <header className="history-modal-header">
+          <div>
+            <span className="eyebrow">session archive</span>
+            <h2 id="history-modal-title">历史记录</h2>
+          </div>
+          <button type="button" className="button secondary icon-button" onClick={onClose} title="关闭" aria-label="关闭历史记录">
+            <X size={15} />
+          </button>
+        </header>
+        <SessionHistoryList
+          sessions={sessions}
+          currentSessionId={currentSessionId}
+          loadingSessionId={loadingSessionId}
+          onLoad={onLoad}
+          variant="modal"
+        />
+      </section>
     </div>
   );
 }
@@ -1185,6 +1321,97 @@ function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; 
   );
 }
 
+function RuntimeSignal({ statusText, latestEvent }: { statusText: string; latestEvent: EventViewModel | null }) {
+  return (
+    <section className={`runtime-signal ${latestEvent ? `tone-${latestEvent.tone}` : 'tone-neutral'}`} aria-label="当前运行信号">
+      <div>
+        <span>当前信号</span>
+        <strong>{latestEvent?.title || statusText}</strong>
+      </div>
+      <p title={latestEvent?.summary || statusText}>{latestEvent?.summary || '尚未收到关键事件。'}</p>
+    </section>
+  );
+}
+
+function EventRadarHeader({ stats, latestEvent }: { stats: EventStats; latestEvent: EventViewModel | null }) {
+  const headline = stats.failed > 0 ? '存在失败节点' : stats.blockers > 0 ? '等待人工处理' : latestEvent?.title || '监听关键事件';
+  const detail =
+    latestEvent?.summary ||
+    '工具调用、人工交互、上下文压缩和会话状态会在这里汇总。';
+
+  return (
+    <section className={`event-radar-header ${stats.failed > 0 ? 'tone-danger' : stats.blockers > 0 ? 'tone-warn' : 'tone-neutral'}`}>
+      <div className="radar-orbit" aria-hidden="true">
+        <span />
+      </div>
+      <div className="radar-copy">
+        <span>run radar</span>
+        <strong>{headline}</strong>
+        <p title={detail}>{detail}</p>
+      </div>
+      <div className="radar-stats" aria-label="事件统计">
+        <span>tools {stats.tools}</span>
+        <span>fail {stats.failed}</span>
+        <span>hold {stats.blockers}</span>
+      </div>
+    </section>
+  );
+}
+
+function TokenMeter({ summary, total }: { summary: TokenSummary; total: number }) {
+  const parts = [
+    { key: 'input', label: 'in', value: summary.input, className: 'input' },
+    { key: 'output', label: 'out', value: summary.output, className: 'output' },
+    { key: 'reasoning', label: 'reason', value: summary.reasoning, className: 'reasoning' },
+  ];
+  const cacheHitRate = summary.input > 0 ? Math.min(summary.cacheRead / summary.input, 1) : 0;
+  const cacheHitPercent = cacheHitRate * 100;
+
+  return (
+    <section className="token-meter" aria-label="token 用量">
+      <div className="token-meter-heading">
+        <span>
+          <Zap size={13} />
+          tokens
+        </span>
+        <strong>{formatNumber(total)}</strong>
+      </div>
+      <div className="cache-hitline">
+        <span>cache hit</span>
+        <strong>{formatPercent(cacheHitPercent)}</strong>
+      </div>
+      <div className={`token-bar ${total > 0 ? '' : 'is-empty'}`} aria-hidden="true">
+        {total > 0 ? (
+          parts.map((part) =>
+            part.value > 0 ? (
+              <span
+                className={`token-segment ${part.className}`}
+                key={part.key}
+                style={{ width: `${(part.value / total) * 100}%` }}
+              />
+            ) : null,
+          )
+        ) : (
+          <span className="token-bar-empty" />
+        )}
+      </div>
+      <div className="cache-meter" aria-label={`缓存命中率 ${formatPercent(cacheHitPercent)}`}>
+        <span style={{ width: `${cacheHitPercent}%` }} />
+      </div>
+      <div className="token-legend">
+        {parts.map((part) => (
+          <span className={part.className} key={part.key}>
+            {part.label} {formatNumber(part.value)}
+          </span>
+        ))}
+        <span className="cache">
+          cache <b>{formatNumber(summary.cacheRead)}</b> / in
+        </span>
+      </div>
+    </section>
+  );
+}
+
 function MessageItem({ message, index }: { message: MessageRecord; index: number }) {
   const role = String(message.info?.role || 'unknown');
   const isAssistant = role === 'assistant';
@@ -1204,6 +1431,9 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
         {message.info?.time?.created ? (
           <span className="muted-inline">{formatTime(message.info.time.created)}</span>
         ) : null}
+        {isAssistant && message.info?.tokens ? (
+          <span className="muted-inline">{formatTokenUsage(message.info.tokens)}</span>
+        ) : null}
       </div>
       <div className="message-body">{renderMessageParts(message.parts, isAssistant)}</div>
     </article>
@@ -1211,18 +1441,29 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
 }
 
 function EventItem({ event }: { event: StreamEvent }) {
-  const label = EVENT_LABELS[event.event_type] || event.event_type;
-  const tone = getEventTone(event.event_type);
+  const view = buildEventViewModel(event);
 
   return (
-    <details className={`event-item ${tone}`}>
+    <details className={`event-item tone-${view.tone}`}>
       <summary>
-        <span className="event-seq">#{event.seq}</span>
-        <span className="event-name">
+        <span className="event-rail">
           <ChevronRight size={13} />
-          {label}
+          <span className="event-icon">{view.icon}</span>
         </span>
-        <span className="event-summary">{buildEventSummary(event)}</span>
+        <span className="event-main">
+          <span className="event-name">{view.title}</span>
+          <span className="event-summary" title={view.summary}>
+            {view.summary}
+          </span>
+        </span>
+        <span className="event-meta">
+          {view.chips.map((chip) => (
+            <span key={chip} title={chip}>
+              {chip}
+            </span>
+          ))}
+          <time>{view.time}</time>
+        </span>
       </summary>
       <pre>{JSON.stringify(event.data, null, 2)}</pre>
     </details>
@@ -1553,6 +1794,50 @@ function boolValue(value: unknown) {
   return value === true;
 }
 
+function numberValue(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function summarizeTokenUsage(messages: MessageRecord[]): TokenSummary {
+  return messages.reduce<TokenSummary>(
+    (summary, message) => {
+      if (message.info?.role !== 'assistant') {
+        return summary;
+      }
+      const tokens = message.info.tokens;
+      if (!tokens) {
+        return summary;
+      }
+      return {
+        input: summary.input + numberValue(tokens.input),
+        output: summary.output + numberValue(tokens.output),
+        reasoning: summary.reasoning + numberValue(tokens.reasoning),
+        cacheRead: summary.cacheRead + numberValue(tokens.cache?.read),
+        cacheWrite: summary.cacheWrite + numberValue(tokens.cache?.write),
+      };
+    },
+    { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
+  );
+}
+
+function formatNumber(value: number) {
+  return new Intl.NumberFormat('en-US').format(value);
+}
+
+function formatPercent(value: number) {
+  return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}%`;
+}
+
+function totalTokensForUsage(tokens: TokenUsage) {
+  return numberValue(tokens.input) + numberValue(tokens.output) + numberValue(tokens.reasoning);
+}
+
+function formatTokenUsage(tokens: TokenUsage) {
+  const total = totalTokensForUsage(tokens);
+  const cacheRead = numberValue(tokens.cache?.read);
+  return cacheRead > 0 ? `${formatNumber(total)} tokens · cache ${formatNumber(cacheRead)}` : `${formatNumber(total)} tokens`;
+}
+
 function jsonPretty(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
@@ -1569,6 +1854,258 @@ function upsertMessage(prev: MessageRecord[], next: MessageRecord): MessageRecor
   const copy = [...prev];
   copy[index] = next;
   return copy;
+}
+
+function summarizeEventStats(events: StreamEvent[]): EventStats {
+  return events.reduce<EventStats>(
+    (stats, event) => ({
+      tools: stats.tools + (event.event_type === 'tool_call_finished' || event.event_type === 'tool_call_failed' ? 1 : 0),
+      failed: stats.failed + (event.event_type === 'tool_call_failed' || event.event_type === 'session_failed' || event.event_type === 'error' ? 1 : 0),
+      blockers: stats.blockers + (event.event_type === 'human_approval_required' || event.event_type === 'human_question_required' ? 1 : 0),
+      compacted: stats.compacted + (event.event_type === 'context_compacted' ? 1 : 0),
+      latest: event,
+    }),
+    { tools: 0, failed: 0, blockers: 0, compacted: 0, latest: null },
+  );
+}
+
+function buildEventViewModel(event: StreamEvent): EventViewModel {
+  const data = event.data || {};
+  const agent = stringValue(data.agent);
+  const agentKind = stringValue(data.agent_kind);
+  const chips = [
+    agentKind === 'subagent' ? 'subagent' : agent,
+    stringValue(data.tool_name),
+    stringValue(data.status),
+  ].filter(Boolean);
+  const base = {
+    chips: Array.from(new Set(chips)).slice(0, 3),
+    time: formatIsoTime(event.created_at),
+  };
+
+  if (event.event_type === 'tool_call_started') {
+    const args = asRecord(data.args);
+    const toolName = stringValue(data.tool_name) || '工具';
+    return {
+      ...base,
+      title: `${toolName} 正在执行`,
+      summary: summarizeToolInput(args) || '工具调用已开始，等待返回结果。',
+      tone: 'running',
+      icon: <Play size={14} />,
+    };
+  }
+
+  if (event.event_type === 'tool_call_finished' || event.event_type === 'tool_call_failed') {
+    const result = asRecord(data.result);
+    const toolName = stringValue(data.tool_name) || stringValue(result.tool_name) || '工具';
+    const failed = event.event_type === 'tool_call_failed';
+    return {
+      ...base,
+      title: `${toolName} ${failed ? '执行失败' : '执行完成'}`,
+      summary: summarizeToolResult(result, failed),
+      tone: failed ? 'danger' : 'ok',
+      icon: failed ? <AlertTriangle size={14} /> : <Check size={14} />,
+      chips: addEventChips(base.chips, [
+        typeof result.duration_ms === 'number' ? `${result.duration_ms}ms` : '',
+        typeof result.exit_code === 'number' ? `exit ${result.exit_code}` : '',
+      ]),
+    };
+  }
+
+  if (event.event_type === 'human_approval_required') {
+    return {
+      ...base,
+      title: '等待人工审批',
+      summary: stringValue(data.reason) || '工具执行需要人工确认。',
+      tone: 'warn',
+      icon: <ShieldCheck size={14} />,
+      chips: addEventChips(base.chips, [stringValue(data.approval_id)]),
+    };
+  }
+
+  if (event.event_type === 'human_approval_resolved') {
+    const approved = boolValue(data.approved);
+    return {
+      ...base,
+      title: approved ? '审批已同意' : '审批已拒绝',
+      summary: stringValue(data.comment) || (approved ? '会话继续执行。' : '会话将按拒绝结果处理。'),
+      tone: approved ? 'ok' : 'danger',
+      icon: approved ? <Check size={14} /> : <X size={14} />,
+      chips: addEventChips(base.chips, [stringValue(data.approval_id)]),
+    };
+  }
+
+  if (event.event_type === 'human_question_required') {
+    const questions = Array.isArray(data.questions) ? data.questions.length : 0;
+    return {
+      ...base,
+      title: '等待用户回答',
+      summary: questions > 0 ? `Agent 需要 ${questions} 个问题的答案。` : 'Agent 需要用户补充信息。',
+      tone: 'warn',
+      icon: <MessageSquareText size={14} />,
+      chips: addEventChips(base.chips, [stringValue(data.question_id)]),
+    };
+  }
+
+  if (event.event_type === 'human_question_resolved') {
+    const declined = boolValue(data.declined);
+    return {
+      ...base,
+      title: declined ? '用户跳过回答' : '用户已回答',
+      summary: declined ? '会话收到跳过信号。' : '会话收到用户答案，继续推进。',
+      tone: declined ? 'warn' : 'ok',
+      icon: declined ? <X size={14} /> : <Check size={14} />,
+      chips: addEventChips(base.chips, [stringValue(data.question_id)]),
+    };
+  }
+
+  if (event.event_type === 'context_compacted') {
+    const before = numberValue(data.before_tokens);
+    const after = numberValue(data.after_tokens);
+    const ratio = before > 0 && after > 0 ? `，压缩 ${formatPercent((1 - after / before) * 100)}` : '';
+    return {
+      ...base,
+      title: '上下文已压缩',
+      summary: before > 0 || after > 0 ? `${formatNumber(before)} -> ${formatNumber(after)} tokens${ratio}` : '会话上下文已压缩。',
+      tone: 'running',
+      icon: <FileText size={14} />,
+    };
+  }
+
+  if (event.event_type === 'session_started') {
+    return {
+      ...base,
+      title: '会话已启动',
+      summary: summarizeSessionEvent(data) || '新的 Agent 会话开始运行。',
+      tone: 'running',
+      icon: <Radio size={14} />,
+    };
+  }
+
+  if (event.event_type === 'session_finished') {
+    return {
+      ...base,
+      title: '会话已完成',
+      summary: summarizeSessionEvent(data) || '本轮任务已结束。',
+      tone: 'ok',
+      icon: <Check size={14} />,
+    };
+  }
+
+  if (event.event_type === 'session_failed' || event.event_type === 'error') {
+    return {
+      ...base,
+      title: event.event_type === 'error' ? '运行错误' : '会话失败',
+      summary: stringValue(data.message) || stringValue(data.error) || summarizeSessionEvent(data) || '运行过程中发生错误。',
+      tone: 'danger',
+      icon: <OctagonAlert size={14} />,
+    };
+  }
+
+  if (event.event_type === 'session_status_changed') {
+    return {
+      ...base,
+      title: '状态已变化',
+      summary: stringValue(data.status) || '会话状态发生变化。',
+      tone: eventToneFromStatus(stringValue(data.status)),
+      icon: <CircleDot size={14} />,
+    };
+  }
+
+  if (event.event_type === 'session_title_updated') {
+    return {
+      ...base,
+      title: '标题已更新',
+      summary: stringValue(data.title) || '会话标题已更新。',
+      tone: 'neutral',
+      icon: <FileText size={14} />,
+    };
+  }
+
+  return {
+    ...base,
+    title: EVENT_LABELS[event.event_type] || event.event_type,
+    summary: buildEventSummary(event),
+    tone: eventToneFromType(event.event_type),
+    icon: <CircleDot size={14} />,
+  };
+}
+
+function addEventChips(current: string[], extra: string[]) {
+  return Array.from(new Set([...current, ...extra.filter(Boolean)])).slice(0, 4);
+}
+
+function summarizeToolInput(input: Record<string, unknown>) {
+  return (
+    stringValue(input.command) ||
+    stringValue(input.file_path) ||
+    stringValue(input.path) ||
+    stringValue(input.task) ||
+    stringValue(input.description) ||
+    summarizeRecordKeys(input)
+  );
+}
+
+function summarizeToolResult(result: Record<string, unknown>, failed: boolean) {
+  const errorText = firstLine(stringValue(result.error_message) || stringValue(result.stderr));
+  if (failed && errorText) {
+    return errorText;
+  }
+  const operation = buildToolOperation(result);
+  const output = firstLine(stringValue(result.output) || stringValue(result.stdout));
+  const filePath = stringValue(result.file_path);
+  if (operation && filePath) {
+    return `${operation} · ${filePath}`;
+  }
+  return operation || output || filePath || (failed ? '工具返回错误结果。' : '工具执行成功。');
+}
+
+function summarizeSessionEvent(data: Record<string, unknown>) {
+  return [stringValue(data.agent_name), stringValue(data.provider), stringValue(data.model), stringValue(data.status)]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+function summarizeRecordKeys(record: Record<string, unknown>) {
+  const keys = Object.keys(record).slice(0, 3);
+  return keys.length ? `参数：${keys.join(', ')}` : '';
+}
+
+function firstLine(value: string) {
+  return value.split(/\r?\n/).find((line) => line.trim())?.trim() || '';
+}
+
+function eventToneFromStatus(status: string): EventTone {
+  const normalized = status.toLowerCase();
+  if (normalized.includes('fail') || normalized.includes('error') || normalized.includes('cancel')) {
+    return 'danger';
+  }
+  if (normalized.includes('wait') || normalized.includes('approval')) {
+    return 'warn';
+  }
+  if (normalized.includes('finish') || normalized.includes('complete')) {
+    return 'ok';
+  }
+  if (normalized.includes('run') || normalized.includes('start')) {
+    return 'running';
+  }
+  return 'neutral';
+}
+
+function eventToneFromType(eventType: string): EventTone {
+  if (eventType.includes('failed') || eventType === 'error') {
+    return 'danger';
+  }
+  if (eventType.includes('approval') || eventType.includes('question')) {
+    return 'warn';
+  }
+  if (eventType.includes('finished') || eventType.includes('completed')) {
+    return 'ok';
+  }
+  if (eventType.includes('started')) {
+    return 'running';
+  }
+  return 'neutral';
 }
 
 function getStatusClass(status: string) {
@@ -1647,6 +2184,18 @@ function formatSessionTime(value: string) {
     day: '2-digit',
     hour: '2-digit',
     minute: '2-digit',
+  });
+}
+
+function formatIsoTime(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value || '-';
+  }
+  return date.toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
   });
 }
 

@@ -11,6 +11,7 @@ from litellm import acompletion
 from codepilot.events import StreamEvent
 from codepilot.logging import get_logger
 from codepilot.session import LLMState, Message, SessionState, ToolPart
+from codepilot.session.message import AssistantMessageTokens, MessageTokenCache
 from codepilot.utils import utc_now_iso
 
 TOOL_RESULT_PLACEHOLDER = "[Old tool result content cleared]"
@@ -21,6 +22,7 @@ class LiteLLMStreamResult:
     text: str = ""
     reasoning: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    tokens: AssistantMessageTokens | None = None
     raw_response: dict[str, Any] = field(default_factory=dict)
 
 
@@ -47,11 +49,15 @@ class LiteLLMClient:
             tools=tools or None,
             max_tokens=llm_state.max_tokens,
             temperature=llm_state.temperature,
+            stream_options={"include_usage": True},
             **self._build_provider_kwargs(llm_state),
         )
 
+        tokens: AssistantMessageTokens | None = None
         async for chunk in stream:
             payload = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+            if payload.get("usage"):
+                tokens = self._extract_tokens(payload["usage"])
             choices = payload.get("choices") or []
             if not choices:
                 continue
@@ -96,7 +102,7 @@ class LiteLLMClient:
                     "arguments": arguments,
                 }
             )
-        return LiteLLMStreamResult(text="".join(content_parts), reasoning="".join(reasoning_parts), tool_calls=tool_calls)
+        return LiteLLMStreamResult(text="".join(content_parts), reasoning="".join(reasoning_parts), tool_calls=tool_calls, tokens=tokens)
 
     async def complete_text(
         self,
@@ -151,6 +157,44 @@ class LiteLLMClient:
                 "api_base": os.environ.get("QWEN_BASE_URL"),
             }
         return {}
+
+    def _extract_tokens(self, usage: Any) -> AssistantMessageTokens:
+        """从不同供应商的 usage 结构中提取统一 token 统计。"""
+        data = self._as_dict(usage)
+        prompt_details = self._as_dict(data.get("prompt_tokens_details") or data.get("input_tokens_details"))
+        completion_details = self._as_dict(data.get("completion_tokens_details") or data.get("output_tokens_details"))
+        return AssistantMessageTokens(
+            input=self._first_int(data, "prompt_tokens", "input_tokens"),
+            output=self._first_int(data, "completion_tokens", "output_tokens"),
+            reasoning=self._first_int(completion_details, "reasoning_tokens"),
+            cache=MessageTokenCache(
+                read=self._first_int(
+                    data,
+                    "cache_read_input_tokens",
+                    "cached_tokens",
+                    fallback=self._first_int(prompt_details, "cached_tokens", "cache_read_input_tokens"),
+                )
+                or 0,
+                write=self._first_int(data, "cache_creation_input_tokens", fallback=self._first_int(prompt_details, "cache_creation_input_tokens"))
+                or 0,
+            ),
+        )
+
+    def _first_int(self, data: dict[str, Any], *keys: str, fallback: int | None = None) -> int | None:
+        for key in keys:
+            value = data.get(key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float):
+                return int(value)
+        return fallback
+
+    def _as_dict(self, value: Any) -> dict[str, Any]:
+        if hasattr(value, "model_dump"):
+            return value.model_dump()
+        return value if isinstance(value, dict) else {}
 
     def _build_provider_tool_call(self, part: ToolPart) -> dict[str, Any]:
         return {
