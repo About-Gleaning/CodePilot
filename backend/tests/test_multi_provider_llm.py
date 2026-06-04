@@ -634,6 +634,7 @@ def test_session_stream_uses_sse_comment_for_heartbeat() -> None:
         agent_profiles={"build": object()},
         session_runner=SimpleNamespace(
             handle_input=None,
+            current_session_id=lambda: "session_1",
             get_status_snapshot=lambda: {
                 "workspace_id": "ws_1",
                 "workspace_path": "/tmp/codepilot",
@@ -665,6 +666,96 @@ def test_session_stream_uses_sse_comment_for_heartbeat() -> None:
     assert "data:" not in chunk
 
 
+def test_session_replay_returns_empty_when_no_current_session() -> None:
+    app_state = SimpleNamespace(
+        session_runner=SimpleNamespace(
+            get_status_snapshot=lambda: {
+                "workspace_id": "ws_1",
+                "workspace_path": "/tmp/codepilot",
+                "session_id": None,
+                "status": "IDLE",
+                "agent_name": "build",
+                "provider": None,
+                "model": None,
+            }
+        ),
+        session_memory=SimpleNamespace(
+            replay=lambda _session_id: {
+                "session": {"data": {"session_id": "session_latest"}},
+                "messages": [{"unexpected": True}],
+                "records": [{"unexpected": True}],
+            }
+        ),
+    )
+    app = FastAPI()
+    app.include_router(build_api_router(app_state))
+    client = TestClient(app)
+
+    response = client.get("/api/session/replay")
+
+    assert response.status_code == 200
+    assert response.json() == {"session": None, "messages": [], "records": []}
+
+
+def test_session_stream_skips_replay_when_no_current_session() -> None:
+    base_settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    settings = base_settings.model_copy(
+        update={
+            "sse": base_settings.sse.model_copy(
+                update={"heartbeat_seconds": 0.01, "replay_on_connect": True}
+            )
+        }
+    )
+    replay_event = StreamEvent(
+        seq=12,
+        event_id="evt_latest",
+        event_type="session_started",
+        session_id="session_latest",
+        created_at="2026-04-30T00:00:00Z",
+        data={"agent_name": "build"},
+    )
+    queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
+    app_state = SimpleNamespace(
+        settings=settings,
+        workspace=SimpleNamespace(
+            workspace_id="ws_1",
+            workspace_path=Path("/tmp/codepilot"),
+            codepilot_home=Path("/tmp/codepilot-home"),
+        ),
+        agent_profiles={"build": object()},
+        session_runner=SimpleNamespace(
+            handle_input=None,
+            current_session_id=lambda: None,
+            get_status_snapshot=lambda: {
+                "workspace_id": "ws_1",
+                "workspace_path": "/tmp/codepilot",
+                "session_id": None,
+                "status": "IDLE",
+                "agent_name": "build",
+                "provider": None,
+                "model": None,
+            },
+        ),
+        session_memory=SimpleNamespace(replay=lambda _session_id: {"session": None, "messages": [], "records": []}),
+        event_bus=SimpleNamespace(create_stream_queue=lambda: queue, remove_stream_queue=lambda _queue: None),
+        event_store=SimpleNamespace(replay=lambda **_kwargs: [replay_event]),
+    )
+    app = FastAPI()
+    app.include_router(build_api_router(app_state))
+    route = next(route for route in app.router.routes if getattr(route, "path", None) == "/api/session/stream")
+
+    async def receive() -> dict[str, object]:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request({"type": "http", "method": "GET", "path": "/api/session/stream", "headers": []}, receive)
+    response = asyncio.run(route.endpoint(request, after_seq=0))
+    chunk = asyncio.run(response.body_iterator.__anext__())
+    asyncio.run(response.body_iterator.aclose())
+
+    assert chunk.startswith(": heartbeat ")
+    assert "session_latest" not in chunk
+
+
 def test_session_stream_replay_keeps_business_event_format() -> None:
     base_settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
     settings = base_settings.model_copy(
@@ -693,6 +784,7 @@ def test_session_stream_replay_keeps_business_event_format() -> None:
         agent_profiles={"build": object()},
         session_runner=SimpleNamespace(
             handle_input=None,
+            current_session_id=lambda: "session_1",
             get_status_snapshot=lambda: {
                 "workspace_id": "ws_1",
                 "workspace_path": "/tmp/codepilot",

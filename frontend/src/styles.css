@@ -2213,9 +2213,11 @@ pre {
 }
 
 .mobile-shell {
+  height: 100vh;
   height: 100dvh;
-  display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   overflow: hidden;
   background:
     linear-gradient(180deg, rgba(5, 8, 7, 0.18), rgba(5, 8, 7, 0.86)),
@@ -2227,6 +2229,7 @@ pre {
 
 .mobile-topbar {
   z-index: 8;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2292,6 +2295,7 @@ pre {
 }
 
 .mobile-error {
+  flex: 0 0 auto;
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -2309,11 +2313,13 @@ pre {
 }
 
 .mobile-content {
+  flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 7px 8px 8px;
-  scroll-padding-bottom: 18px;
+  padding: 7px 8px 10px;
+  overscroll-behavior: contain;
+  scroll-padding-bottom: 86px;
 }
 
 .mobile-glance {
@@ -2357,10 +2363,16 @@ pre {
 
 .mobile-tabs {
   z-index: 7;
+  flex: 0 0 52px;
+  height: 52px;
+  min-height: 52px;
+  max-height: 52px;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: stretch;
   gap: 4px;
   padding: 5px 8px;
+  overflow: hidden;
   border-top: 1px solid rgba(53, 70, 62, 0.68);
   background:
     linear-gradient(180deg, rgba(12, 17, 15, 0.94), rgba(5, 8, 7, 0.98)),
@@ -2370,13 +2382,17 @@ pre {
 .mobile-tabs button {
   position: relative;
   min-width: 0;
-  min-height: 40px;
+  width: 100%;
+  height: 42px;
+  min-height: 42px;
+  max-height: 42px;
   display: grid;
-  grid-template-rows: auto auto;
+  grid-template-rows: 1fr;
   align-items: center;
   justify-content: center;
   gap: 2px;
   padding: 4px 4px;
+  overflow: hidden;
   border: 1px solid rgba(53, 70, 62, 0.62);
   border-radius: 8px;
   background: rgba(10, 15, 13, 0.84);
@@ -2406,14 +2422,20 @@ pre {
 
 .mobile-tabs code {
   position: absolute;
-  transform: translate(18px, -14px);
+  top: 5px;
+  right: max(7px, 16%);
+  max-width: 34px;
   min-width: 18px;
   padding: 2px 4px;
+  overflow: hidden;
   border: 1px solid rgba(212, 255, 98, 0.32);
   border-radius: 999px;
   background: rgba(6, 10, 8, 0.92);
   color: var(--accent);
   font-size: 9px;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .mobile-panel {
@@ -2580,10 +2602,12 @@ pre {
 
 .mobile-composer {
   z-index: 10;
+  flex: 0 0 auto;
   display: grid;
   gap: 6px;
-  max-height: min(42dvh, 320px);
+  max-height: min(46dvh, 320px);
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 6px 8px calc(7px + env(safe-area-inset-bottom));
   border-top: 1px solid var(--line);
   background:

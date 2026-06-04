@@ -345,7 +345,9 @@ function App() {
   const [thinkingValue, setThinkingValue] = useState('');
   const [lastSeq, setLastSeq] = useState(0);
   const lastSeqRef = useRef(0);
+  const currentSessionIdRef = useRef<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
+  const streamReconnectTimerRef = useRef<number | null>(null);
   const questionPanelRef = useRef<HTMLElement | null>(null);
   const questionOptionsRef = useRef<HTMLDivElement | null>(null);
   const questionNoteRef = useRef<HTMLTextAreaElement | null>(null);
@@ -353,9 +355,14 @@ function App() {
   useEffect(() => {
     void bootstrap();
     return () => {
+      clearStreamReconnectTimer();
       eventSourceRef.current?.close();
     };
   }, []);
+
+  useEffect(() => {
+    currentSessionIdRef.current = currentSessionId;
+  }, [currentSessionId]);
 
   useEffect(() => {
     if (!questionRequest) {
@@ -423,7 +430,7 @@ function App() {
       applyProviderAndModelState(statusRes);
       setThinkingValue(statusRes.thinking_value || '');
       setAgentName(statusRes.agent_name || 'build');
-      setMessages(replayRes.messages);
+      setMessages(statusRes.session_id && getReplaySessionId(replayRes) === statusRes.session_id ? replayRes.messages : []);
       setSubagentLiveDeltas({});
       setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
@@ -434,6 +441,7 @@ function App() {
   }
 
   function connectStream(afterSeq: number) {
+    clearStreamReconnectTimer();
     eventSourceRef.current?.close();
     const source = new EventSource(`/api/session/stream?after_seq=${afterSeq}`);
     source.onmessage = (event) => {
@@ -447,13 +455,36 @@ function App() {
       });
     });
     source.onerror = () => {
+      if (eventSourceRef.current !== source) {
+        return;
+      }
       source.close();
-      window.setTimeout(() => connectStream(lastSeqRef.current), 1200);
+      streamReconnectTimerRef.current = window.setTimeout(() => connectStream(lastSeqRef.current), 1200);
     };
     eventSourceRef.current = source;
   }
 
+  function clearStreamReconnectTimer() {
+    if (streamReconnectTimerRef.current === null) {
+      return;
+    }
+    window.clearTimeout(streamReconnectTimerRef.current);
+    streamReconnectTimerRef.current = null;
+  }
+
   function onStreamEvent(event: StreamEvent) {
+    const activeSessionId = currentSessionIdRef.current;
+    const eventSessionId = event.session_id;
+    if (activeSessionId && eventSessionId && eventSessionId !== activeSessionId) {
+      return;
+    }
+    if (!activeSessionId) {
+      if (event.event_type !== 'session_started' || !eventSessionId) {
+        return;
+      }
+      currentSessionIdRef.current = eventSessionId;
+      setCurrentSessionId(eventSessionId);
+    }
     setLastSeq((prev) => {
       const next = Math.max(prev, event.seq);
       lastSeqRef.current = next;
@@ -602,6 +633,7 @@ function App() {
       setFormError('请先选择 model');
       return;
     }
+    const isStartingNewSession = !currentSessionIdRef.current;
     try {
       const payload = {
         type: 'user_message',
@@ -613,7 +645,12 @@ function App() {
         ...(currentSessionId ? { session_id: currentSessionId } : {}),
       };
       const response = await postJson<{ ok: boolean; session: StatusResponse | null }>('/api/session/input', payload);
-      setCurrentSessionId(response.session?.session_id || null);
+      const nextSessionId = response.session?.session_id || null;
+      currentSessionIdRef.current = nextSessionId;
+      setCurrentSessionId(nextSessionId);
+      if (isStartingNewSession && nextSessionId) {
+        connectStream(0);
+      }
       setTask('');
       await refreshStatus();
       await refreshSessionHistory();
@@ -623,7 +660,12 @@ function App() {
   }
 
   function handleNewTask() {
+    clearStreamReconnectTimer();
+    eventSourceRef.current?.close();
+    eventSourceRef.current = null;
+    currentSessionIdRef.current = null;
     setCurrentSessionId(null);
+    setStatus((prev) => (prev ? { ...prev, session_id: null, status: 'IDLE' } : prev));
     setMessages([]);
     setEvents([]);
     setLiveDelta('');
@@ -639,6 +681,8 @@ function App() {
     setActiveQuestionOptionIndex(0);
     setQuestionError('');
     setFormError('');
+    setLastSeq(0);
+    lastSeqRef.current = 0;
   }
 
   async function handleLoadSession(sessionId: string) {
@@ -2902,6 +2946,15 @@ function formatIsoTime(value: string) {
 
 function isTextEntryTarget(target: EventTarget | null) {
   return target instanceof HTMLElement && Boolean(target.closest('input, textarea, select, [contenteditable="true"]'));
+}
+
+function getReplaySessionId(replay: ReplayResponse) {
+  const sessionData = replay.session?.data;
+  if (!sessionData || typeof sessionData !== 'object') {
+    return null;
+  }
+  const sessionId = (sessionData as Record<string, unknown>).session_id;
+  return typeof sessionId === 'string' ? sessionId : null;
 }
 
 async function fetchJson<T>(url: string): Promise<T> {

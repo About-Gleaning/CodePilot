@@ -61,7 +61,10 @@ def build_api_router(app_state: Any) -> APIRouter:
         重新拿到当前会话已经产生的历史事件和消息内容。
         """
         snapshot = app_state.session_runner.get_status_snapshot()
-        replay = await app_state.session_memory.replay(snapshot.get("session_id"))
+        session_id = snapshot.get("session_id")
+        if not session_id:
+            return JSONResponse({"session": None, "messages": [], "records": []})
+        replay = await app_state.session_memory.replay(session_id)
         return JSONResponse(replay)
 
     @router.get("/sessions")
@@ -140,10 +143,11 @@ def build_api_router(app_state: Any) -> APIRouter:
             """
             snapshot = app_state.session_runner.get_status_snapshot()
             replay_session_id = snapshot.get("session_id")
+            active_session_id = replay_session_id
             queue = app_state.event_bus.create_stream_queue()
-            if app_state.settings.sse.replay_on_connect:
+            if active_session_id and app_state.settings.sse.replay_on_connect:
                 # 支持重连补发，避免前端在网络抖动后丢失关键事件。
-                for replay_event in app_state.event_store.replay(session_id=replay_session_id, after_seq=after_seq):
+                for replay_event in app_state.event_store.replay(session_id=active_session_id, after_seq=after_seq):
                     yield _to_sse(replay_event)
 
             heartbeat_seconds = app_state.settings.sse.heartbeat_seconds
@@ -154,6 +158,19 @@ def build_api_router(app_state: Any) -> APIRouter:
                         break
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=heartbeat_seconds)
+                        event_session_id = event.session_id
+                        if active_session_id and event_session_id != active_session_id:
+                            current_session_id = app_state.session_runner.current_session_id()
+                            if event.event_type == "session_started" and event_session_id == current_session_id:
+                                # 前端从“新会话”状态提交首条消息时，连接可能仍绑定旧会话；
+                                # 以新 session_started 为准切换绑定，避免旧会话阻断新会话事件。
+                                active_session_id = event_session_id
+                            else:
+                                continue
+                        if not active_session_id:
+                            if event.event_type != "session_started" or not event_session_id:
+                                continue
+                            active_session_id = event_session_id
                         yield _to_sse(event)
                     except TimeoutError:
                         # 使用 SSE 注释帧保活，避免把保活噪音暴露为业务事件。
