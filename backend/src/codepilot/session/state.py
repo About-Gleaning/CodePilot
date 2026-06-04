@@ -49,7 +49,6 @@ class LLMState(BaseModel):
     provider: str
     model: str
     max_tokens: int
-    temperature: float
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

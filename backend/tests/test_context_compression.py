@@ -144,7 +144,7 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
         result = await compressor.compress(
             session=session,
             config=compression_settings(),
-            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
             llm_client=client,  # type: ignore[arg-type]
         )
 
@@ -207,7 +207,7 @@ def test_context_compressor_only_replaces_target_context_messages() -> None:
         result = await compressor.compress(
             session=session,
             config=compression_settings(),
-            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
             llm_client=StubLLMClient(),  # type: ignore[arg-type]
             context_id="ctx_sub",
         )
@@ -246,7 +246,7 @@ def test_tool_result_placeholder_keeps_latest_result() -> None:
         result = await compressor.compress(
             session=session,
             config=settings,
-            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
             llm_client=StubLLMClient(),  # type: ignore[arg-type]
         )
 

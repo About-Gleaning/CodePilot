@@ -67,7 +67,7 @@ def test_system_prompt_lists_skills_without_full_content_or_path(tmp_path: Path)
         workspace=SimpleNamespace(workspace_path=tmp_path),
         agent_state=AgentState(name="build", role="build"),
         agent_profile=build_agent_profiles(max_iterations=3)["build"],
-        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
         skill_registry=registry,
     )
 
@@ -87,7 +87,7 @@ def test_system_prompt_reports_empty_skills(tmp_path: Path) -> None:
         workspace=SimpleNamespace(workspace_path=tmp_path),
         agent_state=AgentState(name="build", role="build"),
         agent_profile=build_agent_profiles(max_iterations=3)["build"],
-        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096, temperature=0),
+        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
         skill_registry=registry,
     )
 

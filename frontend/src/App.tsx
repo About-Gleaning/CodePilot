@@ -4,6 +4,7 @@ import remarkGfm from 'remark-gfm';
 import {
   AlertTriangle,
   Bot,
+  Brain,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -31,6 +32,18 @@ type ProviderOption = {
   provider: string;
   label: string;
   models: string[];
+  model_capabilities?: Record<string, ModelCapability>;
+};
+
+type ThinkingCapability = {
+  kind: 'reasoning_effort' | 'extra_body_boolean';
+  allowed_values: string[];
+  default_value: string;
+  extra_body_key?: string | null;
+};
+
+type ModelCapability = {
+  thinking?: ThinkingCapability | null;
 };
 
 type ConfigResponse = {
@@ -53,6 +66,8 @@ type StatusResponse = {
   agent_name: string;
   provider: string | null;
   model: string | null;
+  thinking_enabled: boolean;
+  thinking_value?: string | null;
 };
 
 type ReplayResponse = {
@@ -135,6 +150,7 @@ const EVENT_LABELS: Record<string, string> = {
   assistant_message_started: '助手开始输出',
   assistant_message_completed: '助手输出完成',
   llm_delta: '流式增量',
+  llm_reasoning_delta: '推理增量',
   tool_call_started: '工具调用开始',
   tool_call_finished: '工具调用完成',
   tool_call_failed: '工具调用失败',
@@ -260,6 +276,9 @@ function App() {
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [liveDelta, setLiveDelta] = useState('');
   const [subagentLiveDeltas, setSubagentLiveDeltas] = useState<Record<string, string>>({});
+  const [liveReasoningDelta, setLiveReasoningDelta] = useState('');
+  const [subagentLiveReasoningDeltas, setSubagentLiveReasoningDeltas] = useState<Record<string, string>>({});
+  const [thinkingValue, setThinkingValue] = useState('');
   const [lastSeq, setLastSeq] = useState(0);
   const lastSeqRef = useRef(0);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -313,6 +332,19 @@ function App() {
     focusQuestionOptions();
   }, [questionRequest, activeQuestionIndex]);
 
+  useEffect(() => {
+    const capability = getThinkingCapability(findProviderOption(provider), model);
+    if (!capability) {
+      if (thinkingValue) {
+        setThinkingValue('');
+      }
+      return;
+    }
+    if (!capability.allowed_values.includes(thinkingValue)) {
+      setThinkingValue(capability.default_value);
+    }
+  }, [config, provider, model]);
+
   async function bootstrap() {
     try {
       const [configRes, statusRes, replayRes, sessionsRes] = await Promise.all([
@@ -325,9 +357,11 @@ function App() {
       setStatus(statusRes);
       setCurrentSessionId(statusRes.session_id);
       applyProviderAndModelState(statusRes);
+      setThinkingValue(statusRes.thinking_value || '');
       setAgentName(statusRes.agent_name || 'build');
       setMessages(replayRes.messages);
       setSubagentLiveDeltas({});
+      setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
       connectStream(0);
     } catch (error) {
@@ -374,6 +408,15 @@ function App() {
         setLiveDelta((prev) => prev + text);
       }
     }
+    if (event.event_type === 'llm_reasoning_delta') {
+      const text = String(event.data.text || '');
+      if (event.data.agent_kind === 'subagent') {
+        const key = String(event.data.context_id || event.data.parent_call_id || 'subagent');
+        setSubagentLiveReasoningDeltas((prev) => ({ ...prev, [key]: (prev[key] || '') + text }));
+      } else {
+        setLiveReasoningDelta((prev) => prev + text);
+      }
+    }
     if (event.event_type === 'assistant_message_completed') {
       if (event.data.message && typeof event.data.message === 'object') {
         const message = event.data.message as MessageRecord;
@@ -384,8 +427,14 @@ function App() {
             delete next[key];
             return next;
           });
+          setSubagentLiveReasoningDeltas((prev) => {
+            const next = { ...prev };
+            delete next[key];
+            return next;
+          });
         } else {
           setLiveDelta('');
+          setLiveReasoningDelta('');
         }
         setMessages((prev) => upsertMessage(prev, message));
       }
@@ -434,6 +483,7 @@ function App() {
     setStatus(next);
     setCurrentSessionId(next.session_id);
     applyProviderAndModelState(next);
+    setThinkingValue(next.thinking_value || '');
     setAgentName(next.agent_name || 'build');
   }
 
@@ -461,11 +511,20 @@ function App() {
     const providerOption = findProviderOption(nextProvider);
     if (!providerOption) {
       setModel('');
+      setThinkingValue('');
       return;
     }
     if (!providerOption.models.includes(model)) {
       setModel('');
+      setThinkingValue('');
+      return;
     }
+    setThinkingValue(resolveNextThinkingValue(providerOption, model, thinkingValue));
+  }
+
+  function handleModelChange(nextModel: string) {
+    setModel(nextModel);
+    setThinkingValue(resolveNextThinkingValue(findProviderOption(provider), nextModel, thinkingValue));
   }
 
   async function handleStart(event: FormEvent<HTMLFormElement>) {
@@ -486,7 +545,7 @@ function App() {
         agent_name: agentName,
         provider,
         model,
-        metadata: {},
+        metadata: thinkingValue ? { thinking_value: thinkingValue } : {},
         ...(currentSessionId ? { session_id: currentSessionId } : {}),
       };
       const response = await postJson<{ ok: boolean; session: StatusResponse | null }>('/api/session/input', payload);
@@ -505,6 +564,9 @@ function App() {
     setEvents([]);
     setLiveDelta('');
     setSubagentLiveDeltas({});
+    setLiveReasoningDelta('');
+    setSubagentLiveReasoningDeltas({});
+    setThinkingValue('');
     setApprovalRequest(null);
     setApprovalComment('');
     setQuestionRequest(null);
@@ -524,11 +586,14 @@ function App() {
       setStatus(nextStatus);
       setCurrentSessionId(nextStatus.session_id);
       applyProviderAndModelState(nextStatus);
+      setThinkingValue(nextStatus.thinking_value || '');
       setAgentName(nextStatus.agent_name || 'build');
       setMessages(replay.messages);
       setEvents([]);
       setLiveDelta('');
       setSubagentLiveDeltas({});
+      setLiveReasoningDelta('');
+      setSubagentLiveReasoningDeltas({});
       setApprovalRequest(null);
       setApprovalComment('');
       setQuestionRequest(null);
@@ -747,6 +812,10 @@ function App() {
 
   const selectedProvider = findProviderOption(provider);
   const modelOptions = selectedProvider?.models || [];
+  const selectedThinking = getThinkingCapability(selectedProvider, model);
+  const thinkingOptions = selectedThinking
+    ? selectedThinking.allowed_values.map((item) => ({ value: item, label: formatThinkingValue(item) }))
+    : [{ value: '', label: '不可用' }];
   const statusText = status?.status || 'IDLE';
   const activeQuestion = questionRequest?.questions[activeQuestionIndex] || null;
   const activeAnswer = activeQuestion ? questionAnswers[activeQuestion.id] || { values: [], note: '' } : null;
@@ -836,7 +905,7 @@ function App() {
         ) : null}
 
         <section className="message-viewport" aria-label="会话消息">
-          {messages.length === 0 && !liveDelta ? (
+          {messages.length === 0 && !liveDelta && !liveReasoningDelta ? (
             <div className="empty-state">
               <Sparkles size={20} />
               <p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p>
@@ -847,7 +916,7 @@ function App() {
             <MessageItem key={String(message.info?.id || index)} message={message} index={index} />
           ))}
 
-          {liveDelta ? (
+          {liveDelta || liveReasoningDelta ? (
             <article className="message-card assistant streaming-card">
               <div className="message-meta">
                 <span className="role-badge assistant">
@@ -856,10 +925,11 @@ function App() {
                 </span>
                 <span className="muted-inline">streaming</span>
               </div>
-              <MarkdownContent className="message-live-text" text={liveDelta} />
+              <LiveReasoningBlock text={liveReasoningDelta} />
+              {liveDelta ? <MarkdownContent className="message-live-text" text={liveDelta} /> : null}
             </article>
           ) : null}
-          {Object.entries(subagentLiveDeltas).map(([key, text]) => (
+          {Array.from(new Set([...Object.keys(subagentLiveDeltas), ...Object.keys(subagentLiveReasoningDeltas)])).map((key) => (
             <article className="message-card assistant streaming-card subagent-card" key={key}>
               <div className="message-meta">
                 <span className="role-badge assistant">
@@ -868,7 +938,8 @@ function App() {
                 </span>
                 <span className="muted-inline">{key}</span>
               </div>
-              <MarkdownContent className="message-live-text" text={text} />
+              <LiveReasoningBlock text={subagentLiveReasoningDeltas[key] || ''} />
+              {subagentLiveDeltas[key] ? <MarkdownContent className="message-live-text" text={subagentLiveDeltas[key]} /> : null}
             </article>
           ))}
         </section>
@@ -899,9 +970,21 @@ function App() {
               <ConfigSelect
                 value={model}
                 options={[{ value: '', label: '选择 model' }, ...modelOptions.map((item) => ({ value: item, label: item }))]}
-                onChange={setModel}
+                onChange={handleModelChange}
                 disabled={!provider}
               />
+            </label>
+            <label className="field compact-field thinking-field">
+              <span>思考</span>
+              <div className="thinking-select">
+                <Brain size={14} aria-hidden="true" />
+                <ConfigSelect
+                  value={selectedThinking ? thinkingValue || selectedThinking.default_value : ''}
+                  options={thinkingOptions}
+                  onChange={setThinkingValue}
+                  disabled={!selectedThinking || selectedThinking.allowed_values.length <= 1}
+                />
+              </div>
             </label>
           </div>
 
@@ -1554,6 +1637,24 @@ function ReasoningBlock({ text }: { text: string }) {
   );
 }
 
+function LiveReasoningBlock({ text }: { text: string }) {
+  if (!text) {
+    return null;
+  }
+  return (
+    <details className="reasoning-block live-reasoning-block" open>
+      <summary>
+        <span>
+          <CircleDot size={12} />
+          实时推理
+        </span>
+        <small>{text.length} chars</small>
+      </summary>
+      <pre>{text}</pre>
+    </details>
+  );
+}
+
 function ToolPartView({ part }: { part: MessagePart }) {
   const state = asRecord(part.state) as ToolState;
   const output = asRecord(state.output);
@@ -1835,11 +1936,42 @@ function totalTokensForUsage(tokens: TokenUsage) {
 function formatTokenUsage(tokens: TokenUsage) {
   const total = totalTokensForUsage(tokens);
   const cacheRead = numberValue(tokens.cache?.read);
-  return cacheRead > 0 ? `${formatNumber(total)} tokens · cache ${formatNumber(cacheRead)}` : `${formatNumber(total)} tokens`;
+  const reasoning = numberValue(tokens.reasoning);
+  const details = [
+    reasoning > 0 ? `reason ${formatNumber(reasoning)}` : '',
+    cacheRead > 0 ? `cache ${formatNumber(cacheRead)}` : '',
+  ].filter(Boolean);
+  return details.length ? `${formatNumber(total)} tokens · ${details.join(' · ')}` : `${formatNumber(total)} tokens`;
 }
 
 function jsonPretty(value: unknown) {
   return JSON.stringify(value, null, 2);
+}
+
+function getThinkingCapability(provider: ProviderOption | null, model: string): ThinkingCapability | null {
+  return provider?.model_capabilities?.[model]?.thinking || null;
+}
+
+function resolveNextThinkingValue(provider: ProviderOption | null, model: string, currentValue: string) {
+  const capability = getThinkingCapability(provider, model);
+  if (!capability) {
+    return '';
+  }
+  return capability.allowed_values.includes(currentValue) ? currentValue : capability.default_value;
+}
+
+function formatThinkingValue(value: string) {
+  const labels: Record<string, string> = {
+    none: 'none',
+    minimal: 'minimal',
+    low: 'low',
+    medium: 'medium',
+    high: 'high',
+    xhigh: 'xhigh',
+    on: '开启',
+    off: '关闭',
+  };
+  return labels[value] || value;
 }
 
 function upsertMessage(prev: MessageRecord[], next: MessageRecord): MessageRecord[] {

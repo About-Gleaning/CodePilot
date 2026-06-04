@@ -48,12 +48,12 @@ class LiteLLMClient:
             stream=True,
             tools=tools or None,
             max_tokens=llm_state.max_tokens,
-            temperature=llm_state.temperature,
             stream_options={"include_usage": True},
             **self._build_provider_kwargs(llm_state),
         )
 
         tokens: AssistantMessageTokens | None = None
+        agent_event_data = self._agent_event_data(session)
         async for chunk in stream:
             payload = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
             if payload.get("usage"):
@@ -70,12 +70,20 @@ class LiteLLMClient:
                         event_type="llm_delta",
                         session_id=session.session_id,
                         created_at=utc_now_iso(),
-                        data={"text": content},
+                        data={**agent_event_data, "text": content},
                     )
                 )
             reasoning_text = delta.get("reasoning") or delta.get("reasoning_content")
             if reasoning_text:
                 reasoning_parts.append(reasoning_text)
+                await event_bus.publish_stream_event(
+                    StreamEvent(
+                        event_type="llm_reasoning_delta",
+                        session_id=session.session_id,
+                        created_at=utc_now_iso(),
+                        data={**agent_event_data, "text": reasoning_text},
+                    )
+                )
             for tool_call in delta.get("tool_calls") or []:
                 index = tool_call.get("index", 0)
                 existing = tool_call_map[index]
@@ -115,7 +123,6 @@ class LiteLLMClient:
             messages=messages,
             stream=False,
             max_tokens=max_tokens,
-            temperature=llm_state.temperature,
             **self._build_provider_kwargs(llm_state),
         )
         payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
@@ -151,12 +158,36 @@ class LiteLLMClient:
         return f"{prefix}{llm_state.model}"
 
     def _build_provider_kwargs(self, llm_state: LLMState) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
         if llm_state.provider == "qwen":
-            return {
-                "api_key": os.environ.get("QWEN_API_KEY"),
-                "api_base": os.environ.get("QWEN_BASE_URL"),
-            }
-        return {}
+            kwargs.update(
+                {
+                    "api_key": os.environ.get("QWEN_API_KEY"),
+                    "api_base": os.environ.get("QWEN_BASE_URL"),
+                }
+            )
+        thinking_value = llm_state.metadata.get("thinking_value")
+        thinking_settings = self._as_dict(llm_state.metadata.get("thinking"))
+        if not thinking_value or not thinking_settings:
+            return kwargs
+        kind = thinking_settings.get("kind")
+        if kind == "reasoning_effort":
+            kwargs["reasoning_effort"] = thinking_value
+        if kind == "extra_body_boolean":
+            extra_body_key = thinking_settings.get("extra_body_key")
+            if isinstance(extra_body_key, str) and extra_body_key:
+                extra_body = self._as_dict(kwargs.get("extra_body"))
+                extra_body[extra_body_key] = thinking_value == "on"
+                kwargs["extra_body"] = extra_body
+        return kwargs
+
+    def _agent_event_data(self, session: SessionState) -> dict[str, Any]:
+        """为实时流事件补齐 agent 归属，前端据此区分主 agent 与 subagent。"""
+        return {
+            "agent_kind": session.metadata.get("agent_kind") or "agent",
+            "context_id": session.metadata.get("agent_context_id") or "main",
+            "parent_call_id": session.metadata.get("parent_call_id"),
+        }
 
     def _extract_tokens(self, usage: Any) -> AssistantMessageTokens:
         """从不同供应商的 usage 结构中提取统一 token 统计。"""

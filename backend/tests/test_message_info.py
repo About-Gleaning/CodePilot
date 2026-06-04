@@ -197,7 +197,7 @@ def test_litellm_stream_chat_extracts_usage_tokens(monkeypatch: pytest.MonkeyPat
     result = asyncio.run(
         client.stream_chat(
             session=session,
-            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=128, temperature=0),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=128),
             provider_messages=[{"role": "user", "content": "hello"}],
             tools=[],
             event_bus=RecordingStreamBus(),
@@ -212,3 +212,129 @@ def test_litellm_stream_chat_extracts_usage_tokens(monkeypatch: pytest.MonkeyPat
     assert result.tokens.cache is not None
     assert result.tokens.cache.read == 5
     assert result.tokens.cache.write == 0
+
+
+def test_litellm_provider_kwargs_enable_reasoning_effort() -> None:
+    client = LiteLLMClient()
+
+    openai_thinking = {
+        "kind": "reasoning_effort",
+        "allowed_values": ["none", "low", "medium", "high"],
+        "default_value": "medium",
+    }
+    qwen_thinking = {
+        "kind": "extra_body_boolean",
+        "extra_body_key": "enable_thinking",
+        "allowed_values": ["on", "off"],
+        "default_value": "on",
+    }
+    openai_enabled = client._build_provider_kwargs(
+        LLMState(
+            provider="openai",
+            model="any-openai-model",
+            max_tokens=128,
+            metadata={"thinking_value": "medium", "thinking": openai_thinking},
+        )
+    )
+    openai_none = client._build_provider_kwargs(
+        LLMState(
+            provider="openai",
+            model="any-openai-model",
+            max_tokens=128,
+            metadata={"thinking_value": "none", "thinking": openai_thinking},
+        )
+    )
+    openai_disabled = client._build_provider_kwargs(
+        LLMState(
+            provider="openai",
+            model="any-openai-model",
+            max_tokens=128,
+            metadata={"thinking": openai_thinking},
+        )
+    )
+    qwen_enabled = client._build_provider_kwargs(
+        LLMState(
+            provider="qwen",
+            model="any-qwen-model",
+            max_tokens=128,
+            metadata={"thinking_value": "on", "thinking": qwen_thinking},
+        )
+    )
+    qwen_disabled = client._build_provider_kwargs(
+        LLMState(
+            provider="qwen",
+            model="any-qwen-model",
+            max_tokens=128,
+            metadata={"thinking_value": "off", "thinking": qwen_thinking},
+        )
+    )
+
+    assert openai_enabled["reasoning_effort"] == "medium"
+    assert openai_none["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in openai_disabled
+    assert qwen_enabled["extra_body"] == {"enable_thinking": True}
+    assert qwen_disabled["extra_body"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in qwen_enabled
+
+
+def test_litellm_stream_chat_publishes_reasoning_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_acompletion(**kwargs: object) -> FakeStream:
+        captured_kwargs.update(kwargs)
+        return FakeStream(
+            [
+                {"choices": [{"delta": {"reasoning_content": "先分析"}}]},
+                {"choices": [{"delta": {"content": "done"}}]},
+            ]
+        )
+
+    monkeypatch.setattr("codepilot.llm.client.acompletion", fake_acompletion)
+    client = LiteLLMClient()
+    session = SessionState(
+        session_id="session_1",
+        workspace_id="ws_1",
+        workspace_path="/tmp/codepilot",
+        agent_name="build",
+        provider="openai",
+        model="gpt-5.3-codex",
+        status=SessionStatus.RUNNING,
+        created_at="2026-04-30T00:00:00Z",
+        updated_at="2026-04-30T00:00:00Z",
+        metadata={"agent_kind": "subagent", "agent_context_id": "ctx_1", "parent_call_id": "call_1"},
+    )
+    event_bus = RecordingStreamBus()
+
+    result = asyncio.run(
+        client.stream_chat(
+            session=session,
+            llm_state=LLMState(
+                provider="openai",
+                model="gpt-5.3-codex",
+                max_tokens=128,
+                metadata={
+                    "thinking_value": "medium",
+                    "thinking": {
+                        "kind": "reasoning_effort",
+                        "allowed_values": ["low", "medium", "high"],
+                        "default_value": "medium",
+                    },
+                },
+            ),
+            provider_messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            event_bus=event_bus,
+        )
+    )
+
+    assert captured_kwargs["reasoning_effort"] == "medium"
+    assert "temperature" not in captured_kwargs
+    assert result.text == "done"
+    assert result.reasoning == "先分析"
+    assert [event.event_type for event in event_bus.events] == ["llm_reasoning_delta", "llm_delta"]
+    assert event_bus.events[0].data == {
+        "agent_kind": "subagent",
+        "context_id": "ctx_1",
+        "parent_call_id": "call_1",
+        "text": "先分析",
+    }

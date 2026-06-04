@@ -8,22 +8,59 @@ llm:
     openai:
       label: "OpenAI"
       models:
-        - "gpt-5.3-codex"
+        - id: "gpt-5.3-codex"
+          thinking:
+            kind: "reasoning_effort"
+            allowed_values: ["low", "medium", "high"]
+            default_value: "medium"
         - "gpt-4.1"
       litellm_model_prefix: ""
     qwen:
       label: "Qwen"
       models:
-        - "qwen-plus"
-        - "qwen-max"
+        - id: "qwen3-max"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - id: "qwen3-coder-next"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - id: "qwen3.5-flash"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - id: "kimi-k2.5"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - id: "kimi/kimi-k2.5"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - id: "ZHIPU/GLM-5"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
       litellm_model_prefix: "openai/"
   max_tokens: 4096
-  temperature: 0
   stream: true
 agent:
   default_agent_name: "build"
-  max_loop_iterations: 50
-  subagent_max_loop_iterations: 8
+  max_loop_iterations: 200
+  subagent_max_loop_iterations: 200
   subagent_max_depth: 1
 context:
   compression_enabled: false
@@ -72,7 +109,7 @@ hooks:
       hook_type: llm.before
       plugin_type: prompt
       order: 100
-      enabled: true
+      enabled: false
       config:
         role: system
         content: "你必须优先复用已有代码风格，修改前先观察上下文。"

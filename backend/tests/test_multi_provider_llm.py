@@ -43,11 +43,33 @@ def build_settings(environ: dict[str, str]) -> AppSettings:
         providers={
             "openai": LLMProviderSettings(
                 label="OpenAI",
-                models=["gpt-5.3-codex", "gpt-4.1"],
+                models=[
+                    {
+                        "id": "gpt-5.3-codex",
+                        "thinking": {
+                            "kind": "reasoning_effort",
+                            "allowed_values": ["low", "medium", "high"],
+                            "default_value": "medium",
+                        },
+                    },
+                    "gpt-4.1",
+                ],
             ),
             "qwen": LLMProviderSettings(
                 label="Qwen",
-                models=["qwen-plus", "qwen-max"],
+                models=[
+                    "qwen-plus",
+                    "qwen-max",
+                    {
+                        "id": "qwen3.5-flash",
+                        "thinking": {
+                            "kind": "extra_body_boolean",
+                            "extra_body_key": "enable_thinking",
+                            "allowed_values": ["on", "off"],
+                            "default_value": "on",
+                        },
+                    },
+                ],
                 litellm_model_prefix="openai/",
             ),
         }
@@ -75,6 +97,45 @@ def test_build_llm_runtime_settings_activates_only_complete_provider() -> None:
 
     assert list(settings.llm_runtime.activated_providers) == ["openai"]
     assert settings.llm_runtime.activated_providers["openai"].models == ["gpt-5.3-codex", "gpt-4.1"]
+
+
+def test_llm_provider_settings_accepts_legacy_string_models() -> None:
+    provider = LLMProviderSettings(label="OpenAI", models=["gpt-4.1"])
+
+    assert provider.models[0].id == "gpt-4.1"
+    assert provider.models[0].thinking is None
+
+
+def test_llm_provider_settings_validates_thinking_values() -> None:
+    with pytest.raises(ValueError, match="default_value 必须属于 allowed_values"):
+        LLMProviderSettings(
+            label="OpenAI",
+            models=[
+                {
+                    "id": "gpt-test",
+                    "thinking": {
+                        "kind": "reasoning_effort",
+                        "allowed_values": ["low"],
+                        "default_value": "medium",
+                    },
+                }
+            ],
+        )
+
+    with pytest.raises(ValueError, match="reasoning_effort 只能使用"):
+        LLMProviderSettings(
+            label="OpenAI",
+            models=[
+                {
+                    "id": "gpt-test",
+                    "thinking": {
+                        "kind": "reasoning_effort",
+                        "allowed_values": ["on"],
+                        "default_value": "on",
+                    },
+                }
+            ],
+        )
 
 
 def test_resolve_llm_selection_requires_explicit_provider_and_model() -> None:
@@ -155,7 +216,8 @@ def test_config_route_returns_models_without_default_fields() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert [item["provider"] for item in payload["activated_providers"]] == ["openai", "qwen"]
-    assert payload["activated_providers"][1]["models"] == ["qwen-plus", "qwen-max"]
+    assert payload["activated_providers"][1]["models"] == ["qwen-plus", "qwen-max", "qwen3.5-flash"]
+    assert payload["activated_providers"][0]["model_capabilities"]["gpt-5.3-codex"]["thinking"]["default_value"] == "medium"
     assert "default_model" not in payload["activated_providers"][0]
     assert "provider_selection_required" not in payload
 
@@ -274,6 +336,45 @@ def test_session_runner_new_session_rejects_missing_model() -> None:
 
     assert session.provider == "qwen"
     assert session.model == "qwen-plus"
+
+
+def test_session_runner_writes_thinking_enabled_to_new_session_metadata() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings)
+
+    session = runner._new_session(
+        GatewayInput(
+            type=GatewayInputType.USER_MESSAGE,
+            content="hello",
+            agent_name="build",
+            provider="openai",
+            model="gpt-5.3-codex",
+            metadata={"thinking_enabled": True},
+        )
+    )
+
+    assert session.metadata["thinking_enabled"] is True
+    assert session.metadata["thinking_value"] == "medium"
+    runner._session = session
+    assert runner.get_status_snapshot()["thinking_enabled"] is True
+    assert runner.get_status_snapshot()["thinking_value"] == "medium"
+
+
+def test_session_runner_rejects_invalid_thinking_value() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings)
+
+    with pytest.raises(ValueError, match="thinking_value `xhigh` 不属于"):
+        runner._new_session(
+            GatewayInput(
+                type=GatewayInputType.USER_MESSAGE,
+                content="hello",
+                agent_name="build",
+                provider="openai",
+                model="gpt-5.3-codex",
+                metadata={"thinking_value": "xhigh"},
+            )
+        )
 
 
 def test_session_runner_reuses_session_when_request_carries_same_session_id() -> None:
@@ -437,6 +538,44 @@ def test_session_runner_allows_switching_agent_and_model_on_existing_session() -
     assert second_session.messages[-1].info.agent == "plan"
     assert second_session.messages[-1].info.model.provider_id == "qwen"
     assert second_session.messages[-1].info.model.model_id == "qwen-plus"
+
+
+def test_session_runner_updates_thinking_enabled_on_existing_session() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings)
+
+    first_session = asyncio.run(
+        runner.handle_input(
+            GatewayInput(
+                type=GatewayInputType.USER_MESSAGE,
+                content="first",
+                agent_name="build",
+                provider="openai",
+                model="gpt-5.3-codex",
+                metadata={"thinking_enabled": True},
+            )
+        )
+    )
+    assert first_session is not None
+    first_session.status = SessionStatus.COMPLETED
+
+    second_session = asyncio.run(
+        runner.handle_input(
+            GatewayInput(
+                type=GatewayInputType.USER_MESSAGE,
+                session_id=first_session.session_id,
+                content="continue",
+                agent_name="build",
+                provider="openai",
+                model="gpt-5.3-codex",
+                metadata={"thinking_enabled": False},
+            )
+        )
+    )
+
+    assert second_session is not None
+    assert second_session.metadata["thinking_enabled"] is False
+    assert second_session.metadata["thinking_value"] is None
 
 
 def test_session_runner_rejects_unknown_agent_name() -> None:

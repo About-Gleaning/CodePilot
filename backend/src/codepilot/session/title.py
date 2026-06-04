@@ -59,7 +59,6 @@ class SessionTitleService:
             provider=self.provider,
             model=self.model,
             max_tokens=64,
-            temperature=0,
             metadata={"litellm_model_prefix": self.litellm_model_prefix},
         )
         response = await LiteLLMClient().complete_text(

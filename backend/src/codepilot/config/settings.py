@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ServerSettings(BaseModel):
@@ -17,15 +17,68 @@ class StorageSettings(BaseModel):
     codepilot_home: str = "~/codepilot"
 
 
+ReasoningEffortValue = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
+ThinkingBooleanValue = Literal["on", "off"]
+ThinkingValue = ReasoningEffortValue | ThinkingBooleanValue
+
+
+class ThinkingSettings(BaseModel):
+    kind: Literal["reasoning_effort", "extra_body_boolean"]
+    allowed_values: list[ThinkingValue] = Field(default_factory=list)
+    default_value: ThinkingValue
+    extra_body_key: str | None = None
+
+    @model_validator(mode="after")
+    def validate_thinking_values(self) -> "ThinkingSettings":
+        if not self.allowed_values:
+            raise ValueError("thinking.allowed_values 不能为空")
+        if self.default_value not in self.allowed_values:
+            raise ValueError("thinking.default_value 必须属于 allowed_values")
+        if self.kind == "reasoning_effort":
+            invalid = [value for value in self.allowed_values if value in {"on", "off"}]
+            if invalid:
+                raise ValueError("reasoning_effort 只能使用 none/minimal/low/medium/high/xhigh")
+            if self.extra_body_key:
+                raise ValueError("reasoning_effort 不需要配置 extra_body_key")
+        if self.kind == "extra_body_boolean":
+            invalid = [value for value in self.allowed_values if value not in {"on", "off"}]
+            if invalid:
+                raise ValueError("extra_body_boolean 只能使用 on/off")
+            if not self.extra_body_key:
+                raise ValueError("extra_body_boolean 必须配置 extra_body_key")
+        return self
+
+
+class LLMModelSettings(BaseModel):
+    id: str
+    thinking: ThinkingSettings | None = None
+
+
 class LLMProviderSettings(BaseModel):
     label: str
-    models: list[str] = Field(default_factory=list)
+    models: list[LLMModelSettings] = Field(default_factory=list)
     litellm_model_prefix: str = ""
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def normalize_models(cls, value: Any) -> Any:
+        if not isinstance(value, list):
+            return value
+        normalized: list[Any] = []
+        for item in value:
+            if isinstance(item, str):
+                normalized.append({"id": item})
+                continue
+            normalized.append(item)
+        return normalized
 
     @model_validator(mode="after")
     def validate_models(self) -> "LLMProviderSettings":
         if not self.models:
             raise ValueError("LLM provider 至少需要配置一个 model")
+        ids = [model.id for model in self.models]
+        if len(ids) != len(set(ids)):
+            raise ValueError("LLM provider 下的 model id 不能重复")
         return self
 
 
@@ -33,6 +86,7 @@ class ActivatedLLMProvider(BaseModel):
     provider: str
     label: str
     models: list[str]
+    model_settings: dict[str, LLMModelSettings] = Field(default_factory=dict)
     litellm_model_prefix: str = ""
     required_env_vars: list[str] = Field(default_factory=list)
 
@@ -44,7 +98,6 @@ class LLMRuntimeSettings(BaseModel):
 class LLMSettings(BaseModel):
     providers: dict[str, LLMProviderSettings] = Field(default_factory=dict)
     max_tokens: int = 4096
-    temperature: float = 0
     stream: bool = True
 
 
@@ -214,7 +267,8 @@ def build_llm_runtime_settings(
         activated_providers[provider] = ActivatedLLMProvider(
             provider=provider,
             label=provider_settings.label,
-            models=list(provider_settings.models),
+            models=[model.id for model in provider_settings.models],
+            model_settings={model.id: model for model in provider_settings.models},
             litellm_model_prefix=provider_settings.litellm_model_prefix,
             required_env_vars=required_env_vars,
         )
@@ -246,6 +300,40 @@ def resolve_llm_selection(
         raise ValueError(f"model `{model}` 不属于 provider `{provider}` 的已配置模型")
 
     return activated_provider, model
+
+
+def resolve_thinking_value(
+    settings: AppSettings,
+    provider: str,
+    model: str,
+    metadata: Mapping[str, Any],
+) -> str | None:
+    """解析并校验用户选择的模型思考档位。
+
+    thinking_enabled 是旧布尔协议：true 映射到模型默认值，false 表示不传参数。
+    thinking_value 是新协议：只有模型声明支持该值时才允许进入 LLM 调用链。
+    """
+    activated_provider = settings.llm_runtime.activated_providers.get(provider)
+    if activated_provider is None:
+        raise ValueError(f"provider `{provider}` 未激活或不存在")
+    model_settings = activated_provider.model_settings.get(model)
+    thinking_settings = model_settings.thinking if model_settings else None
+
+    raw_value = metadata.get("thinking_value")
+    if raw_value is None:
+        if metadata.get("thinking_enabled") is True and thinking_settings:
+            return str(thinking_settings.default_value)
+        return None
+    if raw_value == "":
+        return None
+    if not isinstance(raw_value, str):
+        raise ValueError("metadata.thinking_value 必须是字符串")
+    if thinking_settings is None:
+        raise ValueError(f"model `{model}` 未配置 thinking 能力，不能设置 thinking_value")
+    if raw_value not in thinking_settings.allowed_values:
+        allowed = ", ".join(str(value) for value in thinking_settings.allowed_values)
+        raise ValueError(f"thinking_value `{raw_value}` 不属于 model `{model}` 的可选值：{allowed}")
+    return raw_value
 
 
 def load_settings(

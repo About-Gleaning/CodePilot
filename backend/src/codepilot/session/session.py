@@ -168,6 +168,7 @@ class AgentLoop:
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
             metadata={
+                **parent_session.metadata,
                 "agent_context_id": context_id,
                 "parent_call_id": parent_call_id,
                 "agent_kind": agent_profile.kind,
@@ -247,13 +248,17 @@ class AgentLoop:
         )
 
     def _build_llm_state(self, session: SessionState, config: Any) -> LLMState:
+        activated_provider = config.llm_runtime.activated_providers[session.provider]
+        model_settings = activated_provider.model_settings.get(session.model)
         return LLMState(
             provider=session.provider,
             model=session.model,
             max_tokens=config.llm.max_tokens,
-            temperature=config.llm.temperature,
             metadata={
-                "litellm_model_prefix": config.llm_runtime.activated_providers[session.provider].litellm_model_prefix,
+                "litellm_model_prefix": activated_provider.litellm_model_prefix,
+                "thinking": model_settings.thinking.model_dump() if model_settings and model_settings.thinking else None,
+                "thinking_enabled": bool(session.metadata.get("thinking_enabled")),
+                "thinking_value": session.metadata.get("thinking_value"),
             },
         )
 

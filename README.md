@@ -34,7 +34,6 @@ CodePilot 是一个以 Web 为入口、Gateway 为统一协议层、Agent Runtim
 codepilot/
   backend/
     .env.example
-    config.example.yaml
     config.yaml
     pyproject.toml
     src/codepilot/
@@ -56,16 +55,17 @@ codepilot/
 uv sync
 ```
 
-4. 复制后端配置模板与环境变量模板：
+4. 复制环境变量模板：
 
 ```bash
-cp config.example.yaml config.yaml
 cp .env.example .env
 ```
 
-5. 在 `backend/.env` 中填写需要激活的 LLM 厂商密钥。配置了哪家厂商所需的完整环境变量，就代表激活了哪家厂商；可以同时激活多家。
+5. 如需调整服务端口、模型清单或工具策略，直接修改仓库中的 `backend/config.yaml`。该文件不包含密钥，可以提交到 GitHub。
 
-6. 启动后端：
+6. 在 `backend/.env` 中填写需要激活的 LLM 厂商密钥。配置了哪家厂商所需的完整环境变量，就代表激活了哪家厂商；可以同时激活多家。
+
+7. 启动后端：
 
 ```bash
 cd backend
@@ -128,16 +128,27 @@ llm:
     openai:
       label: "OpenAI"
       models:
-        - "gpt-5.3-codex"
+        - id: "gpt-5.3-codex"
+          thinking:
+            kind: "reasoning_effort"
+            allowed_values: ["low", "medium", "high"]
+            default_value: "medium"
         - "gpt-4.1"
-      default_model: "gpt-5.3-codex"
       litellm_model_prefix: ""
     qwen:
       label: "Qwen"
       models:
-        - "qwen-plus"
-        - "qwen-max"
-      default_model: "qwen-plus"
+        - "qwen3-max"
+        - "qwen3-coder-next"
+        - id: "qwen3.5-flash"
+          thinking:
+            kind: "extra_body_boolean"
+            extra_body_key: "enable_thinking"
+            allowed_values: ["on", "off"]
+            default_value: "on"
+        - "kimi-k2.5"
+        - "kimi/kimi-k2.5"
+        - "ZHIPU/GLM-5"
       litellm_model_prefix: "openai/"
 ```
 

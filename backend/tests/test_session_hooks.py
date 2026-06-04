@@ -35,7 +35,16 @@ def build_settings() -> AppSettings:
         providers={
             "openai": LLMProviderSettings(
                 label="OpenAI",
-                models=["gpt-5.3-codex"],
+                models=[
+                    {
+                        "id": "gpt-5.3-codex",
+                        "thinking": {
+                            "kind": "reasoning_effort",
+                            "allowed_values": ["low", "medium", "high"],
+                            "default_value": "medium",
+                        },
+                    }
+                ],
             )
         }
     )
@@ -333,6 +342,53 @@ def test_subagent_approval_request_fails_without_human_waiting() -> None:
     assert llm_client.calls == 0
     assert "human_approval_required" not in [event.event_type for event in event_bus.stream_events]
     assert [event.event_type for event in event_bus.stream_events].count("error") == 1
+
+
+def test_agent_loop_llm_state_carries_thinking_enabled_metadata() -> None:
+    settings = build_settings()
+    session = build_session()
+    session.metadata["thinking_enabled"] = True
+    loop = AgentLoop(
+        llm_client=StubLiteLLMClient(),
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=StubToolDispatcher(),
+        hook_manager=_build_hook_manager(settings),
+    )
+
+    llm_state = loop._build_llm_state(session, settings)
+
+    assert llm_state.metadata["thinking_enabled"] is True
+    assert llm_state.metadata["thinking"]["default_value"] == "medium"
+
+
+def test_subagent_inherits_parent_thinking_enabled_metadata() -> None:
+    settings = build_settings()
+    parent_session = build_session()
+    parent_session.metadata["thinking_enabled"] = True
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = RecordingEventBus()
+    llm_client = StubLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=StubToolDispatcher(),
+        hook_manager=_build_hook_manager(settings),
+    )
+
+    result = asyncio.run(
+        loop.run_subagent(
+            parent_session=parent_session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="explore", system_prompt="test", kind="subagent", max_iterations=1),
+            task="读取文件",
+            parent_call_id="call_task_1",
+            runtime=RuntimeHandles(event_bus=event_bus),
+            config=settings,
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.metadata["thinking_enabled"] is True
 
 
 def test_agent_loop_runs_session_hooks_around_loop() -> None:

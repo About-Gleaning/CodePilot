@@ -1,5 +1,4 @@
 backend/.env
-backend/config.yaml
 .run/
 
 # Python

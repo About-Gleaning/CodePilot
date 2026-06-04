@@ -49,4 +49,4 @@ subagent 只能通过 `task` 工具由主 Agent 同步派发，不能从前端 A
 
 ## Security & Configuration Tips
 
-以 `backend/config.example.yaml` 和 `backend/.env.example` 为模板创建本地配置。真实 `backend/.env`、API Key、会话 jsonl、日志和本地 workspace 数据不得提交。处理文件工具、workspace 路径和 LLM 输入时，注意路径越权、敏感信息泄露和非预期写入风险。
+`backend/config.yaml` 是可提交的项目配置，用于维护服务端口、模型清单和工具策略；真实 `backend/.env`、API Key、会话 jsonl、日志和本地 workspace 数据不得提交。处理文件工具、workspace 路径和 LLM 输入时，注意路径越权、敏感信息泄露和非预期写入风险。

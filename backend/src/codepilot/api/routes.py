@@ -99,6 +99,10 @@ def build_api_router(app_state: Any) -> APIRouter:
                 "provider": provider.provider,
                 "label": provider.label,
                 "models": provider.models,
+                "model_capabilities": {
+                    model_id: {"thinking": model_settings.thinking.model_dump() if model_settings.thinking else None}
+                    for model_id, model_settings in provider.model_settings.items()
+                },
             }
             for provider in settings.llm_runtime.activated_providers.values()
         ]

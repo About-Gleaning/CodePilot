@@ -629,6 +629,41 @@ pre {
   max-width: 420px;
 }
 
+.thinking-field {
+  flex: 0 0 142px;
+  min-width: 142px;
+}
+
+.thinking-select {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.thinking-select > svg {
+  flex: 0 0 auto;
+  color: #ffe0a3;
+}
+
+.thinking-select .select-shell {
+  min-width: 0;
+}
+
+.thinking-select .select-trigger {
+  height: 42px;
+  min-height: 42px;
+  padding: 0 9px;
+  border: 1px solid rgba(53, 70, 62, 0.92);
+  background:
+    linear-gradient(180deg, rgba(242, 187, 85, 0.08), rgba(212, 255, 98, 0.025)),
+    #090f0d;
+}
+
+.thinking-select .select-shell.is-disabled .select-trigger {
+  color: var(--muted);
+}
+
 .select-shell {
   position: relative;
   width: 100%;
@@ -1362,6 +1397,11 @@ pre {
   border-top: 1px solid rgba(38, 48, 44, 0.72);
   font-size: 12px;
   line-height: 1.6;
+}
+
+.live-reasoning-block {
+  margin-top: 11px;
+  border-color: rgba(242, 187, 85, 0.42);
 }
 
 .tool-card {

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from codepilot.config.settings import resolve_llm_selection
+from codepilot.config.settings import resolve_llm_selection, resolve_thinking_value
 from codepilot.events import MessageCreatedEvent, SessionLifecycleEvent, SessionMetaEvent, StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.hooks import HookManager, RuntimeHandles
@@ -73,6 +73,8 @@ class SessionRunner:
             "agent_name": self._session.agent_name if self._session else self._config.agent.default_agent_name,
             "provider": self._session.provider if self._session else None,
             "model": self._session.model if self._session else None,
+            "thinking_enabled": bool(self._session.metadata.get("thinking_enabled")) if self._session else False,
+            "thinking_value": self._session.metadata.get("thinking_value") if self._session else None,
         }
 
     def current_session_id(self) -> str | None:
@@ -137,11 +139,13 @@ class SessionRunner:
                 requested_provider=gateway_input.provider,
                 requested_model=gateway_input.model,
             )
+            user_metadata = self._build_user_metadata(activated_provider.provider, selected_model, gateway_input)
             # 同一 session 继续执行时，允许显式切换 agent/provider/model；
             # session 顶层仅保存“当前最新执行配置”，历史配置仍由消息元数据承载。
             self._session.agent_name = gateway_input.agent_name
             self._session.provider = activated_provider.provider
             self._session.model = selected_model
+            self._apply_user_metadata(user_metadata)
             self._session.status = SessionStatus.RUNNING
             self._session.updated_at = utc_now_iso()
         else:
@@ -373,7 +377,25 @@ class SessionRunner:
             status=SessionStatus.RUNNING,
             created_at=now,
             updated_at=now,
+            metadata=self._build_user_metadata(activated_provider.provider, selected_model, gateway_input),
         )
+
+    def _apply_user_metadata(self, user_metadata: dict[str, Any]) -> None:
+        """同步本轮用户显式设置；只保留已校验的思考档位。"""
+        assert self._session is not None
+        self._session.metadata.update(user_metadata)
+
+    def _build_user_metadata(self, provider: str, model: str, gateway_input: GatewayInput) -> dict[str, Any]:
+        thinking_value = resolve_thinking_value(
+            settings=self._config,
+            provider=provider,
+            model=model,
+            metadata=gateway_input.metadata,
+        )
+        return {
+            "thinking_enabled": thinking_value is not None,
+            "thinking_value": thinking_value,
+        }
 
     def _ensure_agent_supported(self, agent_name: str | None) -> None:
         """在进入执行链前显式校验 agent，避免后续字典取值抛出不友好的 KeyError。"""
