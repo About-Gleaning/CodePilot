@@ -11,17 +11,18 @@ FRONTEND_LOG_FILE="$RUN_DIR/frontend.log"
 BACKEND_PORT=8000
 FRONTEND_PORT=5173
 BACKEND_GRACEFUL_SHUTDOWN_SECONDS=5
+DEV_HOST="${CODEPILOT_HOST:-127.0.0.1}"
 
 BACKEND_CMD=(
   uv run uvicorn codepilot.main:app
   --app-dir src
   --reload
-  --host 127.0.0.1
+  --host "$DEV_HOST"
   --port "$BACKEND_PORT"
   # 将 Uvicorn 的优雅退出时间限制在 stop 脚本等待窗口内，避免 SSE 长连接导致外部强杀。
   --timeout-graceful-shutdown "$BACKEND_GRACEFUL_SHUTDOWN_SECONDS"
 )
-FRONTEND_CMD=(pnpm dev --host 127.0.0.1 --port "$FRONTEND_PORT")
+FRONTEND_CMD=(pnpm dev --host "$DEV_HOST" --port "$FRONTEND_PORT")
 
 mkdir -p "$RUN_DIR"
 
@@ -106,7 +107,7 @@ launch_in_own_session() {
   (
     cd "$work_dir" || exit 1
     # 为每个服务创建独立会话，确保 stop 时可以按进程组回收所有子进程。
-    nohup python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" >>"$log_file" 2>&1 &
+    nohup python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" </dev/null >>"$log_file" 2>&1 &
     echo $! >"$pid_file"
   )
 }
@@ -142,7 +143,7 @@ start_backend() {
 start_frontend() {
   local pid
   pid="$(read_pid "$FRONTEND_PID_FILE")"
-  if [[ -n "${pid:-}" ]] && is_pid_running "$pid" && pid_matches_command "$pid" "pnpm dev --host 127.0.0.1 --port 5173"; then
+  if [[ -n "${pid:-}" ]] && is_pid_running "$pid" && pid_matches_command "$pid" "pnpm dev --host"; then
     echo "前端已在运行，PID=$pid"
     return
   fi
@@ -225,13 +226,17 @@ start_all() {
   start_frontend
 
   echo "启动完成。"
-  echo "后端地址: http://127.0.0.1:8000"
-  echo "前端地址: http://127.0.0.1:5173"
+  echo "后端地址: http://${DEV_HOST}:8000"
+  echo "前端地址: http://${DEV_HOST}:5173"
+  echo "手机入口: http://${DEV_HOST}:5173/mobile"
+  if [[ "$DEV_HOST" == "0.0.0.0" ]]; then
+    echo "局域网访问时，请把 0.0.0.0 替换为本机局域网 IP。"
+  fi
 }
 
 stop_all() {
   stop_service "后端" "$BACKEND_PID_FILE" "uvicorn codepilot.main:app" "uvicorn codepilot.main:app" "$BACKEND_PORT"
-  stop_service "前端" "$FRONTEND_PID_FILE" "pnpm dev --host 127.0.0.1 --port ${FRONTEND_PORT}" "vite.js --host 127.0.0.1 --port ${FRONTEND_PORT}" "$FRONTEND_PORT"
+  stop_service "前端" "$FRONTEND_PID_FILE" "pnpm dev --host" "vite.js --host" "$FRONTEND_PORT"
 }
 
 restart_all() {

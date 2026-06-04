@@ -21,6 +21,7 @@ import {
   Radio,
   Send,
   ShieldCheck,
+  SlidersHorizontal,
   Sparkles,
   Square,
   Terminal,
@@ -251,6 +252,69 @@ type EventStats = {
   blockers: number;
   compacted: number;
   latest: StreamEvent | null;
+};
+
+type MobileTab = 'messages' | 'events' | 'history' | 'action';
+
+type MobileConsoleProps = {
+  config: ConfigResponse | null;
+  status: StatusResponse | null;
+  currentSessionId: string | null;
+  provider: string;
+  model: string;
+  agentName: string;
+  task: string;
+  formError: string;
+  approvalComment: string;
+  approvalRequest: ApprovalRequest | null;
+  questionRequest: QuestionRequest | null;
+  questionAnswers: Record<string, QuestionAnswer>;
+  activeQuestionIndex: number;
+  activeQuestionOptionIndex: number;
+  questionError: string;
+  messages: MessageRecord[];
+  events: StreamEvent[];
+  sessionHistory: SessionSummary[];
+  loadingSessionId: string | null;
+  liveDelta: string;
+  subagentLiveDeltas: Record<string, string>;
+  liveReasoningDelta: string;
+  subagentLiveReasoningDeltas: Record<string, string>;
+  thinkingValue: string;
+  modelOptions: string[];
+  thinkingOptions: SelectOption[];
+  selectedThinking: ThinkingCapability | null;
+  statusText: string;
+  activeQuestion: QuestionItem | null;
+  activeAnswer: QuestionAnswer | null;
+  tokenSummary: TokenSummary;
+  totalTokens: number;
+  eventStats: EventStats;
+  latestEventView: EventViewModel | null;
+  questionOptionsRef: React.RefObject<HTMLDivElement>;
+  questionNoteRef: React.RefObject<HTMLTextAreaElement>;
+  onAgentChange: (nextValue: string) => void;
+  onProviderChange: (nextValue: string) => void;
+  onModelChange: (nextValue: string) => void;
+  onThinkingChange: (nextValue: string) => void;
+  onTaskChange: (nextValue: string) => void;
+  onStart: (event: FormEvent<HTMLFormElement>) => void;
+  onStop: () => void;
+  onNewTask: () => void;
+  onLoadSession: (sessionId: string) => void;
+  onApproval: (approved: boolean) => void;
+  onApprovalCommentChange: (nextValue: string) => void;
+  onQuestionDecline: () => void;
+  onMoveActiveQuestion: (step: number) => void;
+  onConfirmActiveQuestion: () => void;
+  onQuestionOptionsKeyDown: (event: React.KeyboardEvent<HTMLDivElement>, question: QuestionItem) => void;
+  onQuestionChoiceChange: (question: QuestionItem, value: string, checked: boolean) => void;
+  onQuestionNoteChange: (questionId: string, note: string) => void;
+  onQuestionNoteKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onSetActiveQuestionIndex: (index: number) => void;
+  onSetActiveQuestionOptionIndex: (index: number) => void;
+  onClearQuestionError: () => void;
+  onFocusQuestionOptions: () => void;
 };
 
 function App() {
@@ -823,6 +887,72 @@ function App() {
   const totalTokens = tokenSummary.input + tokenSummary.output + tokenSummary.reasoning;
   const eventStats = summarizeEventStats(events);
   const latestEventView = eventStats.latest ? buildEventViewModel(eventStats.latest) : null;
+  const isMobileEntry = window.location.pathname === '/mobile';
+
+  if (isMobileEntry) {
+    return (
+      <MobileConsole
+        config={config}
+        status={status}
+        currentSessionId={currentSessionId}
+        provider={provider}
+        model={model}
+        agentName={agentName}
+        task={task}
+        formError={formError}
+        approvalComment={approvalComment}
+        approvalRequest={approvalRequest}
+        questionRequest={questionRequest}
+        questionAnswers={questionAnswers}
+        activeQuestionIndex={activeQuestionIndex}
+        activeQuestionOptionIndex={activeQuestionOptionIndex}
+        questionError={questionError}
+        messages={messages}
+        events={events}
+        sessionHistory={sessionHistory}
+        loadingSessionId={loadingSessionId}
+        liveDelta={liveDelta}
+        subagentLiveDeltas={subagentLiveDeltas}
+        liveReasoningDelta={liveReasoningDelta}
+        subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
+        thinkingValue={thinkingValue}
+        modelOptions={modelOptions}
+        thinkingOptions={thinkingOptions}
+        selectedThinking={selectedThinking}
+        statusText={statusText}
+        activeQuestion={activeQuestion}
+        activeAnswer={activeAnswer}
+        tokenSummary={tokenSummary}
+        totalTokens={totalTokens}
+        eventStats={eventStats}
+        latestEventView={latestEventView}
+        questionOptionsRef={questionOptionsRef}
+        questionNoteRef={questionNoteRef}
+        onAgentChange={setAgentName}
+        onProviderChange={handleProviderChange}
+        onModelChange={handleModelChange}
+        onThinkingChange={setThinkingValue}
+        onTaskChange={setTask}
+        onStart={handleStart}
+        onStop={handleStop}
+        onNewTask={handleNewTask}
+        onLoadSession={handleLoadSession}
+        onApproval={(approved) => void handleApproval(approved)}
+        onApprovalCommentChange={setApprovalComment}
+        onQuestionDecline={() => void handleQuestionDecline()}
+        onMoveActiveQuestion={moveActiveQuestion}
+        onConfirmActiveQuestion={() => void confirmActiveQuestion()}
+        onQuestionOptionsKeyDown={handleQuestionOptionsKeyDown}
+        onQuestionChoiceChange={updateQuestionChoice}
+        onQuestionNoteChange={updateQuestionNote}
+        onQuestionNoteKeyDown={handleQuestionNoteKeyDown}
+        onSetActiveQuestionIndex={setActiveQuestionIndex}
+        onSetActiveQuestionOptionIndex={setActiveQuestionOptionIndex}
+        onClearQuestionError={() => setQuestionError('')}
+        onFocusQuestionOptions={focusQuestionOptions}
+      />
+    );
+  }
 
   return (
     <div className="workspace-shell">
@@ -1193,6 +1323,445 @@ function PanelTitle({ icon, title, badge, action }: { icon: React.ReactNode; tit
         {action}
       </div>
     </div>
+  );
+}
+
+function MobileConsole(props: MobileConsoleProps) {
+  const [activeTab, setActiveTab] = useState<MobileTab>('messages');
+  const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const hasHumanAction = Boolean(props.approvalRequest || props.questionRequest);
+  const mobileTabs: Array<{ value: MobileTab; label: string; icon: React.ReactNode; count?: number }> = [
+    { value: 'messages', label: '消息', icon: <MessageSquareText size={15} />, count: props.messages.length },
+    { value: 'events', label: '事件', icon: <ListTree size={15} />, count: props.events.length },
+    { value: 'history', label: '历史', icon: <History size={15} />, count: props.sessionHistory.length },
+    {
+      value: 'action',
+      label: hasHumanAction ? '待处理' : '运行',
+      icon: hasHumanAction ? <ShieldCheck size={15} /> : <Radio size={15} />,
+      count: props.eventStats.blockers || undefined,
+    },
+  ];
+
+  useEffect(() => {
+    if (hasHumanAction) {
+      setActiveTab('action');
+    }
+  }, [hasHumanAction]);
+
+  return (
+    <div className="mobile-shell">
+      <header className="mobile-topbar">
+        <div className="mobile-brand">
+          <div className="brand-mark" aria-hidden="true">
+            <Terminal size={17} />
+          </div>
+          <div>
+            <h1>CodePilot</h1>
+            <p>{props.config?.workspace_id || 'mobile console'}</p>
+          </div>
+        </div>
+        <div className="mobile-top-actions">
+          <button type="button" className="mobile-icon-action" onClick={props.onNewTask} title="新会话" aria-label="新会话">
+            <Plus size={16} />
+          </button>
+          <div className={`status-pill ${getStatusClass(props.statusText)}`}>
+            <CircleDot size={12} />
+            <span>{props.statusText}</span>
+          </div>
+        </div>
+      </header>
+
+      {props.formError ? (
+        <section className="mobile-error" role="alert">
+          <OctagonAlert size={15} />
+          <span>{props.formError}</span>
+        </section>
+      ) : null}
+
+      <main className="mobile-content">
+        {activeTab === 'messages' ? (
+          <MobileMessagePanel
+            messages={props.messages}
+            liveDelta={props.liveDelta}
+            liveReasoningDelta={props.liveReasoningDelta}
+            subagentLiveDeltas={props.subagentLiveDeltas}
+            subagentLiveReasoningDeltas={props.subagentLiveReasoningDeltas}
+          />
+        ) : null}
+
+        {activeTab === 'events' ? (
+          <section className="mobile-panel">
+            <PanelTitle icon={<ListTree size={16} />} title="任务雷达" badge={`${props.events.length}/200`} />
+            <EventRadarHeader stats={props.eventStats} latestEvent={props.latestEventView} />
+            <div className="event-list mobile-event-list">
+              {props.events.length === 0 ? (
+                <p className="quiet-copy">等待关键事件。</p>
+              ) : (
+                props.events
+                  .slice()
+                  .reverse()
+                  .map((event) => <EventItem key={event.seq} event={event} />)
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {activeTab === 'history' ? (
+          <section className="mobile-panel">
+            <div className="mobile-panel-heading">
+              <PanelTitle icon={<History size={16} />} title="历史会话" badge={String(props.sessionHistory.length)} />
+              <button type="button" className="button secondary" onClick={props.onNewTask}>
+                <Plus size={14} />
+                新会话
+              </button>
+            </div>
+            <SessionHistoryList
+              sessions={props.sessionHistory}
+              currentSessionId={props.currentSessionId}
+              loadingSessionId={props.loadingSessionId}
+              onLoad={props.onLoadSession}
+              variant="modal"
+            />
+          </section>
+        ) : null}
+
+        {activeTab === 'action' ? (
+          <section className="mobile-panel">
+            <PanelTitle icon={hasHumanAction ? <ShieldCheck size={16} /> : <Radio size={16} />} title={hasHumanAction ? '人工处理' : '运行详情'} />
+            {props.approvalRequest ? (
+              <ApprovalPanel
+                approvalRequest={props.approvalRequest}
+                approvalComment={props.approvalComment}
+                onApprovalCommentChange={props.onApprovalCommentChange}
+              />
+            ) : props.questionRequest ? (
+              <QuestionPanel {...props} />
+            ) : (
+              <>
+                <RuntimeSignal statusText={props.statusText} latestEvent={props.latestEventView} />
+                <div className="mobile-metrics" aria-label="运行统计">
+                  <Metric icon={<MessageSquareText size={14} />} label="消息" value={String(props.messages.length)} />
+                  <Metric icon={<Play size={14} />} label="工具" value={String(props.eventStats.tools)} />
+                  <Metric icon={<AlertTriangle size={14} />} label="失败" value={String(props.eventStats.failed)} />
+                  <Metric icon={<Zap size={14} />} label="tokens" value={formatNumber(props.totalTokens)} />
+                </div>
+                <div className="session-status-card mobile-session-card">
+                  <div className={`status-pill ${getStatusClass(props.statusText)}`}>
+                    <CircleDot size={12} />
+                    <span>{props.statusText}</span>
+                  </div>
+                  <div className="session-id-block">
+                    <span>session</span>
+                    <code title={props.status?.session_id || '-'}>{props.status?.session_id || '-'}</code>
+                  </div>
+                </div>
+                <TokenMeter summary={props.tokenSummary} total={props.totalTokens} />
+              </>
+            )}
+          </section>
+        ) : null}
+      </main>
+
+      <nav className="mobile-tabs" aria-label="手机控制台视图">
+        {mobileTabs.map((tab) => (
+          <button
+            type="button"
+            className={activeTab === tab.value ? 'is-active' : ''}
+            key={tab.value}
+            onClick={() => setActiveTab(tab.value)}
+          >
+            {tab.icon}
+            <span>{tab.label}</span>
+            {typeof tab.count === 'number' ? <code>{tab.count}</code> : null}
+          </button>
+        ))}
+      </nav>
+
+      <form className={`mobile-composer ${hasHumanAction ? 'has-human-action' : ''}`} onSubmit={props.onStart}>
+        <div className="mobile-composer-head">
+          <button
+            type="button"
+            className={`mobile-config-toggle ${isConfigOpen ? 'is-open' : ''}`}
+            onClick={() => setIsConfigOpen((prev) => !prev)}
+            aria-expanded={isConfigOpen}
+          >
+            <SlidersHorizontal size={15} />
+            <span>{props.agentName || 'agent'} · {props.model || 'model'}</span>
+            <ChevronDown size={15} aria-hidden="true" />
+          </button>
+          {!hasHumanAction ? (
+            <button type="button" className="mobile-stop-button" onClick={props.onStop} title="停止" aria-label="停止任务">
+              <Square size={14} />
+            </button>
+          ) : null}
+        </div>
+
+        {isConfigOpen ? (
+          <div className="mobile-config-grid">
+            <label className="field compact-field">
+              <span>Agent</span>
+              <ConfigSelect
+                value={props.agentName}
+                options={(props.config?.agents || ['build', 'plan']).map((agent) => ({ value: agent, label: agent }))}
+                onChange={props.onAgentChange}
+              />
+            </label>
+            <label className="field compact-field">
+              <span>Provider</span>
+              <ConfigSelect
+                value={props.provider}
+                options={[
+                  { value: '', label: '选择 provider' },
+                  ...(props.config?.activated_providers || []).map((item) => ({ value: item.provider, label: item.label })),
+                ]}
+                onChange={props.onProviderChange}
+              />
+            </label>
+            <label className="field compact-field model-field">
+              <span>Model</span>
+              <ConfigSelect
+                value={props.model}
+                options={[{ value: '', label: '选择 model' }, ...props.modelOptions.map((item) => ({ value: item, label: item }))]}
+                onChange={props.onModelChange}
+                disabled={!props.provider}
+              />
+            </label>
+            <label className="field compact-field thinking-field">
+              <span>思考</span>
+              <div className="thinking-select">
+                <Brain size={14} aria-hidden="true" />
+                <ConfigSelect
+                  value={props.selectedThinking ? props.thinkingValue || props.selectedThinking.default_value : ''}
+                  options={props.thinkingOptions}
+                  onChange={props.onThinkingChange}
+                  disabled={!props.selectedThinking || props.selectedThinking.allowed_values.length <= 1}
+                />
+              </div>
+            </label>
+          </div>
+        ) : null}
+
+        {props.approvalRequest ? (
+          <div className="mobile-human-actions">
+            <button type="button" className="button primary" onClick={() => props.onApproval(true)}>
+              <Check size={15} />
+              同意
+            </button>
+            <button type="button" className="button danger" onClick={() => props.onApproval(false)}>
+              <X size={15} />
+              拒绝
+            </button>
+          </div>
+        ) : props.questionRequest ? (
+          <div className="mobile-human-actions">
+            <button type="button" className="button secondary" onClick={props.onQuestionDecline}>
+              <X size={15} />
+              退出
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              onClick={() => props.onMoveActiveQuestion(-1)}
+              disabled={props.activeQuestionIndex === 0}
+            >
+              <ChevronLeft size={15} />
+              上一题
+            </button>
+            <button type="button" className="button primary" onClick={props.onConfirmActiveQuestion}>
+              {props.activeQuestionIndex === props.questionRequest.questions.length - 1 ? <Check size={15} /> : <ChevronRight size={15} />}
+              {props.activeQuestionIndex === props.questionRequest.questions.length - 1 ? '提交' : '下一题'}
+            </button>
+          </div>
+        ) : (
+          <>
+            <div className="mobile-input-row">
+              <textarea
+                rows={2}
+                placeholder="输入任务..."
+                value={props.task}
+                onChange={(event) => props.onTaskChange(event.target.value)}
+              />
+              <button type="submit" className="button primary mobile-send-button" title="发送" aria-label="发送">
+                <Send size={15} />
+              </button>
+            </div>
+          </>
+        )}
+      </form>
+    </div>
+  );
+}
+
+function MobileMessagePanel({
+  messages,
+  liveDelta,
+  liveReasoningDelta,
+  subagentLiveDeltas,
+  subagentLiveReasoningDeltas,
+}: {
+  messages: MessageRecord[];
+  liveDelta: string;
+  liveReasoningDelta: string;
+  subagentLiveDeltas: Record<string, string>;
+  subagentLiveReasoningDeltas: Record<string, string>;
+}) {
+  return (
+    <section className="mobile-panel mobile-message-list" aria-label="会话消息">
+      {messages.length === 0 && !liveDelta && !liveReasoningDelta ? (
+        <div className="empty-state">
+          <Sparkles size={20} />
+          <p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p>
+        </div>
+      ) : null}
+
+      {messages.map((message, index) => (
+        <MessageItem key={String(message.info?.id || index)} message={message} index={index} />
+      ))}
+
+      {liveDelta || liveReasoningDelta ? (
+        <article className="message-card assistant streaming-card">
+          <div className="message-meta">
+            <span className="role-badge assistant">
+              <Bot size={13} />
+              assistant
+            </span>
+            <span className="muted-inline">streaming</span>
+          </div>
+          <LiveReasoningBlock text={liveReasoningDelta} />
+          {liveDelta ? <MarkdownContent className="message-live-text" text={liveDelta} /> : null}
+        </article>
+      ) : null}
+
+      {Array.from(new Set([...Object.keys(subagentLiveDeltas), ...Object.keys(subagentLiveReasoningDeltas)])).map((key) => (
+        <article className="message-card assistant streaming-card subagent-card" key={key}>
+          <div className="message-meta">
+            <span className="role-badge assistant">
+              <Bot size={13} />
+              subagent
+            </span>
+            <span className="muted-inline">{key}</span>
+          </div>
+          <LiveReasoningBlock text={subagentLiveReasoningDeltas[key] || ''} />
+          {subagentLiveDeltas[key] ? <MarkdownContent className="message-live-text" text={subagentLiveDeltas[key]} /> : null}
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function ApprovalPanel({
+  approvalRequest,
+  approvalComment,
+  onApprovalCommentChange,
+}: {
+  approvalRequest: ApprovalRequest;
+  approvalComment: string;
+  onApprovalCommentChange: (nextValue: string) => void;
+}) {
+  return (
+    <section className="composer-approval mobile-approval" aria-label="人工审批">
+      <div className="approval-heading">
+        <ShieldCheck size={16} />
+        <strong>人工审批</strong>
+        <code>{approvalRequest.approval_id}</code>
+      </div>
+      <p className="approval-reason">{approvalRequest.reason}</p>
+      <pre className="code-block">{JSON.stringify(approvalRequest.action || {}, null, 2)}</pre>
+      <textarea
+        rows={3}
+        placeholder="审批备注"
+        value={approvalComment}
+        onChange={(event) => onApprovalCommentChange(event.target.value)}
+      />
+    </section>
+  );
+}
+
+function QuestionPanel(props: MobileConsoleProps) {
+  if (!props.questionRequest || !props.activeQuestion || !props.activeAnswer) {
+    return null;
+  }
+
+  return (
+    <section className="composer-question mobile-question" aria-label="用户回答">
+      <div className="approval-heading">
+        <MessageSquareText size={16} />
+        <strong>需要回答</strong>
+        <code>{props.questionRequest.question_id}</code>
+      </div>
+      <div className="question-flow">
+        <div className="question-progress" aria-label="问题进度">
+          {props.questionRequest.questions.map((question, index) => {
+            const answer = props.questionAnswers[question.id] || { values: [], note: '' };
+            const isActive = index === props.activeQuestionIndex;
+            const isDone = answer.values.length > 0;
+            return (
+              <button
+                type="button"
+                className={`question-step ${isActive ? 'is-active' : ''} ${isDone ? 'is-done' : ''}`}
+                key={question.id}
+                onClick={() => {
+                  props.onSetActiveQuestionIndex(index);
+                  props.onSetActiveQuestionOptionIndex(0);
+                  props.onClearQuestionError();
+                  props.onFocusQuestionOptions();
+                }}
+                aria-current={isActive ? 'step' : undefined}
+              >
+                {index + 1}
+              </button>
+            );
+          })}
+        </div>
+
+        <fieldset className="question-fieldset">
+          <legend>
+            <span>
+              第 {props.activeQuestionIndex + 1} / {props.questionRequest.questions.length} 题
+            </span>
+            {props.activeQuestion.question}
+          </legend>
+          <div
+            className="question-options"
+            ref={props.questionOptionsRef}
+            role={props.activeQuestion.multiple ? 'group' : 'radiogroup'}
+            aria-label={props.activeQuestion.question}
+            tabIndex={0}
+            onKeyDown={(event) => props.onQuestionOptionsKeyDown(event, props.activeQuestion as QuestionItem)}
+          >
+            {props.activeQuestion.options.map((option, optionIndex) => {
+              const inputType = props.activeQuestion?.multiple ? 'checkbox' : 'radio';
+              const checked = props.activeAnswer?.values.includes(option.value) || false;
+              const isKeyboardActive = optionIndex === props.activeQuestionOptionIndex;
+              return (
+                <label className={`question-option ${isKeyboardActive ? 'is-keyboard-active' : ''}`} key={option.value}>
+                  <input
+                    type={inputType}
+                    name={props.activeQuestion?.id}
+                    checked={checked}
+                    tabIndex={-1}
+                    onChange={(event) => {
+                      props.onSetActiveQuestionOptionIndex(optionIndex);
+                      props.onQuestionChoiceChange(props.activeQuestion as QuestionItem, option.value, event.target.checked);
+                    }}
+                  />
+                  <span>{option.label}</span>
+                </label>
+              );
+            })}
+          </div>
+          <textarea
+            ref={props.questionNoteRef}
+            rows={3}
+            placeholder="备注"
+            value={props.activeAnswer.note}
+            onChange={(event) => props.onQuestionNoteChange((props.activeQuestion as QuestionItem).id, event.target.value)}
+            onKeyDown={props.onQuestionNoteKeyDown}
+          />
+          {props.questionError ? <p className="question-error">{props.questionError}</p> : null}
+        </fieldset>
+      </div>
+    </section>
   );
 }
 
