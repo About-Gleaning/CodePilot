@@ -58,7 +58,7 @@ llm:
   max_tokens: 4096
   stream: true
 agent:
-  default_agent_name: "build"
+  default_agent_name: "life"
   max_loop_iterations: 200
   subagent_max_loop_iterations: 200
   subagent_max_depth: 1
