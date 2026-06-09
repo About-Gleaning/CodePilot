@@ -55,6 +55,12 @@ llm:
             allowed_values: ["on", "off"]
             default_value: "on"
       litellm_model_prefix: "openai/"
+    deepseek:
+      label: "DeepSeek"
+      models:
+        - "deepseek-v4-flash"
+        - "deepseek-v4-pro"
+      litellm_model_prefix: "openai/"
   max_tokens: 4096
   stream: true
 agent:

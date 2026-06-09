@@ -72,6 +72,11 @@ def build_settings(environ: dict[str, str]) -> AppSettings:
                 ],
                 litellm_model_prefix="openai/",
             ),
+            "deepseek": LLMProviderSettings(
+                label="DeepSeek",
+                models=["deepseek-v4-flash", "deepseek-v4-pro"],
+                litellm_model_prefix="openai/",
+            ),
         }
     )
     settings = AppSettings(llm=llm_settings)
@@ -97,6 +102,15 @@ def test_build_llm_runtime_settings_activates_only_complete_provider() -> None:
 
     assert list(settings.llm_runtime.activated_providers) == ["openai"]
     assert settings.llm_runtime.activated_providers["openai"].models == ["gpt-5.3-codex", "gpt-4.1"]
+
+
+def test_build_llm_runtime_settings_activates_deepseek_with_api_key() -> None:
+    settings = build_settings({"DEEPSEEK_API_KEY": "sk-deepseek"})
+
+    assert list(settings.llm_runtime.activated_providers) == ["deepseek"]
+    deepseek = settings.llm_runtime.activated_providers["deepseek"]
+    assert deepseek.models == ["deepseek-v4-flash", "deepseek-v4-pro"]
+    assert deepseek.litellm_model_prefix == "openai/"
 
 
 def test_llm_provider_settings_accepts_legacy_string_models() -> None:
@@ -165,6 +179,22 @@ def test_resolve_llm_selection_requires_explicit_provider_and_model() -> None:
     assert selected_model == "qwen-plus"
 
 
+def test_resolve_llm_selection_supports_deepseek_models() -> None:
+    settings = build_settings({"DEEPSEEK_API_KEY": "sk-deepseek"})
+
+    activated_provider, selected_model = resolve_llm_selection(
+        settings,
+        requested_provider="deepseek",
+        requested_model="deepseek-v4-pro",
+    )
+
+    assert activated_provider.provider == "deepseek"
+    assert selected_model == "deepseek-v4-pro"
+
+    with pytest.raises(ValueError, match="不属于"):
+        resolve_llm_selection(settings, requested_provider="deepseek", requested_model="gpt-5.3-codex")
+
+
 def test_session_runner_status_snapshot_has_no_default_llm() -> None:
     settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
     runner = build_session_runner(settings)
@@ -181,6 +211,7 @@ def test_config_route_returns_models_without_default_fields() -> None:
             "OPENAI_API_KEY": "sk-openai",
             "QWEN_API_KEY": "sk-qwen",
             "QWEN_BASE_URL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "DEEPSEEK_API_KEY": "sk-deepseek",
         }
     )
     app_state = SimpleNamespace(
@@ -215,8 +246,9 @@ def test_config_route_returns_models_without_default_fields() -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert [item["provider"] for item in payload["activated_providers"]] == ["openai", "qwen"]
+    assert [item["provider"] for item in payload["activated_providers"]] == ["openai", "qwen", "deepseek"]
     assert payload["activated_providers"][1]["models"] == ["qwen-plus", "qwen-max", "qwen3.5-flash"]
+    assert payload["activated_providers"][2]["models"] == ["deepseek-v4-flash", "deepseek-v4-pro"]
     assert payload["activated_providers"][0]["model_capabilities"]["gpt-5.3-codex"]["thinking"]["default_value"] == "medium"
     assert "default_model" not in payload["activated_providers"][0]
     assert "provider_selection_required" not in payload

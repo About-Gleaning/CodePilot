@@ -248,6 +248,7 @@ def _provider_env_requirements() -> dict[str, tuple[str, ...]]:
     return {
         "openai": ("OPENAI_API_KEY",),
         "qwen": ("QWEN_API_KEY", "QWEN_BASE_URL"),
+        "deepseek": ("DEEPSEEK_API_KEY",),
     }
 
 

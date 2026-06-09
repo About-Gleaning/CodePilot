@@ -277,6 +277,36 @@ def test_litellm_provider_kwargs_enable_reasoning_effort() -> None:
     assert "reasoning_effort" not in qwen_enabled
 
 
+def test_litellm_provider_kwargs_support_deepseek_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek")
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+
+    kwargs = LiteLLMClient()._build_provider_kwargs(
+        LLMState(provider="deepseek", model="deepseek-v4-pro", max_tokens=128)
+    )
+
+    assert kwargs == {
+        "api_key": "sk-deepseek",
+        "api_base": "https://api.deepseek.com",
+    }
+
+
+def test_litellm_provider_kwargs_support_deepseek_base_url_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-deepseek")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://deepseek.example.com/v1")
+    monkeypatch.setenv("QWEN_API_KEY", "sk-qwen")
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+
+    kwargs = LiteLLMClient()._build_provider_kwargs(
+        LLMState(provider="deepseek", model="deepseek-v4-flash", max_tokens=128)
+    )
+
+    assert kwargs == {
+        "api_key": "sk-deepseek",
+        "api_base": "https://deepseek.example.com/v1",
+    }
+
+
 def test_litellm_stream_chat_publishes_reasoning_delta(monkeypatch: pytest.MonkeyPatch) -> None:
     captured_kwargs: dict[str, object] = {}
 

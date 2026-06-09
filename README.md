@@ -112,12 +112,15 @@ pnpm dev
 
 ## LiteLLM 配置
 
-在 `backend/.env` 中配置对应 Provider 所需的密钥。当前内置支持 `openai` 与 `qwen`：
+在 `backend/.env` 中配置对应 Provider 所需的密钥。当前内置支持 `openai`、`qwen` 与 `deepseek`：
 
 ```dotenv
 OPENAI_API_KEY="your-key"
 QWEN_API_KEY="your-qwen-key"
 QWEN_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEEPSEEK_API_KEY="your-deepseek-key"
+# 可选：默认使用 https://api.deepseek.com。
+DEEPSEEK_BASE_URL="https://api.deepseek.com"
 ```
 
 然后在 `backend/config.yaml` 中维护厂商与模型清单：
@@ -150,6 +153,12 @@ llm:
         - "kimi/kimi-k2.5"
         - "ZHIPU/GLM-5"
       litellm_model_prefix: "openai/"
+    deepseek:
+      label: "DeepSeek"
+      models:
+        - "deepseek-v4-flash"
+        - "deepseek-v4-pro"
+      litellm_model_prefix: "openai/"
 ```
 
 规则说明：
@@ -157,6 +166,7 @@ llm:
 - `backend/.env` 中只有环境变量完整的厂商才会被激活
 - 前端的 provider 与 model 下拉框全部来自 `backend/config.yaml`
 - 若同时激活多个厂商，发起任务时必须显式选择 provider
+- DeepSeek 使用 OpenAI 兼容接口接入；`deepseek-chat` 与 `deepseek-reasoner` 将在 2026-07-24 15:59 UTC 弃用，因此默认配置只保留当前 V4 模型
 
 一期直接通过 LiteLLM 发起真实流式调用，不做 mock。
 

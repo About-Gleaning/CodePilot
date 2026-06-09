@@ -166,6 +166,13 @@ class LiteLLMClient:
                     "api_base": os.environ.get("QWEN_BASE_URL"),
                 }
             )
+        if llm_state.provider == "deepseek":
+            kwargs.update(
+                {
+                    "api_key": os.environ.get("DEEPSEEK_API_KEY"),
+                    "api_base": os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
+                }
+            )
         thinking_value = llm_state.metadata.get("thinking_value")
         thinking_settings = self._as_dict(llm_state.metadata.get("thinking"))
         if not thinking_value or not thinking_settings:
