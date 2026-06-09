@@ -2113,26 +2113,37 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
   const isAssistant = role === 'assistant';
   const agentKind = String(message.info?.agent_kind || 'agent');
   const agentName = String(message.info?.agent || '');
+  const parts = message.parts || [];
+  const stepFinishParts = parts.filter((part) => part.type === 'step-finish');
+  const bodyParts = stepFinishParts.length ? parts.filter((part) => part.type !== 'step-finish') : parts;
+  const shouldRenderCard = bodyParts.length > 0 || stepFinishParts.length === 0;
 
   return (
-    <article className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
-      <div className="message-meta">
-        <span className={`role-badge ${isAssistant ? 'assistant' : 'user'}`}>
-          {isAssistant ? <Bot size={13} /> : <Terminal size={13} />}
-          {agentKind === 'subagent' ? 'subagent' : role}
-        </span>
-        {agentName ? <span className="muted-inline">{agentName}</span> : null}
-        <span className="muted-inline">#{index + 1}</span>
-        {message.info?.parent_call_id ? <span className="muted-inline">task {message.info.parent_call_id}</span> : null}
-        {message.info?.time?.created ? (
-          <span className="muted-inline">{formatTime(message.info.time.created)}</span>
-        ) : null}
-        {isAssistant && message.info?.tokens ? (
-          <span className="muted-inline">{formatTokenUsage(message.info.tokens)}</span>
-        ) : null}
-      </div>
-      <div className="message-body">{renderMessageParts(message.parts, isAssistant)}</div>
-    </article>
+    <>
+      {shouldRenderCard ? (
+        <article className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
+          <div className="message-meta">
+            <span className={`role-badge ${isAssistant ? 'assistant' : 'user'}`}>
+              {isAssistant ? <Bot size={13} /> : <Terminal size={13} />}
+              {agentKind === 'subagent' ? 'subagent' : role}
+            </span>
+            {agentName ? <span className="muted-inline">{agentName}</span> : null}
+            <span className="muted-inline">#{index + 1}</span>
+            {message.info?.parent_call_id ? <span className="muted-inline">task {message.info.parent_call_id}</span> : null}
+            {message.info?.time?.created ? (
+              <span className="muted-inline">{formatTime(message.info.time.created)}</span>
+            ) : null}
+            {isAssistant && message.info?.tokens ? (
+              <span className="muted-inline">{formatTokenUsage(message.info.tokens)}</span>
+            ) : null}
+          </div>
+          <div className="message-body">{renderMessageParts(bodyParts, isAssistant)}</div>
+        </article>
+      ) : null}
+      {stepFinishParts.map((part, partIndex) => (
+        <StepFinishView key={`step-finish-${String(message.info?.id || index)}-${partIndex}`} part={part} />
+      ))}
+    </>
   );
 }
 
@@ -2170,9 +2181,31 @@ function renderMessageParts(parts: MessagePart[] | undefined, isAssistant: boole
   if (!parts?.length) {
     return <p className="empty-message">（空消息）</p>;
   }
-  const visibleParts = parts
-    .map((part, index) => renderPart(part, index, isAssistant))
-    .filter((item): item is React.ReactNode => item !== null);
+  const visibleParts: React.ReactNode[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (part.type !== 'tool') {
+      const rendered = renderPart(part, index, isAssistant);
+      if (rendered !== null) {
+        visibleParts.push(rendered);
+      }
+      continue;
+    }
+
+    const groupId = getToolGroupId(part);
+    const toolParts = [part];
+    let nextIndex = index + 1;
+    while (groupId && parts[nextIndex]?.type === 'tool' && getToolGroupId(parts[nextIndex]) === groupId) {
+      toolParts.push(parts[nextIndex]);
+      nextIndex += 1;
+    }
+    if (groupId && toolParts.length > 1) {
+      visibleParts.push(<ToolGroupView key={`tool-group-${index}`} parts={toolParts} />);
+    } else {
+      visibleParts.push(<ToolPartView key={`tool-${index}`} part={part} />);
+    }
+    index = nextIndex - 1;
+  }
   return visibleParts.length ? visibleParts : <p className="empty-message">（无可展示内容）</p>;
 }
 
@@ -2191,7 +2224,7 @@ function renderPart(part: MessagePart, index: number, isAssistant: boolean): Rea
     return null;
   }
   if (part.type === 'step-finish') {
-    return <StepFinishView key={key} part={part} />;
+    return null;
   }
   if (part.type === 'file') {
     return <FilePartView key={key} part={part} />;
@@ -2215,6 +2248,36 @@ function renderPart(part: MessagePart, index: number, isAssistant: boolean): Rea
     return <CompactNote key={key} tone="neutral" title="Agent" value={stringValue(part.name)} />;
   }
   return isAssistant ? <UnknownPartView key={key} part={part} /> : <TextBlock key={key} text={jsonPretty(part)} />;
+}
+
+function ToolGroupView({ parts }: { parts: MessagePart[] }) {
+  const statuses = parts.map((part) => getToolStatus(part));
+  const failed = statuses.filter((status) => getToolTone(status) === 'tool-error').length;
+  const running = statuses.filter((status) => status === 'pending' || status === 'running').length;
+  const completed = parts.length - failed - running;
+  const tone = failed > 0 ? 'tool-error' : running > 0 ? 'tool-pending' : 'tool-ok';
+
+  return (
+    <section className={`tool-group ${tone}`} aria-label={`并发工具组，共 ${parts.length} 个工具`}>
+      <header className="tool-group-header">
+        <div>
+          <ListTree size={14} />
+          <strong>并发工具组</strong>
+          <span>{parts.length} 个工具同时执行</span>
+        </div>
+        <div className="tool-group-meter" aria-label={`完成 ${completed}，运行中 ${running}，失败 ${failed}`}>
+          {parts.map((part, index) => (
+            <span className={getToolTone(getToolStatus(part))} key={String(part.call_id || index)} />
+          ))}
+        </div>
+      </header>
+      <div className="tool-group-grid">
+        {parts.map((part, index) => (
+          <ToolPartView key={String(part.call_id || index)} part={part} index={index + 1} />
+        ))}
+      </div>
+    </section>
+  );
 }
 
 function TextBlock({ text }: { text: string }) {
@@ -2268,30 +2331,36 @@ function LiveReasoningBlock({ text }: { text: string }) {
   );
 }
 
-function ToolPartView({ part }: { part: MessagePart }) {
+function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
   const state = asRecord(part.state) as ToolState;
   const output = asRecord(state.output);
   const input = asRecord(state.input);
   const tool = stringValue(part.tool) || 'unknown_tool';
   const status = stringValue(state.status) || 'pending';
   const tone = getToolTone(status);
-  const title = buildToolTitle(tool, status, output);
+  const display = buildToolDisplay(tool, input, output);
   const command = stringValue(output.command) || stringValue(input.command);
+  const description = stringValue(input.description) || stringValue(output.description);
   const cwd = stringValue(output.cwd) || stringValue(input.cwd);
   const filePath = stringValue(output.file_path) || stringValue(input.file_path);
+  const url = stringValue(output.url) || stringValue(input.url);
+  const finalUrl = stringValue(output.final_url);
+  const skillName = stringValue(output.name) || stringValue(input.name);
+  const operation = buildToolOperation(output);
   const errorMessage = buildToolErrorMessage(state, output);
   const resultText = stringValue(output.output);
   const diff = stringValue(output.diff);
   const stdout = stringValue(output.stdout);
   const stderr = stringValue(output.stderr);
-  const hasDetails = hasMeaningfulDetails({ state, output });
 
   return (
     <article className={`tool-card ${tone}`}>
       <header className="tool-card-header">
         <div className="tool-title">
           {tone === 'tool-error' ? <AlertTriangle size={15} /> : <Play size={14} />}
-          <span>{title}</span>
+          {index ? <em>{index}</em> : null}
+          <span title={display.title}>{display.title}</span>
+          {display.tag ? <small className="tool-name-tag">{display.tag}</small> : null}
         </div>
         <div className="tool-chips">
           <StatusChip status={status} />
@@ -2300,10 +2369,16 @@ function ToolPartView({ part }: { part: MessagePart }) {
         </div>
       </header>
 
-      {command ? <KeyValue label="command" value={command} mono /> : null}
-      {cwd ? <KeyValue label="cwd" value={cwd} mono /> : null}
-      {filePath ? <KeyValue label="file" value={filePath} mono /> : null}
-      {buildToolOperation(output) ? <KeyValue label="operation" value={buildToolOperation(output)} /> : null}
+      <div className="tool-meta-grid">
+        {command ? <KeyValue label="command" value={command} mono /> : null}
+        {cwd ? <KeyValue label="cwd" value={cwd} mono /> : null}
+        {skillName && tool === 'load_skill' ? <KeyValue label="skill" value={skillName} /> : null}
+        {url && tool === 'webfetch' ? <KeyValue label="url" value={url} mono /> : null}
+        {finalUrl && finalUrl !== url ? <KeyValue label="final" value={finalUrl} mono /> : null}
+        {filePath ? <KeyValue label="file" value={filePath} mono /> : null}
+        {operation ? <KeyValue label="operation" value={operation} /> : null}
+        {description && tool !== 'bash_tool' ? <KeyValue label="description" value={description} /> : null}
+      </div>
 
       {errorMessage ? (
         <div className="tool-error-message">
@@ -2316,13 +2391,6 @@ function ToolPartView({ part }: { part: MessagePart }) {
       {stdout ? <OutputBlock label="stdout" value={stdout} truncated={boolValue(output.stdout_truncated)} /> : null}
       {stderr ? <OutputBlock label="stderr" value={stderr} tone="warn" truncated={boolValue(output.stderr_truncated)} /> : null}
       {diff ? <OutputBlock label="diff" value={diff} tone="diff" /> : null}
-
-      {hasDetails ? (
-        <details className="raw-details">
-          <summary>查看原始详情</summary>
-          <pre>{jsonPretty({ tool, call_id: part.call_id, state })}</pre>
-        </details>
-      ) : null}
     </article>
   );
 }
@@ -2352,22 +2420,32 @@ function OutputBlock({
   truncated?: boolean;
 }) {
   return (
-    <section className={`tool-output ${tone}`}>
-      <div>
-        <span>{label}</span>
+    <details className={`tool-output ${tone}`}>
+      <summary>
+        <span>
+          <ChevronRight size={12} />
+          {label}
+        </span>
+        <code>{formatNumber(value.length)} chars</code>
         {truncated ? <small>已截断</small> : null}
-      </div>
+      </summary>
       <pre>{value}</pre>
-    </section>
+    </details>
   );
 }
 
 function StepFinishView({ part }: { part: MessagePart }) {
   const reason = stringValue(part.reason);
-  if (!reason || reason === 'completed') {
-    return null;
-  }
-  return <CompactNote tone="neutral" title="步骤结束" value={reason} />;
+  const label = reason && reason !== 'completed' ? reason : 'completed';
+  return (
+    <div className={`step-finish-note ${reason && reason !== 'completed' ? 'has-reason' : ''}`}>
+      <span aria-hidden="true">
+        <Check size={12} />
+      </span>
+      <strong>步骤结束</strong>
+      <code>{label}</code>
+    </div>
+  );
 }
 
 function FilePartView({ part }: { part: MessagePart }) {
@@ -2424,17 +2502,28 @@ function UnknownPartView({ part }: { part: MessagePart }) {
   );
 }
 
-function buildToolTitle(tool: string, status: string, output: Record<string, unknown>) {
-  if (status === 'pending') {
-    return `${tool} 等待执行`;
+function buildToolDisplay(tool: string, input: Record<string, unknown>, output: Record<string, unknown>) {
+  if (tool === 'bash_tool') {
+    return {
+      title: stringValue(input.description) || stringValue(output.description) || stringValue(output.command) || stringValue(input.command) || tool,
+      tag: tool,
+    };
   }
-  if (status === 'running') {
-    return `${tool} 正在执行`;
+  if (tool === 'load_skill') {
+    const skillName = stringValue(output.name) || stringValue(input.name);
+    return {
+      title: skillName ? `加载 skill：${skillName}` : '加载 skill',
+      tag: tool,
+    };
   }
-  if (status === 'error' || output.status === 'error') {
-    return `${tool} 执行失败`;
+  if (tool === 'webfetch') {
+    const url = stringValue(output.url) || stringValue(input.url);
+    return {
+      title: url ? `获取 URL：${url}` : '获取 URL',
+      tag: tool,
+    };
   }
-  return `${tool} 执行完成`;
+  return { title: tool, tag: '' };
 }
 
 function buildToolOperation(output: Record<string, unknown>) {
@@ -2465,36 +2554,15 @@ function getToolTone(status: string) {
   return 'tool-ok';
 }
 
-function hasMeaningfulDetails({ state, output }: { state: ToolState; output: Record<string, unknown> }) {
-  const input = asRecord(state.input);
-  const inputKeys = Object.keys(input);
-  const outputKeys = Object.keys(output);
-  return inputKeys.length > 0 || outputKeys.some((key) => !KNOWN_OUTPUT_FIELDS.has(key));
+function getToolStatus(part: MessagePart) {
+  const state = asRecord(part.state) as ToolState;
+  return stringValue(state.status) || 'pending';
 }
 
-const KNOWN_OUTPUT_FIELDS = new Set([
-  'status',
-  'tool_name',
-  'command',
-  'cwd',
-  'exit_code',
-  'stdout',
-  'stderr',
-  'timed_out',
-  'stdout_truncated',
-  'stderr_truncated',
-  'duration_ms',
-  'file_path',
-  'output',
-  'is_empty',
-  'operation',
-  'replaced_count',
-  'diff',
-  'bytes_written',
-  'error_type',
-  'error_message',
-  'recoverable',
-]);
+function getToolGroupId(part: MessagePart) {
+  const metadata = asRecord(part.metadata);
+  return stringValue(metadata.execution_group);
+}
 
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
@@ -2631,10 +2699,11 @@ function buildEventViewModel(event: StreamEvent): EventViewModel {
   if (event.event_type === 'tool_call_started') {
     const args = asRecord(data.args);
     const toolName = stringValue(data.tool_name) || '工具';
+    const display = buildToolDisplay(toolName, args, {});
     return {
       ...base,
-      title: `${toolName} 正在执行`,
-      summary: summarizeToolInput(args) || '工具调用已开始，等待返回结果。',
+      title: display.title,
+      summary: summarizeToolInput(args) || '正在执行，等待返回结果。',
       tone: 'running',
       icon: <Play size={14} />,
     };
@@ -2642,11 +2711,13 @@ function buildEventViewModel(event: StreamEvent): EventViewModel {
 
   if (event.event_type === 'tool_call_finished' || event.event_type === 'tool_call_failed') {
     const result = asRecord(data.result);
+    const args = asRecord(data.args);
     const toolName = stringValue(data.tool_name) || stringValue(result.tool_name) || '工具';
     const failed = event.event_type === 'tool_call_failed';
+    const display = buildToolDisplay(toolName, args, result);
     return {
       ...base,
-      title: `${toolName} ${failed ? '执行失败' : '执行完成'}`,
+      title: display.title,
       summary: summarizeToolResult(result, failed),
       tone: failed ? 'danger' : 'ok',
       icon: failed ? <AlertTriangle size={14} /> : <Check size={14} />,
@@ -2782,11 +2853,13 @@ function addEventChips(current: string[], extra: string[]) {
 
 function summarizeToolInput(input: Record<string, unknown>) {
   return (
+    stringValue(input.description) ||
+    stringValue(input.name) ||
+    stringValue(input.url) ||
     stringValue(input.command) ||
     stringValue(input.file_path) ||
     stringValue(input.path) ||
     stringValue(input.task) ||
-    stringValue(input.description) ||
     summarizeRecordKeys(input)
   );
 }

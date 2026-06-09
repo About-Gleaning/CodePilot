@@ -154,6 +154,7 @@ class ToolDispatcher:
                 pending_approval: ApprovalRequest | None = None
                 pending_question: QuestionRequest | None = None
                 unresolved_items: list[dict[str, Any]] = []
+                group_parts: list[ToolPart] = []
                 for item_index, (item, (part, approval, question)) in enumerate(zip(group, group_results, strict=False)):
                     if approval:
                         if pending_index is None:
@@ -167,7 +168,10 @@ class ToolDispatcher:
                             pending_question = question
                         unresolved_items.append(item)
                         continue
-                    result_parts.append(part)
+                    group_parts.append(part)
+                if len(group_parts) > 1:
+                    self._mark_parallel_group(group_parts, group_index)
+                result_parts.extend(group_parts)
                 if pending_index is not None:
                     remaining_groups = self._remaining_items(groups, group_index + 1, 0)
                     pending_item = group[pending_index]
@@ -209,6 +213,11 @@ class ToolDispatcher:
         if current_parallel:
             grouped.append(current_parallel)
         return grouped
+
+    def _mark_parallel_group(self, parts: list[ToolPart], group_index: int) -> None:
+        group_id = f"parallel_{group_index + 1}_{parts[0].call_id}"
+        for part in parts:
+            part.metadata = {**part.metadata, "execution_group": group_id}
 
     def _remaining_items(self, groups: list[list[dict[str, Any]]], group_index: int, item_index: int) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
