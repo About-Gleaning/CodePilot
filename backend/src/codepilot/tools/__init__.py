@@ -1,6 +1,6 @@
 from .base import BaseTool, ToolExecutionContext, ToolPreflightResult, ToolSpec
 from .bash import BashTool
-from .dispatcher import ToolDispatcher, ToolExecutionBatch
+from .dispatcher import ToolDispatcher, ToolExecutionBatch, ToolResumeBatch
 from .edit_file_tool import EditFileTool
 from .load_skill_tool import LoadSkillTool
 from .mcp import McpToolAdapter
@@ -28,6 +28,7 @@ __all__ = [
     "ToolExecutionBatch",
     "ToolExecutionContext",
     "ToolPreflightResult",
+    "ToolResumeBatch",
     "ToolRegistry",
     "ToolSpec",
     "WebFetchTool",

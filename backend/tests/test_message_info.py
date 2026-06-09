@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from codepilot.llm import LiteLLMClient
 from codepilot.session import LLMState, SessionState, SessionStatus
-from codepilot.session.message import Message
+from codepilot.session.message import Message, ToolPart, ToolPartState, build_assistant_message_info
 
 
 class FakeStream:
@@ -161,6 +161,33 @@ def test_litellm_provider_message_builder_prepends_system_prompt() -> None:
         {"role": "system", "content": "system rules"},
         {"role": "user", "content": "hello"},
     ]
+
+
+def test_litellm_provider_message_builder_rejects_pending_tool_parts() -> None:
+    client = LiteLLMClient()
+    message = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_000,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd="/tmp/codepilot",
+            root="/tmp/codepilot",
+        ),
+        parts=[
+            ToolPart(
+                call_id="call_1",
+                tool="bash_tool",
+                state=ToolPartState(status="pending", input={"command": "pwd"}),
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="工具调用尚未全部闭环"):
+        client.build_provider_messages([message])
 
 
 def test_litellm_stream_chat_extracts_usage_tokens(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -11,21 +11,28 @@ from codepilot.utils import utc_now_millis
 
 def merge_approved_tool_result(session: SessionState, approved_tool_part: ToolPart) -> None:
     """把审批后执行得到的工具结果合并回最后一条 assistant 消息。"""
+    merge_approved_tool_results(session, [approved_tool_part])
+
+
+def merge_approved_tool_results(session: SessionState, approved_tool_parts: list[ToolPart]) -> None:
+    """把审批恢复后得到的一批工具结果合并回最后一条 assistant 消息。"""
     latest_message = _latest_assistant_message(session)
-    if latest_message is None:
+    if latest_message is None or not approved_tool_parts:
         return
 
+    part_map = {part.call_id: part for part in approved_tool_parts}
     merged_parts: list[object] = []
-    replaced = False
+    replaced_ids: set[str] = set()
     for part in latest_message.parts:
         # 通过 call_id 精确匹配待替换的工具片段，避免误改同一条消息中的其他工具结果。
-        if isinstance(part, ToolPart) and part.call_id == approved_tool_part.call_id:
-            merged_parts.append(approved_tool_part)
-            replaced = True
+        if isinstance(part, ToolPart) and part.call_id in part_map:
+            merged_parts.append(part_map[part.call_id])
+            replaced_ids.add(part.call_id)
             continue
         merged_parts.append(part)
-    if not replaced:
-        merged_parts.append(approved_tool_part)
+    for tool_part in approved_tool_parts:
+        if tool_part.call_id not in replaced_ids:
+            merged_parts.append(tool_part)
     latest_message.parts = merged_parts
     _mark_assistant_tool_completed(latest_message)
 

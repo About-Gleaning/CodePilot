@@ -141,14 +141,18 @@ class LiteLLMClient:
             content = message.text_content()
             tool_parts = message.tool_parts()
             if role == "assistant" and tool_parts:
+                completed_tool_parts = [part for part in tool_parts if part.state.status in {"completed", "error"}]
+                if len(completed_tool_parts) != len(tool_parts):
+                    pending_ids = [part.call_id for part in tool_parts if part.state.status not in {"completed", "error"}]
+                    raise ValueError(f"assistant 工具调用尚未全部闭环，不能发送给 LLM：{pending_ids}")
                 provider_messages.append(
                     {
                         "role": "assistant",
                         "content": content or "",
-                        "tool_calls": [self._build_provider_tool_call(part) for part in tool_parts],
+                        "tool_calls": [self._build_provider_tool_call(part) for part in completed_tool_parts],
                     }
                 )
-                provider_messages.extend(self._build_provider_tool_results(tool_parts))
+                provider_messages.extend(self._build_provider_tool_results(completed_tool_parts))
                 continue
             provider_messages.append({"role": role, "content": content})
         return provider_messages

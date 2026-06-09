@@ -9,7 +9,7 @@ from codepilot.config.settings import BashToolSettings
 from codepilot.events import EventBus
 from codepilot.hooks import HookManager, RuntimeHandles
 from codepilot.session.agents import AgentProfile, build_agent_profiles
-from codepilot.tools import BashTool, ToolDispatcher, ToolExecutionContext, ToolRegistry
+from codepilot.tools import BaseTool, BashTool, ToolDispatcher, ToolExecutionContext, ToolPreflightResult, ToolRegistry, ToolSpec
 
 
 def build_context(tmp_path: Path, *, agent_name: str = "build") -> ToolExecutionContext:
@@ -246,6 +246,117 @@ def test_dispatcher_pauses_and_resumes_approved_bash_command(tmp_path: Path) -> 
     assert pending.tool_parts == []
     assert isinstance(pending.pending_approval.request.action, dict)
     assert approved_part.state.output["stdout"] == "approved\n"
+
+
+class RecordingApprovalTool(BaseTool):
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.spec = ToolSpec(
+            name="record_tool",
+            description="记录测试工具",
+            input_schema={"type": "object", "properties": {}},
+            timeout_seconds=1,
+        )
+
+    async def preflight(self, args: dict[str, Any], context: ToolExecutionContext) -> ToolPreflightResult:
+        if args.get("needs_approval"):
+            return ToolPreflightResult(status="requires_approval", reason="测试审批")
+        return ToolPreflightResult(status="allow")
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> dict[str, Any]:
+        name = str(args["name"])
+        self.calls.append(name)
+        return {"status": "ok", "name": name}
+
+
+def test_dispatcher_resumes_remaining_tools_after_approval(tmp_path: Path) -> None:
+    async def run_case() -> tuple[list[str], Any, Any]:
+        calls: list[str] = []
+        registry = ToolRegistry()
+        registry.register(RecordingApprovalTool(calls))
+        dispatcher = ToolDispatcher(registry, HookManager())
+        session = SimpleNamespace(session_id="session_1", messages=[])
+        workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
+        agent = SimpleNamespace(name="build")
+        runtime = RuntimeHandles(event_bus=EventBus())
+
+        pending = await dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            tool_calls=[
+                {"tool_call_id": "call_1", "tool_name": "record_tool", "arguments": {"name": "first", "needs_approval": True}},
+                {"tool_call_id": "call_2", "tool_name": "record_tool", "arguments": {"name": "second"}},
+            ],
+            runtime=runtime,
+            config=SimpleNamespace(),
+        )
+        assert pending.pending_approval is not None
+        assert pending.resume_batch is not None
+
+        resumed = await dispatcher.resume_tool_batch(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            resume_batch=pending.resume_batch,
+            runtime=runtime,
+            config=SimpleNamespace(),
+        )
+        return calls, pending, resumed
+
+    calls, pending, resumed = asyncio.run(run_case())
+
+    assert pending.tool_parts == []
+    assert calls == ["first", "second"]
+    assert resumed.pending_approval is None
+    assert [part.call_id for part in resumed.tool_parts] == ["call_1", "call_2"]
+
+
+def test_dispatcher_does_not_skip_approval_for_remaining_tools(tmp_path: Path) -> None:
+    async def run_case() -> tuple[list[str], Any, Any]:
+        calls: list[str] = []
+        registry = ToolRegistry()
+        registry.register(RecordingApprovalTool(calls))
+        dispatcher = ToolDispatcher(registry, HookManager())
+        session = SimpleNamespace(session_id="session_1", messages=[])
+        workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
+        agent = SimpleNamespace(name="build")
+        runtime = RuntimeHandles(event_bus=EventBus())
+
+        pending = await dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            tool_calls=[
+                {"tool_call_id": "call_1", "tool_name": "record_tool", "arguments": {"name": "first", "needs_approval": True}},
+                {"tool_call_id": "call_2", "tool_name": "record_tool", "arguments": {"name": "second", "needs_approval": True}},
+            ],
+            runtime=runtime,
+            config=SimpleNamespace(),
+        )
+        assert pending.resume_batch is not None
+        resumed = await dispatcher.resume_tool_batch(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            resume_batch=pending.resume_batch,
+            runtime=runtime,
+            config=SimpleNamespace(),
+        )
+        return calls, pending, resumed
+
+    calls, pending, resumed = asyncio.run(run_case())
+
+    assert pending.pending_approval is not None
+    assert resumed.pending_approval is not None
+    assert resumed.resume_batch is not None
+    assert resumed.pending_approval.resume_item["tool_call_id"] == "call_2"
+    assert calls == ["first"]
+    assert [part.call_id for part in resumed.tool_parts] == ["call_1"]
 
 
 def test_dispatcher_returns_blocked_preflight_result(tmp_path: Path) -> None:

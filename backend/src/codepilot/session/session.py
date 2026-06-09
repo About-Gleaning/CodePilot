@@ -20,6 +20,7 @@ from codepilot.session.interactions import ApprovalCoordinator, QuestionCoordina
 from codepilot.session.message_ops import (
     build_question_tool_output,
     merge_approved_tool_result,
+    merge_approved_tool_results,
     merge_question_result,
     summarize_question_answers,
 )
@@ -29,7 +30,7 @@ from codepilot.session.flow import (
 )
 from codepilot.session.message import Message, TextPart, build_user_message_info
 from codepilot.session.state import AgentState, ApprovalResult, LLMState, PendingApproval, PendingQuestion, QuestionResult, SessionState, SessionStatus
-from codepilot.tools import ToolDispatcher, ToolRegistry
+from codepilot.tools import ToolDispatcher, ToolExecutionBatch, ToolRegistry, ToolResumeBatch
 from codepilot.utils import new_message_id, new_context_id, utc_now_iso, utc_now_millis
 
 
@@ -353,7 +354,7 @@ class AgentLoop:
             ctx.session.status = SessionStatus.FAILED
             return False
         if turn_result.status == "needs_question" and turn_result.pending_question is not None:
-            return await self._handle_pending_question(ctx, turn_result.pending_question, iteration)
+            return await self._handle_pending_question(ctx, turn_result.pending_question, iteration, turn_result.resume_batch)
         if turn_result.status != "needs_approval" or turn_result.pending_approval is None:
             return True
 
@@ -361,6 +362,7 @@ class AgentLoop:
             ctx,
             turn_result.pending_approval,
             iteration,
+            resume_batch=turn_result.resume_batch,
             stop_after_approval=turn_result.stop_after_approval,
         )
 
@@ -370,6 +372,7 @@ class AgentLoop:
         approval: PendingApproval,
         iteration: int,
         *,
+        resume_batch: ToolResumeBatch | None = None,
         stop_after_approval: bool = False,
     ) -> bool:
         """处理单轮执行产生的人工审批，并按原逻辑恢复可能挂起的工具调用。"""
@@ -384,7 +387,11 @@ class AgentLoop:
         if approval.resume_item is None:
             return True
 
-        await self._resume_approved_tool_call(ctx, approval)
+        batch = await self._resume_approved_tool_call(ctx, approval, resume_batch)
+        if batch.pending_approval:
+            return await self._handle_pending_approval(ctx, batch.pending_approval, iteration, resume_batch=batch.resume_batch)
+        if batch.pending_question:
+            return await self._handle_pending_question(ctx, batch.pending_question, iteration, batch.resume_batch)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
     async def _fail_subagent_human_approval(self, ctx: _RunContext, approval: PendingApproval) -> None:
@@ -411,6 +418,7 @@ class AgentLoop:
         ctx: _RunContext,
         question: PendingQuestion,
         iteration: int,
+        resume_batch: ToolResumeBatch | None = None,
     ) -> bool:
         """处理 question 工具等待；回答后回填工具结果，拒答后结束当前 run。"""
         result = await self._wait_for_question(ctx, question)
@@ -424,6 +432,12 @@ class AgentLoop:
             return True
         merge_question_result(ctx.session, question, result)
         await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
+        if resume_batch is not None and resume_batch.items:
+            batch = await self._resume_tool_batch(ctx, resume_batch)
+            if batch.pending_approval:
+                return await self._handle_pending_approval(ctx, batch.pending_approval, iteration, resume_batch=batch.resume_batch)
+            if batch.pending_question:
+                return await self._handle_pending_question(ctx, batch.pending_question, iteration, batch.resume_batch)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
     async def _publish_question_resolved(
@@ -490,8 +504,16 @@ class AgentLoop:
     def _is_rejected(self, result: ApprovalResult | None) -> bool:
         return result is not None and not result.approved
 
-    async def _resume_approved_tool_call(self, ctx: _RunContext, approval: PendingApproval) -> None:
-        # 审批通过后继续执行挂起工具，并把结果回填到最后一条 assistant 消息里。
+    async def _resume_approved_tool_call(
+        self,
+        ctx: _RunContext,
+        approval: PendingApproval,
+        resume_batch: ToolResumeBatch | None,
+    ) -> ToolExecutionBatch:
+        # 审批通过后从暂停点继续执行同一批工具，直到全部完成或再次暂停。
+        if resume_batch is not None:
+            return await self._resume_tool_batch(ctx, resume_batch)
+
         approved_tool_part = await self._turn_executor.tool_dispatcher.execute_approved_tool_call(
             session=ctx.session,
             workspace=ctx.workspace,
@@ -503,6 +525,22 @@ class AgentLoop:
         )
         merge_approved_tool_result(ctx.session, approved_tool_part)
         await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
+        return ToolExecutionBatch(tool_parts=[approved_tool_part])
+
+    async def _resume_tool_batch(self, ctx: _RunContext, resume_batch: ToolResumeBatch) -> ToolExecutionBatch:
+        batch = await self._turn_executor.tool_dispatcher.resume_tool_batch(
+            session=ctx.session,
+            workspace=ctx.workspace,
+            agent=ctx.agent_state,
+            resume_batch=resume_batch,
+            runtime=ctx.runtime,
+            config=ctx.config,
+            stop_event=ctx.stop_event,
+        )
+        if batch.tool_parts:
+            merge_approved_tool_results(ctx.session, batch.tool_parts)
+            await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
+        return batch
 
     async def _run_loop_after_approved_tool(self, ctx: _RunContext, iteration: int) -> bool:
         loop_after = await self._turn_executor.run_loop_after(

@@ -89,7 +89,7 @@ tools:
   default_requires_approval: false
   default_error_policy: "return_tool_result"
   bash:
-    approval_mode: "all"
+    approval_mode: "none"
     allowlist: []
     blacklist: []
     readonly_allowlist:
@@ -125,7 +125,7 @@ sse:
   heartbeat_seconds: 15
   replay_on_connect: true
 human_in_the_loop:
-  enabled: true
+  enabled: false
 logging:
   level: "INFO"
   format: "json"

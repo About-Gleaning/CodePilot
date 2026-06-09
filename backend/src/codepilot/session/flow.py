@@ -41,7 +41,7 @@ from codepilot.session.state import (
     SessionStatus,
 )
 from codepilot.session.system_prompt import build_system_prompt
-from codepilot.tools.dispatcher import ToolDispatcher
+from codepilot.tools.dispatcher import ToolDispatcher, ToolResumeBatch
 from codepilot.tools.registry import ToolRegistry
 from codepilot.utils import new_message_id, utc_now_iso, utc_now_millis
 
@@ -53,6 +53,7 @@ class TurnResult:
     status: Literal["continue", "completed", "stopped", "needs_approval", "needs_question", "failed"]
     pending_approval: PendingApproval | None = None
     pending_question: PendingQuestion | None = None
+    resume_batch: ToolResumeBatch | None = None
     stop_after_approval: bool = False
 
 
@@ -378,9 +379,17 @@ class TurnExecutor:
         await self.message_appender.append(session, assistant_message, runtime)
         await self.publish_assistant_message_completed(session, assistant_message, runtime)
         if tool_batch.pending_approval:
-            return TurnResult(status="needs_approval", pending_approval=tool_batch.pending_approval)
+            return TurnResult(
+                status="needs_approval",
+                pending_approval=tool_batch.pending_approval,
+                resume_batch=tool_batch.resume_batch,
+            )
         if tool_batch.pending_question:
-            return TurnResult(status="needs_question", pending_question=tool_batch.pending_question)
+            return TurnResult(
+                status="needs_question",
+                pending_question=tool_batch.pending_question,
+                resume_batch=tool_batch.resume_batch,
+            )
 
         # 工具完成后才运行 LOOP_AFTER，让 Hook 可以基于工具结果决定继续、失败或请求审批。
         # 如果工具还在等待审批，后续控制权必须交给审批流程，不能提前触发后置 Hook。

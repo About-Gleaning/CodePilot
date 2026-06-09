@@ -16,10 +16,19 @@ from codepilot.utils import utc_now_iso
 
 
 @dataclass(slots=True)
+class ToolResumeBatch:
+    """记录工具批次暂停后的最小恢复上下文。"""
+
+    items: list[dict[str, Any]]
+    approved_call_id: str | None = None
+
+
+@dataclass(slots=True)
 class ToolExecutionBatch:
     tool_parts: list[ToolPart] = field(default_factory=list)
     pending_approval: PendingApproval | None = None
     pending_question: PendingQuestion | None = None
+    resume_batch: ToolResumeBatch | None = None
 
 
 class ToolDispatcher:
@@ -40,45 +49,28 @@ class ToolDispatcher:
         config: Any,
         stop_event: Any | None = None,
     ) -> ToolExecutionBatch:
-        result_parts: list[ToolPart] = []
-        for group in self._group_tool_calls(tool_calls):
-            if any(not item["spec"].can_parallel for item in group):
-                for item in group:
-                    part, approval, question = await self._execute_one(
-                        session, workspace, agent, item, runtime, config, stop_event=stop_event
-                    )
-                    if approval:
-                        return ToolExecutionBatch(
-                            tool_parts=result_parts,
-                            pending_approval=PendingApproval(request=approval, source="tool", resume_item=item),
-                        )
-                    if question:
-                        return ToolExecutionBatch(
-                            tool_parts=result_parts,
-                            pending_question=PendingQuestion(request=question, source="tool", resume_item=item),
-                        )
-                    result_parts.append(part)
-            else:
-                group_results = await asyncio.gather(
-                    *[
-                        self._execute_one(session, workspace, agent, item, runtime, config, stop_event=stop_event)
-                        for item in group
-                    ]
-                )
-                for item, (part, approval, question) in zip(group, group_results, strict=False):
-                    if approval:
-                        pending_item = next(call for call in group if call["tool_name"] == approval.action.get("tool_name"))
-                        return ToolExecutionBatch(
-                            tool_parts=result_parts,
-                            pending_approval=PendingApproval(request=approval, source="tool", resume_item=pending_item),
-                        )
-                    if question:
-                        return ToolExecutionBatch(
-                            tool_parts=result_parts,
-                            pending_question=PendingQuestion(request=question, source="tool", resume_item=item),
-                        )
-                    result_parts.append(part)
-        return ToolExecutionBatch(tool_parts=result_parts)
+        return await self._execute_items(session, workspace, agent, tool_calls, runtime, config, stop_event=stop_event)
+
+    async def resume_tool_batch(
+        self,
+        session: SessionState,
+        workspace: Any,
+        agent: AgentState,
+        resume_batch: ToolResumeBatch,
+        runtime: RuntimeHandles,
+        config: Any,
+        stop_event: Any | None = None,
+    ) -> ToolExecutionBatch:
+        return await self._execute_items(
+            session,
+            workspace,
+            agent,
+            resume_batch.items,
+            runtime,
+            config,
+            approved_call_id=resume_batch.approved_call_id,
+            stop_event=stop_event,
+        )
 
     async def execute_approved_tool_call(
         self,
@@ -99,6 +91,101 @@ class ToolDispatcher:
             session, workspace, agent, item, runtime, config, skip_approval=True, stop_event=stop_event
         )
         return part
+
+    async def _execute_items(
+        self,
+        session: SessionState,
+        workspace: Any,
+        agent: AgentState,
+        tool_calls: list[dict[str, Any]],
+        runtime: RuntimeHandles,
+        config: Any,
+        approved_call_id: str | None = None,
+        stop_event: Any | None = None,
+    ) -> ToolExecutionBatch:
+        result_parts: list[ToolPart] = []
+        groups = self._group_tool_calls(tool_calls)
+        for group_index, group in enumerate(groups):
+            if any(item["spec"] is None or not item["spec"].can_parallel for item in group):
+                for item_index, item in enumerate(group):
+                    part, approval, question = await self._execute_one(
+                        session,
+                        workspace,
+                        agent,
+                        item,
+                        runtime,
+                        config,
+                        skip_approval=item.get("tool_call_id") == approved_call_id,
+                        stop_event=stop_event,
+                    )
+                    if approval:
+                        return ToolExecutionBatch(
+                            tool_parts=result_parts,
+                            pending_approval=PendingApproval(request=approval, source="tool", resume_item=item),
+                            resume_batch=ToolResumeBatch(
+                                items=self._remaining_items(groups, group_index, item_index),
+                                approved_call_id=item.get("tool_call_id"),
+                            ),
+                        )
+                    if question:
+                        return ToolExecutionBatch(
+                            tool_parts=result_parts,
+                            pending_question=PendingQuestion(request=question, source="tool", resume_item=item),
+                            resume_batch=ToolResumeBatch(items=self._remaining_items(groups, group_index, item_index + 1)),
+                        )
+                    result_parts.append(part)
+            else:
+                group_results = await asyncio.gather(
+                    *[
+                        self._execute_one(
+                            session,
+                            workspace,
+                            agent,
+                            item,
+                            runtime,
+                            config,
+                            skip_approval=item.get("tool_call_id") == approved_call_id,
+                            stop_event=stop_event,
+                        )
+                        for item in group
+                    ]
+                )
+                pending_index: int | None = None
+                pending_approval: ApprovalRequest | None = None
+                pending_question: QuestionRequest | None = None
+                unresolved_items: list[dict[str, Any]] = []
+                for item_index, (item, (part, approval, question)) in enumerate(zip(group, group_results, strict=False)):
+                    if approval:
+                        if pending_index is None:
+                            pending_index = item_index
+                            pending_approval = approval
+                        unresolved_items.append(item)
+                        continue
+                    if question:
+                        if pending_index is None:
+                            pending_index = item_index
+                            pending_question = question
+                        unresolved_items.append(item)
+                        continue
+                    result_parts.append(part)
+                if pending_index is not None:
+                    remaining_groups = self._remaining_items(groups, group_index + 1, 0)
+                    pending_item = group[pending_index]
+                    if pending_approval:
+                        return ToolExecutionBatch(
+                            tool_parts=result_parts,
+                            pending_approval=PendingApproval(request=pending_approval, source="tool", resume_item=pending_item),
+                            resume_batch=ToolResumeBatch(
+                                items=unresolved_items + remaining_groups,
+                                approved_call_id=pending_item.get("tool_call_id"),
+                            ),
+                        )
+                    return ToolExecutionBatch(
+                        tool_parts=result_parts,
+                        pending_question=PendingQuestion(request=pending_question, source="tool", resume_item=pending_item),
+                        resume_batch=ToolResumeBatch(items=[item for item in unresolved_items if item is not pending_item] + remaining_groups),
+                    )
+        return ToolExecutionBatch(tool_parts=result_parts)
 
     def _group_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
         grouped: list[list[dict[str, Any]]] = []
@@ -122,6 +209,13 @@ class ToolDispatcher:
         if current_parallel:
             grouped.append(current_parallel)
         return grouped
+
+    def _remaining_items(self, groups: list[list[dict[str, Any]]], group_index: int, item_index: int) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for index, group in enumerate(groups[group_index:], start=group_index):
+            start = item_index if index == group_index else 0
+            items.extend(group[start:])
+        return items
 
     async def _execute_one(
         self,
