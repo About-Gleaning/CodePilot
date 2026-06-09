@@ -1,0 +1,33 @@
+对 workspace 内已有 UTF-8 文本文件进行精准局部编辑。
+
+使用规则：
+- `file_path` 必须是绝对路径；真实路径必须位于当前 workspace 内。
+- 只能编辑已存在的文件；如果文件不存在，请改用 `write_file` 创建。
+- 编辑前优先用 `read_file` 读取最新内容，确保 `old_string` 与当前文件内容完全一致。
+- `old_string` 和 `new_string` 必须保留真实缩进、换行和空白字符；`read_file` 输出不额外添加行号。
+- 始终传入小片段，避免用整文件内容做替换。
+- `new_string` 必须与 `old_string` 不同。
+
+替换行为：
+- 默认 `replace_all=false`：`old_string` 必须在文件中唯一匹配；匹配多处时工具会拒绝执行。
+- `replace_all=true`：替换所有匹配位置；只在明确需要批量修改同一文本时使用。
+- `old_string == ""`：将 `new_string` 追加到文件末尾。
+- `new_string == ""`：删除 `old_string` 对应内容。
+
+适合场景：
+- 修改函数、配置项、测试断言或文档片段。
+- 删除已有文本片段。
+- 在已有内容前后插入小段代码。
+
+错误排查：
+- 未找到 `old_string` 时，通常是文件内容已变化、缩进不同或上下文不足。
+- 匹配到多处时，应扩大 `old_string` 的上下文，或在确认安全后设置 `replace_all=true`。
+
+示例：
+```json
+{
+  "file_path": "/src/server.py",
+  "old_string": "    def stop(self):\n        pass",
+  "new_string": "    def stop(self):\n        self.running = False\n        self.socket.close()"
+}
+```

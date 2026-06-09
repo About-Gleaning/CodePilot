@@ -1,0 +1,36 @@
+写入当前 session 的结构化任务列表，用于跟踪复杂编码任务的进度。
+
+使用时机：
+- 任务包含 3 个或以上明确步骤。
+- 任务涉及多个文件、多个阶段或需要持续验证。
+- 用户明确要求使用 todo list 或任务列表。
+- 已经创建 todo 后，开始、完成或调整任务时应及时更新。
+
+避免使用：
+- 单个简单命令、单处小修改、纯解释问题或没有组织价值的短任务。
+- 只为了展示流程而创建空泛 todo。
+
+参数结构：
+- `todos` 最多 20 项。
+- 每项必须包含 `content`、`status` 和 `priority`。
+- `status` 只能是 `pending`、`in_progress`、`completed`。
+- `priority` 只能是 `low`、`medium`、`high`。
+- `content` 不能为空；应描述可执行、可验证的任务。
+- 同一时间最多只能有一个 `in_progress`，否则工具会拒绝执行。
+
+更新规则：
+- 开始某项任务时，将该项标记为 `in_progress`。
+- 完成某项任务后，立即将该项标记为 `completed`。
+- 不要在没有实际完成时批量标记为 `completed`。
+- 任务变化时传入完整的新 todo 列表；工具会覆盖当前 session 的旧列表。
+
+示例：
+```json
+{
+  "todos": [
+    {"content": "定位文件工具 description 与实现的冲突", "status": "completed", "priority": "high"},
+    {"content": "重写 description 文本", "status": "in_progress", "priority": "high"},
+    {"content": "运行相关测试", "status": "pending", "priority": "medium"}
+  ]
+}
+```
