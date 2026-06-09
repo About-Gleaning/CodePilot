@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -7,7 +8,9 @@ from typing import Any
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.state import AgentState, LLMState, SessionState
-from codepilot.utils import utc_now_iso
+
+
+_WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日")
 
 
 def build_system_prompt(
@@ -81,7 +84,7 @@ def _build_runtime_context(
 ) -> str:
     git_enabled = (workspace_path / ".git").exists()
     lines = [
-        f"- 当前时间：{utc_now_iso()}",
+        *_build_current_time_context(),
         f"- 工作根目录：{workspace_path}",
         f"- 当前 Agent：{agent_state.name}",
         f"- Agent 角色：{agent_state.role}",
@@ -92,3 +95,19 @@ def _build_runtime_context(
         "- 用户偏好：预留，尚未接入用户偏好存储。",
     ]
     return "\n".join(lines)
+
+
+def _build_current_time_context(now: datetime | None = None) -> list[str]:
+    local_now = now.astimezone() if now is not None else datetime.now().astimezone()
+    utc_offset = _format_utc_offset(local_now)
+    timezone_name = local_now.tzname() or "本地时区"
+    return [
+        f"- 当前本地完整时间：{local_now:%Y-%m-%d} {_WEEKDAYS[local_now.weekday()]} {local_now:%H:%M:%S}（{timezone_name}，UTC{utc_offset}）",
+    ]
+
+
+def _format_utc_offset(value: datetime) -> str:
+    offset = value.strftime("%z")
+    if not offset:
+        return "+00:00"
+    return f"{offset[:3]}:{offset[3:]}"

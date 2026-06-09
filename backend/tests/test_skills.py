@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from codepilot.session.agents import build_agent_profiles
 from codepilot.session.state import AgentState, LLMState, SessionState, SessionStatus
-from codepilot.session.system_prompt import build_system_prompt
+from codepilot.session.system_prompt import _build_current_time_context, build_system_prompt
 from codepilot.skills import SkillRegistry
 from codepilot.utils import utc_now_iso
 
@@ -92,6 +93,31 @@ def test_system_prompt_reports_empty_skills(tmp_path: Path) -> None:
     )
 
     assert "当前没有可用 skills" in prompt
+
+
+def test_system_prompt_injects_explicit_time_context_without_model_inference(tmp_path: Path) -> None:
+    prompt = build_system_prompt(
+        session=build_session(tmp_path),
+        workspace=SimpleNamespace(workspace_path=tmp_path),
+        agent_state=AgentState(name="build", role="build"),
+        agent_profile=build_agent_profiles(max_iterations=3)["build"],
+        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+        skill_registry=None,
+    )
+
+    assert "- 当前本地完整时间：" in prompt
+    assert "- 当前本地星期：" not in prompt
+    assert "- 当前时间：" not in prompt
+
+
+def test_build_current_time_context_formats_local_date_weekday_and_utc_offset() -> None:
+    now = datetime(2026, 6, 5, 17, 11, 32, tzinfo=timezone(timedelta(hours=8), "CST"))
+
+    lines = _build_current_time_context(now)
+
+    assert lines == [
+        "- 当前本地完整时间：2026-06-05 星期五 17:11:32（CST，UTC+08:00）",
+    ]
 
 
 def build_session(workspace_path: Path) -> SessionState:
