@@ -15,6 +15,11 @@ class ToolRegistry:
     def get(self, tool_name: str) -> BaseTool | None:
         return self._tools.get(tool_name)
 
+    def disable_all_approvals(self) -> None:
+        """worker 无人值守运行时统一关闭工具级人工审批。"""
+        for tool in self._tools.values():
+            tool.spec.requires_approval = False
+
     def get_llm_tool_schemas(
         self,
         allowed_tools: list[str] | None = None,

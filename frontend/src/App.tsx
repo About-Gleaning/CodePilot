@@ -5,11 +5,13 @@ import {
   AlertTriangle,
   Bot,
   Brain,
+  CalendarClock,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   CircleDot,
+  Pencil,
   FileText,
   HardDrive,
   History,
@@ -25,6 +27,7 @@ import {
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   Zap,
   X,
 } from 'lucide-react';
@@ -88,6 +91,10 @@ type SessionSummary = {
   model: string | null;
   message_count: number;
   preview: string;
+  source?: string | null;
+  schedule_task_id?: string | null;
+  schedule_run_id?: string | null;
+  schedule_task_name?: string | null;
 };
 
 type SessionsResponse = {
@@ -97,6 +104,70 @@ type SessionsResponse = {
 type LoadSessionResponse = ReplayResponse & {
   ok: boolean;
   session: Record<string, unknown> | null;
+};
+
+type ScheduleTrigger = {
+  kind: 'once' | 'interval' | 'daily' | 'weekly';
+  run_at?: string | null;
+  interval_seconds?: number | null;
+  time_of_day?: string | null;
+  day_of_week?: number | null;
+  timezone?: string | null;
+};
+
+type ScheduleTask = {
+  id: string;
+  name: string;
+  prompt: string;
+  agent_name: string;
+  provider: string;
+  model: string;
+  trigger: ScheduleTrigger;
+  working_dir: string;
+  enabled: boolean;
+  next_run_at?: string | null;
+  last_run_at?: string | null;
+};
+
+type ScheduleRun = {
+  id: string;
+  task_id: string;
+  task_name: string;
+  session_id?: string | null;
+  status: string;
+  scheduled_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  pid?: number | null;
+  working_dir: string;
+  error?: string | null;
+  summary?: string | null;
+};
+
+type ScheduleRunsResponse = {
+  active: ScheduleRun[];
+  recent: ScheduleRun[];
+};
+
+type SchedulesResponse = {
+  schedules: ScheduleTask[];
+};
+
+type ScheduleFormState = {
+  editing_id: string | null;
+  name: string;
+  prompt: string;
+  agent_name: string;
+  provider: string;
+  model: string;
+  working_dir: string;
+  trigger_kind: 'once' | 'interval' | 'daily' | 'weekly';
+  run_at: string;
+  interval_seconds: string;
+  time_of_day: string;
+  day_of_week: string;
+  timezone: string;
+  enabled: boolean;
 };
 
 type StreamEvent = {
@@ -141,6 +212,16 @@ type SelectOption = {
   label: string;
 };
 
+const WEEKDAY_OPTIONS: SelectOption[] = [
+  { value: '1', label: '周一' },
+  { value: '2', label: '周二' },
+  { value: '3', label: '周三' },
+  { value: '4', label: '周四' },
+  { value: '5', label: '周五' },
+  { value: '6', label: '周六' },
+  { value: '7', label: '周日' },
+];
+
 const EVENT_LABELS: Record<string, string> = {
   session_started: '会话启动',
   session_title_updated: '标题更新',
@@ -179,6 +260,63 @@ const KEY_EVENT_TYPES = new Set([
   'human_question_resolved',
   'error',
 ]);
+
+function formatDateTimeLocal(date: Date): string {
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function createDefaultScheduleForm(workspacePath = ''): ScheduleFormState {
+  const runAt = formatDateTimeLocal(new Date(Date.now() + 5 * 60 * 1000));
+  return {
+    editing_id: null,
+    name: '',
+    prompt: '',
+    agent_name: 'build',
+    provider: '',
+    model: '',
+    working_dir: workspacePath,
+    trigger_kind: 'once',
+    run_at: runAt,
+    interval_seconds: '3600',
+    time_of_day: '09:00',
+    day_of_week: '5',
+    timezone: '',
+    enabled: true,
+  };
+}
+
+function scheduleToForm(task: ScheduleTask): ScheduleFormState {
+  return {
+    editing_id: task.id,
+    name: task.name,
+    prompt: task.prompt,
+    agent_name: task.agent_name,
+    provider: task.provider,
+    model: task.model,
+    working_dir: task.working_dir,
+    trigger_kind: task.trigger.kind,
+    run_at: task.trigger.run_at ? formatDateTimeLocal(new Date(task.trigger.run_at)) : createDefaultScheduleForm(task.working_dir).run_at,
+    interval_seconds: String(task.trigger.interval_seconds || 3600),
+    time_of_day: task.trigger.time_of_day || '09:00',
+    day_of_week: String(task.trigger.day_of_week || 5),
+    timezone: task.trigger.timezone || '',
+    enabled: task.enabled,
+  };
+}
+
+function buildScheduleTrigger(form: ScheduleFormState): ScheduleTrigger {
+  if (form.trigger_kind === 'once') {
+    return { kind: 'once', run_at: new Date(form.run_at).toISOString() };
+  }
+  if (form.trigger_kind === 'interval') {
+    return { kind: 'interval', interval_seconds: Number(form.interval_seconds) };
+  }
+  if (form.trigger_kind === 'weekly') {
+    return { kind: 'weekly', day_of_week: Number(form.day_of_week), time_of_day: form.time_of_day, timezone: form.timezone || null };
+  }
+  return { kind: 'daily', time_of_day: form.time_of_day, timezone: form.timezone || null };
+}
 
 type MessageRecord = {
   info?: {
@@ -336,6 +474,11 @@ function App() {
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
+  const [schedules, setSchedules] = useState<ScheduleTask[]>([]);
+  const [scheduleRuns, setScheduleRuns] = useState<ScheduleRunsResponse>({ active: [], recent: [] });
+  const [isScheduleFormOpen, setIsScheduleFormOpen] = useState(false);
+  const [scheduleForm, setScheduleForm] = useState<ScheduleFormState>(() => createDefaultScheduleForm());
+  const [scheduleError, setScheduleError] = useState('');
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [liveDelta, setLiveDelta] = useState('');
@@ -351,6 +494,7 @@ function App() {
   const questionPanelRef = useRef<HTMLElement | null>(null);
   const questionOptionsRef = useRef<HTMLDivElement | null>(null);
   const questionNoteRef = useRef<HTMLTextAreaElement | null>(null);
+  const hasActiveScheduleRuns = scheduleRuns.active.length > 0;
 
   useEffect(() => {
     void bootstrap();
@@ -358,6 +502,41 @@ function App() {
       clearStreamReconnectTimer();
       eventSourceRef.current?.close();
     };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer: number | null = null;
+
+    const scheduleNextPoll = () => {
+      const delay = hasActiveScheduleRuns ? 3000 : 30000;
+      timer = window.setTimeout(() => {
+        void poll();
+      }, delay);
+    };
+
+    const poll = async () => {
+      await refreshScheduleRuns();
+      if (!stopped) {
+        scheduleNextPoll();
+      }
+    };
+
+    scheduleNextPoll();
+    return () => {
+      stopped = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [hasActiveScheduleRuns]);
+
+  useEffect(() => {
+    const handleFocus = () => {
+      void refreshScheduleRuns();
+    };
+    window.addEventListener('focus', handleFocus);
+    return () => window.removeEventListener('focus', handleFocus);
   }, []);
 
   useEffect(() => {
@@ -418,11 +597,13 @@ function App() {
 
   async function bootstrap() {
     try {
-      const [configRes, statusRes, replayRes, sessionsRes] = await Promise.all([
+      const [configRes, statusRes, replayRes, sessionsRes, schedulesRes, scheduleRunsRes] = await Promise.all([
         fetchJson<ConfigResponse>('/api/config'),
         fetchJson<StatusResponse>('/api/session/status'),
         fetchJson<ReplayResponse>('/api/session/replay'),
         fetchJson<SessionsResponse>('/api/sessions'),
+        fetchJson<SchedulesResponse>('/api/schedules'),
+        fetchJson<ScheduleRunsResponse>('/api/schedule-runs'),
       ]);
       setConfig(configRes);
       setStatus(statusRes);
@@ -434,6 +615,9 @@ function App() {
       setSubagentLiveDeltas({});
       setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
+      setSchedules(schedulesRes.schedules);
+      setScheduleRuns(scheduleRunsRes);
+      setScheduleForm((prev) => ({ ...prev, working_dir: prev.working_dir || configRes.workspace_path }));
       connectStream(0);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '初始化失败');
@@ -585,6 +769,125 @@ function App() {
   async function refreshSessionHistory() {
     const next = await fetchJson<SessionsResponse>('/api/sessions');
     setSessionHistory(next.sessions);
+  }
+
+  async function refreshSchedules() {
+    const next = await fetchJson<SchedulesResponse>('/api/schedules');
+    setSchedules(next.schedules);
+  }
+
+  async function refreshScheduleRuns() {
+    try {
+      const [runsRes, schedulesRes] = await Promise.all([
+        fetchJson<ScheduleRunsResponse>('/api/schedule-runs'),
+        fetchJson<SchedulesResponse>('/api/schedules'),
+      ]);
+      setScheduleRuns(runsRes);
+      setSchedules(schedulesRes.schedules);
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : '刷新定时任务失败');
+    }
+  }
+
+  async function handleSaveSchedule(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setScheduleError('');
+    if (!scheduleForm.provider) {
+      setScheduleError('请先选择 provider');
+      return;
+    }
+    if (!scheduleForm.model) {
+      setScheduleError('请先选择 model');
+      return;
+    }
+    try {
+      const payload = {
+        name: scheduleForm.name,
+        prompt: scheduleForm.prompt,
+        agent_name: scheduleForm.agent_name,
+        provider: scheduleForm.provider,
+        model: scheduleForm.model,
+        working_dir: scheduleForm.working_dir,
+        enabled: scheduleForm.enabled,
+        trigger: buildScheduleTrigger(scheduleForm),
+      };
+      if (scheduleForm.editing_id) {
+        await requestJson(`/api/schedules/${scheduleForm.editing_id}`, { method: 'PATCH', body: payload });
+      } else {
+        await postJson('/api/schedules', payload);
+      }
+      setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
+      setIsScheduleFormOpen(false);
+      await refreshSchedules();
+      await refreshScheduleRuns();
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : '保存定时任务失败');
+    }
+  }
+
+  function handleEditSchedule(task: ScheduleTask) {
+    setScheduleError('');
+    setScheduleForm(scheduleToForm(task));
+    setIsScheduleFormOpen(true);
+  }
+
+  function handleCancelScheduleEdit() {
+    setScheduleError('');
+    setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
+    setIsScheduleFormOpen(false);
+  }
+
+  async function handleToggleSchedule(task: ScheduleTask) {
+    setScheduleError('');
+    try {
+      await requestJson(`/api/schedules/${task.id}`, { method: 'PATCH', body: { enabled: !task.enabled } });
+      await refreshSchedules();
+      await refreshScheduleRuns();
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : '更新定时任务状态失败');
+    }
+  }
+
+  async function handleDeleteSchedule(task: ScheduleTask) {
+    const confirmed = window.confirm(`删除定时任务「${task.name}」？未启动的等待任务会被取消，正在运行的 worker 不会被终止。`);
+    if (!confirmed) {
+      return;
+    }
+    setScheduleError('');
+    try {
+      await requestJson(`/api/schedules/${task.id}`, { method: 'DELETE' });
+      if (scheduleForm.editing_id === task.id) {
+        setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
+        setIsScheduleFormOpen(false);
+      }
+      await refreshSchedules();
+      await refreshScheduleRuns();
+    } catch (error) {
+      setScheduleError(error instanceof Error ? error.message : '删除定时任务失败');
+    }
+  }
+
+  function updateScheduleForm(patch: Partial<ScheduleFormState>) {
+    setScheduleForm((prev) => {
+      const next = { ...prev, ...patch };
+      if (patch.provider !== undefined) {
+        const providerOption = config?.activated_providers.find((item) => item.provider === patch.provider) || null;
+        if (!providerOption || !providerOption.models.includes(next.model)) {
+          next.model = '';
+        }
+      }
+      return next;
+    });
+  }
+
+  async function handleScheduleRunClick(run: ScheduleRun) {
+    if (!run.session_id) {
+      if (run.error) {
+        setScheduleError(run.error);
+      }
+      return;
+    }
+    await handleLoadSession(run.session_id);
   }
 
   function applyProviderAndModelState(statusRes: StatusResponse) {
@@ -1327,6 +1630,27 @@ function App() {
       </main>
 
       <aside className="rail rail-right">
+        <SchedulePanel
+          schedules={schedules}
+          runs={scheduleRuns}
+          form={scheduleForm}
+          error={scheduleError}
+          isFormOpen={isScheduleFormOpen}
+          config={config}
+          onToggleForm={() => {
+            setScheduleError('');
+            setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
+            setIsScheduleFormOpen(true);
+          }}
+          onFormChange={updateScheduleForm}
+          onSubmit={handleSaveSchedule}
+          onCancelForm={handleCancelScheduleEdit}
+          onEdit={handleEditSchedule}
+          onToggleTask={(task) => void handleToggleSchedule(task)}
+          onDelete={(task) => void handleDeleteSchedule(task)}
+          onRunClick={(run) => void handleScheduleRunClick(run)}
+        />
+
         <section className="panel event-panel">
           <PanelTitle icon={<ListTree size={16} />} title="任务雷达" badge={`${events.length}/200`} />
           <EventRadarHeader stats={eventStats} latestEvent={latestEventView} />
@@ -1352,6 +1676,217 @@ function App() {
         onLoad={handleLoadSession}
       />
     </div>
+  );
+}
+
+function SchedulePanel({
+  schedules,
+  runs,
+  form,
+  error,
+  isFormOpen,
+  config,
+  onToggleForm,
+  onFormChange,
+  onSubmit,
+  onCancelForm,
+  onEdit,
+  onToggleTask,
+  onDelete,
+  onRunClick,
+}: {
+  schedules: ScheduleTask[];
+  runs: ScheduleRunsResponse;
+  form: ScheduleFormState;
+  error: string;
+  isFormOpen: boolean;
+  config: ConfigResponse | null;
+  onToggleForm: () => void;
+  onFormChange: (patch: Partial<ScheduleFormState>) => void;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onCancelForm: () => void;
+  onEdit: (task: ScheduleTask) => void;
+  onToggleTask: (task: ScheduleTask) => void;
+  onDelete: (task: ScheduleTask) => void;
+  onRunClick: (run: ScheduleRun) => void;
+}) {
+  const providerOption = config?.activated_providers.find((item) => item.provider === form.provider) || null;
+  const modelOptions = providerOption?.models || [];
+  const visibleRuns = dedupeRuns([...runs.active, ...runs.recent]).slice(0, 6);
+  const isEditing = Boolean(form.editing_id);
+  return (
+    <section className="panel schedule-panel">
+      <PanelTitle
+        icon={<CalendarClock size={16} />}
+        title="定时任务"
+        badge={`${runs.active.length}/${schedules.length}`}
+        action={
+          <button type="button" className="button secondary icon-button" onClick={onToggleForm} title="创建定时任务" aria-label="创建定时任务">
+            <Plus size={14} />
+          </button>
+        }
+      />
+      {error ? (
+        <div className="schedule-error" role="alert">
+          <OctagonAlert size={14} />
+          <span>{error}</span>
+        </div>
+      ) : null}
+      {isFormOpen ? (
+        <form className="schedule-form" onSubmit={onSubmit}>
+          <div className="schedule-form-title">
+            <strong>{isEditing ? '编辑任务' : '创建任务'}</strong>
+            <button type="button" className="button ghost icon-button" onClick={onCancelForm} title="取消" aria-label="取消">
+              <X size={14} />
+            </button>
+          </div>
+          <label className="field">
+            <span>任务名</span>
+            <input value={form.name} onChange={(event) => onFormChange({ name: event.target.value })} />
+          </label>
+          <label className="field">
+            <span>Prompt</span>
+            <textarea rows={3} value={form.prompt} onChange={(event) => onFormChange({ prompt: event.target.value })} />
+          </label>
+          <div className="schedule-grid">
+            <label className="field">
+              <span>Agent</span>
+              <ConfigSelect
+                value={form.agent_name}
+                options={(config?.agents || ['build']).map((agent) => ({ value: agent, label: agent }))}
+                onChange={(value) => onFormChange({ agent_name: value })}
+              />
+            </label>
+            <label className="field">
+              <span>Provider</span>
+              <ConfigSelect
+                value={form.provider}
+                options={[
+                  { value: '', label: '选择' },
+                  ...(config?.activated_providers || []).map((item) => ({ value: item.provider, label: item.label })),
+                ]}
+                onChange={(value) => onFormChange({ provider: value })}
+              />
+            </label>
+          </div>
+          <label className="field">
+            <span>Model</span>
+            <ConfigSelect
+              value={form.model}
+              options={[{ value: '', label: '选择 model' }, ...modelOptions.map((item) => ({ value: item, label: item }))]}
+              onChange={(value) => onFormChange({ model: value })}
+              disabled={!form.provider}
+            />
+          </label>
+          <label className="field">
+            <span>执行目录</span>
+            <input value={form.working_dir} onChange={(event) => onFormChange({ working_dir: event.target.value })} />
+          </label>
+          <div className="schedule-grid">
+            <label className="field">
+              <span>触发</span>
+              <ConfigSelect
+                value={form.trigger_kind}
+                options={[
+                  { value: 'once', label: '单次' },
+                  { value: 'interval', label: '间隔' },
+                  { value: 'daily', label: '每日' },
+                  { value: 'weekly', label: '每周' },
+                ]}
+                onChange={(value) => onFormChange({ trigger_kind: value as ScheduleFormState['trigger_kind'] })}
+              />
+            </label>
+            {form.trigger_kind === 'once' ? (
+              <label className="field">
+                <span>执行时间</span>
+                <input type="datetime-local" value={form.run_at} onChange={(event) => onFormChange({ run_at: event.target.value })} />
+              </label>
+            ) : null}
+            {form.trigger_kind === 'interval' ? (
+              <label className="field">
+                <span>秒</span>
+                <input value={form.interval_seconds} onChange={(event) => onFormChange({ interval_seconds: event.target.value })} />
+              </label>
+            ) : null}
+            {form.trigger_kind === 'weekly' ? (
+              <label className="field">
+                <span>星期</span>
+                <ConfigSelect value={form.day_of_week} options={WEEKDAY_OPTIONS} onChange={(value) => onFormChange({ day_of_week: value })} />
+              </label>
+            ) : null}
+            {form.trigger_kind === 'daily' || form.trigger_kind === 'weekly' ? (
+              <label className="field">
+                <span>时间</span>
+                <input value={form.time_of_day} onChange={(event) => onFormChange({ time_of_day: event.target.value })} />
+              </label>
+            ) : null}
+          </div>
+          {form.trigger_kind === 'daily' || form.trigger_kind === 'weekly' ? (
+            <label className="field">
+              <span>Timezone</span>
+              <input placeholder="Asia/Shanghai" value={form.timezone} onChange={(event) => onFormChange({ timezone: event.target.value })} />
+            </label>
+          ) : null}
+          <label className="schedule-toggle">
+            <input type="checkbox" checked={form.enabled} onChange={(event) => onFormChange({ enabled: event.target.checked })} />
+            <span>启用</span>
+          </label>
+          <button type="submit" className="button primary">
+            <Check size={15} />
+            {isEditing ? '保存' : '创建'}
+          </button>
+        </form>
+      ) : null}
+      <div className="schedule-task-list">
+        {schedules.length === 0 ? (
+          <p className="quiet-copy">暂无定时任务。</p>
+        ) : (
+          schedules.map((task) => (
+            <div className="schedule-task-card" key={task.id}>
+              <div className="schedule-task-main">
+                <span className={`schedule-task-state ${task.enabled ? 'is-enabled' : 'is-disabled'}`}>{task.enabled ? '已启用' : '已关闭'}</span>
+                <strong>{task.name}</strong>
+                <span>{formatScheduleTrigger(task.trigger)}</span>
+                <code title={task.working_dir}>{task.working_dir}</code>
+                <span>下次：{task.next_run_at ? formatSessionTime(task.next_run_at) : '-'}</span>
+              </div>
+              <div className="schedule-task-actions">
+                <button type="button" className="button ghost icon-button" onClick={() => onEdit(task)} title="编辑" aria-label="编辑">
+                  <Pencil size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="button ghost icon-button"
+                  onClick={() => onToggleTask(task)}
+                  title={task.enabled ? '关闭' : '开启'}
+                  aria-label={task.enabled ? '关闭' : '开启'}
+                >
+                  {task.enabled ? <Square size={14} /> : <Play size={14} />}
+                </button>
+                <button type="button" className="button ghost icon-button danger" onClick={() => onDelete(task)} title="删除" aria-label="删除">
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+      <div className="schedule-run-list">
+        {visibleRuns.length === 0 ? (
+          <p className="quiet-copy">暂无运行记录。</p>
+        ) : (
+          visibleRuns.map((run) => (
+            <button type="button" className="schedule-run-card" key={run.id} onClick={() => onRunClick(run)}>
+              <span className={`schedule-run-status ${getScheduleRunClass(run.status)}`}>{run.status}</span>
+              <strong>{run.task_name}</strong>
+              <span>{formatSessionTime(run.finished_at || run.started_at || run.scheduled_at)}</span>
+              <code title={run.working_dir}>{run.working_dir}</code>
+              {run.summary ? <p>{run.summary}</p> : null}
+            </button>
+          ))
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -1838,7 +2373,12 @@ function SessionHistoryList({
             return (
               <article className={`session-item ${isCurrent ? 'is-current' : ''}`} key={session.session_id}>
                 <div className="session-item-main">
-                  <strong>{session.title || session.preview || session.session_id}</strong>
+                  <strong>
+                    {session.source === 'schedule' ? <span className="session-source-badge">定时任务</span> : null}
+                    {session.source === 'schedule' && session.schedule_task_name
+                      ? session.schedule_task_name
+                      : session.title || session.preview || session.session_id}
+                  </strong>
                   {variant === 'modal' && session.preview ? <p>{session.preview}</p> : null}
                   <span>{formatSessionTime(session.updated_at || session.created_at)}</span>
                 </div>
@@ -2943,6 +3483,49 @@ function getStatusClass(status: string) {
   return 'status-idle';
 }
 
+function getScheduleRunClass(status: string) {
+  if (status === 'completed') {
+    return 'is-ok';
+  }
+  if (status === 'failed' || status === 'timeout' || status === 'interrupted') {
+    return 'is-danger';
+  }
+  if (status === 'running') {
+    return 'is-running';
+  }
+  if (status === 'pending') {
+    return 'is-waiting';
+  }
+  return 'is-muted';
+}
+
+function formatScheduleTrigger(trigger: ScheduleTrigger) {
+  if (trigger.kind === 'once') {
+    return `单次 ${trigger.run_at ? formatSessionTime(trigger.run_at) : '-'}`;
+  }
+  if (trigger.kind === 'interval') {
+    return `每 ${trigger.interval_seconds || '-'} 秒`;
+  }
+  if (trigger.kind === 'weekly') {
+    const weekday = WEEKDAY_OPTIONS.find((item) => item.value === String(trigger.day_of_week))?.label || '-';
+    return `每${weekday} ${trigger.time_of_day || '-'}${trigger.timezone ? ` ${trigger.timezone}` : ''}`;
+  }
+  return `每日 ${trigger.time_of_day || '-'}${trigger.timezone ? ` ${trigger.timezone}` : ''}`;
+}
+
+function dedupeRuns(runs: ScheduleRun[]) {
+  const seen = new Set<string>();
+  const result: ScheduleRun[] = [];
+  for (const run of runs) {
+    if (seen.has(run.id)) {
+      continue;
+    }
+    seen.add(run.id);
+    result.push(run);
+  }
+  return result;
+}
+
 function getEventTone(eventType: string) {
   if (eventType.includes('failed') || eventType === 'error') {
     return 'tone-danger';
@@ -3038,17 +3621,21 @@ async function fetchJson<T>(url: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function requestJson<T>(url: string, { method, body }: { method: string; body?: unknown }): Promise<T> {
   const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    method,
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
     const detail = await response.text();
     throw new Error(detail || `请求失败: ${url}`);
   }
   return response.json() as Promise<T>;
+}
+
+async function postJson<T>(url: string, body: unknown): Promise<T> {
+  return requestJson<T>(url, { method: 'POST', body });
 }
 
 export default App;

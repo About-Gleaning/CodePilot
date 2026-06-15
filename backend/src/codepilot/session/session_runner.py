@@ -34,6 +34,7 @@ class SessionRunner:
         agent_loop: AgentLoop,
         agent_profiles: dict[str, AgentProfile],
         title_service: SessionTitleService | None = None,
+        allow_human_interaction: bool = True,
     ) -> None:
         self._workspace = workspace
         self._config = config
@@ -41,6 +42,7 @@ class SessionRunner:
         self._hook_manager = hook_manager
         self._agent_loop = agent_loop
         self._agent_profiles = agent_profiles
+        self._allow_human_interaction = allow_human_interaction
         self._session: SessionState | None = None
         self._task: asyncio.Task[SessionState] | None = None
         self._title_service = title_service or SessionTitleService()
@@ -80,6 +82,12 @@ class SessionRunner:
     def current_session_id(self) -> str | None:
         """返回当前内存中持有的 session_id；没有会话时返回 None。"""
         return self._session.session_id if self._session else None
+
+    async def wait_current_run(self) -> SessionState | None:
+        """等待当前后台执行任务结束，供 headless worker 在进程内同步收尾。"""
+        if self._task and not self._task.done():
+            await self._task
+        return self._session
 
     def load_session(self, session_id: str, replay: dict[str, Any]) -> SessionState:
         """把已持久化的历史会话恢复为当前可继续对话的内存会话。"""
@@ -168,7 +176,8 @@ class SessionRunner:
                         "workspace_path": self._session.workspace_path,
                         "initial_user_message_id": message.info.id,
                         "updated_at": self._session.updated_at,
-                    },
+                    }
+                    | self._schedule_meta_fields(),
                 )
             )
             await self._event_bus.publish_domain_event(
@@ -244,6 +253,7 @@ class SessionRunner:
                 question_event=self._question_event,
                 question_result_holder=self._question_result_holder,
                 stop_event=self._stop_event,
+                allow_human_interaction=self._allow_human_interaction,
             )
         except Exception as exc:  # noqa: BLE001
             # 运行异常时显式写入失败状态并发出错误事件，便于前端与日志系统感知失败原因。
@@ -392,10 +402,29 @@ class SessionRunner:
             model=model,
             metadata=gateway_input.metadata,
         )
-        return {
+        metadata = {
             "thinking_enabled": thinking_value is not None,
             "thinking_value": thinking_value,
+            "allow_human_interaction": self._allow_human_interaction,
         }
+        if gateway_input.metadata.get("source") == "schedule":
+            for key in ("source", "schedule_task_id", "schedule_run_id", "schedule_task_name"):
+                value = gateway_input.metadata.get(key)
+                if isinstance(value, str) and value:
+                    metadata[key] = value
+        return metadata
+
+    def _schedule_meta_fields(self) -> dict[str, str]:
+        """把定时任务标记同步到 session_meta，供历史列表无需读取 run 表即可展示。"""
+        assert self._session is not None
+        if self._session.metadata.get("source") != "schedule":
+            return {}
+        fields: dict[str, str] = {}
+        for key in ("source", "schedule_task_id", "schedule_run_id", "schedule_task_name"):
+            value = self._session.metadata.get(key)
+            if isinstance(value, str) and value:
+                fields[key] = value
+        return fields
 
     def _ensure_agent_supported(self, agent_name: str | None) -> None:
         """在进入执行链前显式校验 agent，避免后续字典取值抛出不友好的 KeyError。"""

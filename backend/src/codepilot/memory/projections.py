@@ -98,6 +98,10 @@ def build_session_summary(records: list[dict[str, Any]]) -> dict[str, Any] | Non
         "model": session_data.get("model"),
         "message_count": len(summary_messages),
         "preview": truncate_preview(preview),
+        "source": session_data.get("source"),
+        "schedule_task_id": session_data.get("schedule_task_id"),
+        "schedule_run_id": session_data.get("schedule_run_id"),
+        "schedule_task_name": session_data.get("schedule_task_name"),
     }
 
 

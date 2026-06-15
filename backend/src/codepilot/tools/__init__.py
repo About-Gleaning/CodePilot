@@ -7,6 +7,7 @@ from .mcp import McpToolAdapter
 from .question_tool import QuestionTool
 from .read_file_tool import ReadFileTool
 from .registry import ToolRegistry
+from .schedule_manage_tool import ScheduleManageTool
 from .task_tool import TaskTool
 from .todo_tool import TodoReadTool, TodoWriteTool
 from .webfetch_tool import WebFetchTool
@@ -21,6 +22,7 @@ __all__ = [
     "McpToolAdapter",
     "QuestionTool",
     "ReadFileTool",
+    "ScheduleManageTool",
     "TaskTool",
     "TodoReadTool",
     "TodoWriteTool",

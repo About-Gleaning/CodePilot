@@ -84,11 +84,20 @@ textarea {
 }
 
 select,
+input,
 textarea {
   width: 100%;
   background: #090e0c;
   border-radius: 6px;
   outline: none;
+}
+
+input {
+  min-height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-family: var(--font-mono);
 }
 
 select {
@@ -103,6 +112,7 @@ textarea {
 }
 
 select:focus,
+input:focus,
 textarea:focus,
 button:focus-visible,
 details:focus-within {
@@ -510,6 +520,242 @@ pre {
   height: 30px;
   padding: 0 9px;
   font-size: 11px;
+}
+
+.session-source-badge {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 6px;
+  padding: 1px 5px;
+  border: 1px solid rgba(88, 199, 217, 0.36);
+  border-radius: 5px;
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  vertical-align: 1px;
+}
+
+.schedule-panel {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.schedule-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid rgba(255, 111, 97, 0.42);
+  border-radius: 7px;
+  background: rgba(255, 111, 97, 0.08);
+  color: #ffb2aa;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.schedule-form {
+  display: grid;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid rgba(53, 70, 62, 0.72);
+  border-radius: 8px;
+  background: rgba(8, 13, 11, 0.7);
+}
+
+.schedule-form-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.schedule-form .select-trigger {
+  height: 36px;
+  min-height: 36px;
+}
+
+.schedule-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.schedule-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.schedule-toggle input {
+  width: auto;
+  min-height: auto;
+}
+
+.schedule-task-list {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.schedule-task-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid rgba(38, 48, 44, 0.82);
+  border-radius: 8px;
+  background: rgba(8, 13, 11, 0.62);
+}
+
+.schedule-task-main {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.schedule-task-main strong,
+.schedule-task-main span,
+.schedule-task-main code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-task-main strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+.schedule-task-main span,
+.schedule-task-main code {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.schedule-task-state {
+  justify-self: start;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(53, 70, 62, 0.34);
+}
+
+.schedule-task-state.is-enabled {
+  color: var(--ok);
+}
+
+.schedule-task-state.is-disabled {
+  color: var(--muted);
+}
+
+.schedule-task-actions {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.icon-button.danger {
+  color: var(--danger);
+}
+
+.schedule-run-list {
+  display: grid;
+  gap: 8px;
+  max-height: 270px;
+  overflow: auto;
+}
+
+.schedule-run-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 5px 8px;
+  width: 100%;
+  padding: 9px;
+  border: 1px solid rgba(38, 48, 44, 0.82);
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, rgba(88, 199, 217, 0.035), transparent 54%),
+    rgba(8, 13, 11, 0.68);
+  color: var(--text);
+  text-align: left;
+}
+
+.schedule-run-card:hover {
+  border-color: rgba(88, 199, 217, 0.42);
+  background: rgba(10, 18, 16, 0.82);
+}
+
+.schedule-run-card strong,
+.schedule-run-card code,
+.schedule-run-card p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schedule-run-card strong {
+  grid-column: 1;
+  font-size: 12px;
+}
+
+.schedule-run-card span:not(.schedule-run-status),
+.schedule-run-card code {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.schedule-run-card code,
+.schedule-run-card p {
+  grid-column: 1 / -1;
+}
+
+.schedule-run-card p {
+  margin: 0;
+  color: #bfccc4;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.schedule-run-status {
+  grid-column: 2;
+  grid-row: 1;
+  align-self: start;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(53, 70, 62, 0.34);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.schedule-run-status.is-ok {
+  color: var(--ok);
+}
+
+.schedule-run-status.is-danger {
+  color: var(--danger);
+}
+
+.schedule-run-status.is-running {
+  color: var(--cyan);
+}
+
+.schedule-run-status.is-waiting {
+  color: var(--warn);
+}
+
+.schedule-run-status.is-muted {
+  color: var(--muted);
 }
 
 .history-modal-backdrop {
