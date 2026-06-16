@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-本仓库是前后端分离的 CodePilot 原型。后端位于 `backend/`，核心包在 `backend/src/codepilot/`：`api/` 提供 FastAPI 路由，`session/` 管理 Agent 会话流，`tools/` 放内置工具，`skills/` 管理按需加载的技能运行时，`llm/` 封装 LiteLLM，`memory/` 处理 jsonl 存储。后端测试位于 `backend/tests/`。前端位于 `frontend/`，React 入口为 `frontend/src/main.tsx`，主界面在 `frontend/src/App.tsx`，样式在 `frontend/src/styles.css`。运行期文件写入根目录 `.run/`，不要提交日志、PID、密钥或本地缓存。
+本仓库是前后端分离的 CodePilot 原型。后端位于 `backend/`，核心包在 `backend/src/codepilot/`：`api/` 提供 FastAPI 路由，`session/` 管理 Agent 会话流，`tools/` 放内置工具，`skills/` 管理按需加载的技能运行时，`scheduler/` 管理定时任务和独立 worker，`llm/` 封装 LiteLLM，`memory/` 处理 jsonl 存储。后端测试位于 `backend/tests/`。前端位于 `frontend/`，React 入口为 `frontend/src/main.tsx`，主界面在 `frontend/src/App.tsx`，样式在 `frontend/src/styles.css`。运行期文件写入 `storage.codepilot_home/workspace/<workspace_id>/`，不要提交日志、PID、密钥或本地缓存。
 
 ## Build, Test, and Development Commands
 
@@ -34,6 +34,12 @@ Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。
 
 subagent 只能通过 `task` 工具由主 Agent 同步派发，不能从前端 Agent 下拉直接选择，也不能递归调用 `task`。subagent 的消息和 stream event 必须带上 `agent_kind`、`context_id` 和 `parent_call_id`，便于前端展示、jsonl 回放和审计时恢复父子关系。`SessionCompactedEvent` 若只压缩某个上下文，必须写入 `scope="context"` 和对应 `context_id`，回放时只替换该上下文消息，不能覆盖整个 session。
+
+## Scheduler Runtime Guidelines
+
+定时任务由主进程调度、独立 worker 子进程执行。任务配置写入 workspace 运行目录下的 `schedules.json`，必须使用临时文件原子替换；运行状态写入 `schedule_runs.jsonl`，必须追加完整状态快照，不要覆盖历史。worker 的 session 仍写入同一 `sessions/` 目录，并且创建会话时必须在 metadata/session_meta 中保留 `source="schedule"`、`schedule_task_id`、`schedule_run_id` 和 `schedule_task_name`，保证历史记录可独立识别定时任务。
+
+worker 执行目录只作为项目工作目录，不能向用户项目目录写入 CodePilot 运行态文件。主进程只接受本机 worker 上报，并必须校验 `schedule_worker_token`；删除任务时只取消未启动的 pending run，不强杀已经运行的 worker。第一版只支持 `once`、`interval`、`daily`、`weekly` 四类触发，不引入 cron 或实时 SSE 推送。
 
 ## Skill Development Guidelines
 

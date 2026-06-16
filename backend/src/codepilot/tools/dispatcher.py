@@ -260,8 +260,30 @@ class ToolDispatcher:
             stop_event=stop_event,
         )
         if not skip_approval:
-            preflight = await tool.preflight(tool_args, tool_context)
+            try:
+                preflight = await tool.preflight(tool_args, tool_context)
+            except Exception as exc:  # noqa: BLE001
+                self._logger.exception("tool preflight failed", tool_name=tool_name, error=str(exc))
+                result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
+                await self._publish_preflight_error(
+                    session=session,
+                    runtime=runtime,
+                    agent=agent,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    result=result,
+                )
+                return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
             if preflight.status == "blocked" and preflight.result is not None:
+                if preflight.result.get("status") == "error":
+                    await self._publish_preflight_error(
+                        session=session,
+                        runtime=runtime,
+                        agent=agent,
+                        tool_name=tool_name,
+                        tool_call_id=tool_call_id,
+                        result=preflight.result,
+                    )
                 return self._result_builder.completed_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None, None
             if preflight.status == "requires_approval":
                 approval = ApprovalRequest(
@@ -345,3 +367,23 @@ class ToolDispatcher:
             result=result,
         )
         return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
+
+    async def _publish_preflight_error(
+        self,
+        *,
+        session: SessionState,
+        runtime: RuntimeHandles,
+        agent: AgentState,
+        tool_name: str,
+        tool_call_id: str,
+        result: dict[str, Any],
+    ) -> None:
+        # preflight 发生在真实工具执行前；这里仍发布失败事件，避免前端只看到消息入库、事件流缺失。
+        await self._event_publisher.publish_finished(
+            session=session,
+            runtime=runtime,
+            agent=agent,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            result=result,
+        )

@@ -6,13 +6,15 @@ from types import SimpleNamespace
 from typing import Any
 
 from codepilot.config import AppSettings, build_llm_runtime_settings
-from codepilot.config.settings import LLMProviderSettings, LLMSettings
+from codepilot.config.settings import BashToolSettings, LLMProviderSettings, LLMSettings
 from codepilot.context import CompressionResult
 from codepilot.events import EventBus
 from codepilot.hooks import BaseHook, HookContext, HookManager, HookResult, HookType, RuntimeHandles
+from codepilot.llm import LiteLLMClient
 from codepilot.main import _build_hook_manager
 from codepilot.session import (
     AgentLoop,
+    AgentState,
     ApprovalResult,
     Message,
     QuestionResult,
@@ -26,8 +28,8 @@ from codepilot.session.agents import AgentProfile
 from codepilot.session.message import ToolPartState
 from codepilot.session.session import summarize_question_answers
 from codepilot.session.title import SessionTitleService
-from codepilot.tools import BaseTool, QuestionTool, ToolDispatcher, ToolRegistry, ToolSpec
-from codepilot.tools.base import ToolExecutionContext
+from codepilot.tools import BaseTool, BashTool, QuestionTool, ToolDispatcher, ToolRegistry, ToolSpec
+from codepilot.tools.base import ToolExecutionContext, ToolPreflightResult
 
 
 def build_settings() -> AppSettings:
@@ -164,7 +166,12 @@ class StubLiteLLMClient:
         self.calls = 0
         self.last_provider_messages: list[Any] = []
 
-    def build_provider_messages(self, messages: list[Message], system_prompt: str | None = None) -> list[Any]:
+    def build_provider_messages(
+        self,
+        messages: list[Message],
+        system_prompt: str | None = None,
+        runtime_context: str | None = None,
+    ) -> list[Any]:
         provider_messages: list[Any] = []
         if system_prompt:
             provider_messages.append({"role": "system", "content": system_prompt})
@@ -766,6 +773,25 @@ class ApprovalTool(BaseTool):
         return {"status": "ok", "args": args}
 
 
+class PreflightApprovalTool(BaseTool):
+    spec = ToolSpec(
+        name="preflight_approval_tool",
+        description="preflight 需要审批的测试工具",
+        input_schema={"type": "object", "properties": {}},
+        timeout_seconds=1,
+    )
+
+    async def preflight(self, args: dict[str, Any], context: ToolExecutionContext) -> ToolPreflightResult:
+        return ToolPreflightResult(status="requires_approval", reason="需要审批")
+
+    async def execute(
+        self,
+        args: dict[str, Any],
+        context: ToolExecutionContext | None = None,
+    ) -> dict[str, Any]:
+        return {"status": "ok", "args": args}
+
+
 class ToolCallLiteLLMClient(StubLiteLLMClient):
     async def stream_chat(
         self,
@@ -781,6 +807,67 @@ class ToolCallLiteLLMClient(StubLiteLLMClient):
             reasoning="",
             tool_calls=[{"tool_call_id": "call_1", "tool_name": "approval_tool", "arguments": {}}],
         )
+
+
+def test_non_interactive_session_blocks_tool_spec_approval() -> None:
+    settings = build_settings()
+    session = build_session()
+    session.metadata["allow_human_interaction"] = False
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"), workspace_dir=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(ApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+
+    batch = asyncio.run(
+        dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=AgentState(name="build"),
+            tool_calls=[{"tool_call_id": "call_1", "tool_name": "approval_tool", "arguments": {}}],
+            runtime=runtime,
+            config=settings,
+        )
+    )
+
+    assert batch.pending_approval is not None
+    assert batch.pending_approval.request.approval_id == "approval_tool_call_1"
+    assert batch.pending_approval.resume_item is not None
+    assert batch.pending_approval.resume_item["tool_call_id"] == "call_1"
+    assert batch.tool_parts == []
+
+
+def test_non_interactive_session_blocks_tool_preflight_approval() -> None:
+    settings = build_settings()
+    session = build_session()
+    session.metadata["allow_human_interaction"] = False
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"), workspace_dir=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(PreflightApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+
+    batch = asyncio.run(
+        dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=AgentState(name="build"),
+            tool_calls=[{"tool_call_id": "call_1", "tool_name": "preflight_approval_tool", "arguments": {}}],
+            runtime=runtime,
+            config=settings,
+        )
+    )
+
+    assert batch.pending_approval is not None
+    assert batch.pending_approval.request.approval_id == "approval_tool_call_1"
+    assert batch.pending_approval.request.reason == "需要审批"
+    assert batch.pending_approval.resume_item is not None
+    assert batch.pending_approval.resume_item["tool_call_id"] == "call_1"
+    assert batch.tool_parts == []
 
 
 class NoIdToolCallLiteLLMClient(StubLiteLLMClient):
@@ -860,6 +947,50 @@ class QuestionToolCallLiteLLMClient(StubLiteLLMClient):
                 ],
             )
         return SimpleNamespace(text="收到答案", reasoning="", tool_calls=[])
+
+
+class BashParseErrorLiteLLMClient(StubLiteLLMClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self._message_builder = LiteLLMClient()
+
+    def build_provider_messages(
+        self,
+        messages: list[Message],
+        system_prompt: str | None = None,
+        runtime_context: str | None = None,
+    ) -> list[Any]:
+        provider_messages = self._message_builder.build_provider_messages(
+            messages,
+            system_prompt=system_prompt,
+            runtime_context=runtime_context,
+        )
+        self.last_provider_messages = provider_messages
+        return provider_messages
+
+    async def stream_chat(
+        self,
+        session: SessionState,
+        llm_state: Any,
+        provider_messages: list[Any],
+        tools: list[dict[str, Any]],
+        event_bus: EventBus,
+    ) -> Any:
+        self.calls += 1
+        self.last_provider_messages = provider_messages
+        if self.calls == 1:
+            return SimpleNamespace(
+                text="需要执行命令",
+                reasoning="",
+                tool_calls=[
+                    {
+                        "tool_call_id": "call_bad_quote",
+                        "tool_name": "bash_tool",
+                        "arguments": {"command": "echo 'abc"},
+                    }
+                ],
+            )
+        return SimpleNamespace(text="已收到工具错误并修正后继续。", reasoning="", tool_calls=[])
 
 
 class ContinueToolDispatcher(StubToolDispatcher):
@@ -964,6 +1095,58 @@ def test_agent_loop_reuses_generated_tool_call_id_for_execution() -> None:
     assert llm_client.tool_call["tool_call_id"] == tool_parts[0].call_id
 
 
+def test_agent_loop_continues_after_preflight_tool_error(tmp_path: Path) -> None:
+    settings = build_settings()
+    session = build_session()
+    session.workspace_path = str(tmp_path)
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
+    event_bus = EventBus()
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5))
+    llm_client = BashParseErrorLiteLLMClient()
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=tool_registry,
+        tool_dispatcher=ToolDispatcher(tool_registry, hook_manager),
+        hook_manager=hook_manager,
+    )
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(
+                name="build",
+                system_prompt="test",
+                allowed_tools=["bash_tool"],
+                max_iterations=3,
+            ),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.status == SessionStatus.COMPLETED
+    assert llm_client.calls == 2
+    failed_tool = result.messages[1].tool_parts()[0]
+    assert failed_tool.state.status == "error"
+    assert failed_tool.state.error is not None
+    assert failed_tool.state.error.code == "BashCommandParseError"
+    assert result.messages[1].info.finish == "tool_completed"
+    tool_messages = [message for message in llm_client.last_provider_messages if isinstance(message, dict) and message.get("role") == "tool"]
+    assert len(tool_messages) == 1
+    assert "BashCommandParseError" in str(tool_messages[0].get("content"))
+    assert [event.event_type for event in stream_events].count("tool_call_failed") == 1
+    assert stream_events[-1].event_type == "session_finished"
+
+
 def test_agent_loop_stops_after_completed_tools_when_loop_after_requests_stop() -> None:
     settings = build_settings()
     session = build_session()
@@ -1065,7 +1248,54 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
     assert interactions[0].data["interaction_id"] == "approval_tool_call_1"
     assert session.messages[-1].info.role == "user"
     assert session.messages[-1].info.agent == "build"
-    assert session.messages[-2].tool_parts()[0].state.status == "pending"
+    tool_part = session.messages[-2].tool_parts()[0]
+    assert tool_part.state.status == "error"
+    assert tool_part.state.error is not None
+    assert tool_part.state.error.code == "ToolApprovalRejected"
+    assert tool_part.state.output is not None
+    assert tool_part.state.output["error_type"] == "ToolApprovalRejected"
+    assert "拒绝执行" in tool_part.state.output["error_message"]
+    assert interactions[1].data["message_id"] == session.messages[-2].info.id
+    assert interactions[1].data["call_id"] == "call_1"
+
+
+def test_non_interactive_agent_loop_fails_before_tool_approval_wait() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(ApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=ToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+            allow_human_interaction=False,
+        )
+    )
+
+    assert result.status == SessionStatus.FAILED
+    assert result.metadata["non_interactive_error"] == "定时任务为无人值守运行，不能请求人工输入。"
+    assert "human_approval_required" not in [event.event_type for event in stream_events]
+    assert any(event.event_type == "error" for event in stream_events)
 
 
 def test_agent_loop_fast_approval_reply_does_not_lose_wakeup() -> None:
@@ -1210,6 +1440,91 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     )
 
 
+def test_non_interactive_agent_loop_fails_before_question_wait() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(QuestionTool(timeout_seconds=1))
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=QuestionToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["question"], max_iterations=3),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+            question_event=asyncio.Event(),
+            question_result_holder={"result": None},
+            allow_human_interaction=False,
+        )
+    )
+
+    assert result.status == SessionStatus.FAILED
+    assert "human_question_required" not in [event.event_type for event in stream_events]
+    assert any(event.event_type == "error" for event in stream_events)
+
+
+def test_subagent_inherits_non_interactive_policy_from_parent_session() -> None:
+    settings = build_settings()
+    parent_session = build_session()
+    parent_session.metadata["allow_human_interaction"] = False
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(QuestionTool(timeout_seconds=1))
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=QuestionToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    result = asyncio.run(
+        loop.run_subagent(
+            parent_session=parent_session,
+            workspace=workspace,
+            agent_profile=AgentProfile(
+                name="explore",
+                system_prompt="test",
+                kind="subagent",
+                allowed_tools=["question"],
+                max_iterations=3,
+            ),
+            task="需要澄清目标",
+            parent_call_id="call_task_1",
+            runtime=runtime,
+            config=settings,
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.status == SessionStatus.FAILED
+    assert result.metadata["non_interactive_error"] == "定时任务为无人值守运行，不能请求人工输入。"
+    assert "human_question_required" not in [event.event_type for event in stream_events]
+    assert any(event.event_type == "error" for event in stream_events)
+
+
 def test_agent_loop_question_decline_appends_user_message_and_stops() -> None:
     settings = build_settings()
     session = build_session()
@@ -1264,10 +1579,16 @@ def test_agent_loop_question_decline_appends_user_message_and_stops() -> None:
     assert llm_client.calls == 1
     assert result.messages[-1].info.role == "user"
     assert "用户拒绝回答 question 工具提出的问题" in result.messages[-1].text_content()
-    assert result.messages[-2].tool_parts()[0].state.status == "pending"
+    tool_part = result.messages[-2].tool_parts()[0]
+    assert tool_part.state.status == "error"
+    assert tool_part.state.error is not None
+    assert tool_part.state.error.code == "QuestionDeclined"
+    assert tool_part.state.output is not None
+    assert tool_part.state.output["error_type"] == "QuestionDeclined"
     resolved = next(event for event in stream_events if event.event_type == "human_question_resolved")
     assert resolved.data["declined"] is True
     assert resolved.data["continue_loop"] is False
+    LiteLLMClient().build_provider_messages(result.messages[-2:])
 
 
 def test_agent_loop_fast_question_reply_does_not_lose_wakeup() -> None:

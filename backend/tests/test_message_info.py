@@ -8,7 +8,9 @@ from pydantic import ValidationError
 
 from codepilot.llm import LiteLLMClient
 from codepilot.session import LLMState, SessionState, SessionStatus
-from codepilot.session.message import Message, ToolPart, ToolPartState, build_assistant_message_info
+from codepilot.session.flow import _latest_user_message_datetime
+from codepilot.session.message import Message, TextPart, ToolPart, ToolPartState, build_assistant_message_info, build_user_message_info
+from codepilot.session.system_prompt import build_runtime_context_prompt
 
 
 class FakeStream:
@@ -27,6 +29,14 @@ class RecordingStreamBus:
     async def publish_stream_event(self, event: object) -> object:
         self.events.append(event)
         return event
+
+
+class RecordingLogger:
+    def __init__(self) -> None:
+        self.records: list[dict[str, object]] = []
+
+    def info(self, event: str, **kwargs: object) -> None:
+        self.records.append({"event": event, **kwargs})
 
 
 def test_message_info_discriminates_user_and_assistant_by_role() -> None:
@@ -161,6 +171,150 @@ def test_litellm_provider_message_builder_prepends_system_prompt() -> None:
         {"role": "system", "content": "system rules"},
         {"role": "user", "content": "hello"},
     ]
+
+
+def test_litellm_provider_message_builder_wraps_latest_user_with_runtime_context() -> None:
+    client = LiteLLMClient()
+    messages = [
+        Message.model_validate(
+            {
+                "info": {
+                    "id": "msg_user_1",
+                    "session_id": "session_1",
+                    "role": "user",
+                    "time": {"created": 1_746_000_000_000},
+                    "agent": "build",
+                    "model": {"provider_id": "openai", "model_id": "gpt-5.3-codex"},
+                },
+                "parts": [{"type": "text", "text": "历史问题"}],
+            }
+        ),
+        Message.model_validate(
+            {
+                "info": {
+                    "id": "msg_assistant_1",
+                    "session_id": "session_1",
+                    "role": "assistant",
+                    "time": {"created": 1_746_000_000_001},
+                    "parent_id": "msg_user_1",
+                    "agent": "build",
+                    "model": {"provider_id": "openai", "model_id": "gpt-5.3-codex"},
+                    "path": {"cwd": "/tmp/codepilot", "root": "/tmp/codepilot"},
+                },
+                "parts": [{"type": "text", "text": "历史回答"}],
+            }
+        ),
+        Message.model_validate(
+            {
+                "info": {
+                    "id": "msg_user_2",
+                    "session_id": "session_1",
+                    "role": "user",
+                    "time": {"created": 1_746_000_000_002},
+                    "agent": "build",
+                    "model": {"provider_id": "openai", "model_id": "gpt-5.3-codex"},
+                },
+                "parts": [{"type": "text", "text": "当前问题"}],
+            }
+        ),
+    ]
+
+    provider_messages = client.build_provider_messages(
+        messages,
+        system_prompt="system rules",
+        runtime_context="<runtime_context>\ncurrent_time: 2026-06-15 星期一 18:00:00\n</runtime_context>",
+    )
+
+    assert provider_messages[0] == {"role": "system", "content": "system rules"}
+    assert provider_messages[1] == {"role": "user", "content": "历史问题"}
+    assert provider_messages[2] == {"role": "assistant", "content": "历史回答"}
+    assert provider_messages[3]["role"] == "user"
+    assert provider_messages[3]["content"] == (
+        "<runtime_context>\n"
+        "current_time: 2026-06-15 星期一 18:00:00\n"
+        "</runtime_context>\n\n"
+        "<user_request>\n"
+        "当前问题\n"
+        "</user_request>"
+    )
+    assert messages[-1].text_content() == "当前问题"
+
+
+def test_latest_user_message_time_keeps_runtime_context_stable_for_same_turn() -> None:
+    old_user = Message(
+        info=build_user_message_info(
+            message_id="msg_user_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_000,
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+        ),
+        parts=[TextPart(text="历史问题")],
+    )
+    assistant = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd="/tmp/codepilot",
+            root="/tmp/codepilot",
+        ),
+        parts=[TextPart(text="历史回答")],
+    )
+    latest_user = Message(
+        info=build_user_message_info(
+            message_id="msg_user_2",
+            session_id="session_1",
+            created_at_ms=1_746_000_123_000,
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+        ),
+        parts=[TextPart(text="当前问题")],
+    )
+
+    latest_time = _latest_user_message_datetime([old_user, assistant, latest_user, assistant])
+
+    assert latest_time is not None
+    assert latest_time.timestamp() == pytest.approx(1_746_000_123)
+
+    session = SessionState(
+        session_id="session_1",
+        workspace_id="ws_1",
+        workspace_path="/tmp/codepilot",
+        agent_name="build",
+        provider="openai",
+        model="gpt-5.3-codex",
+        status=SessionStatus.RUNNING,
+        created_at="2026-04-30T00:00:00Z",
+        updated_at="2026-04-30T00:00:00Z",
+    )
+    workspace = SimpleNamespace(workspace_path="/tmp/codepilot")
+    llm_state = LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=128)
+    agent_state = SimpleNamespace(name="build")
+
+    first_context = build_runtime_context_prompt(
+        session=session,
+        workspace=workspace,
+        agent_state=agent_state,
+        llm_state=llm_state,
+        now=latest_time,
+    )
+    second_context = build_runtime_context_prompt(
+        session=session,
+        workspace=workspace,
+        agent_state=agent_state,
+        llm_state=llm_state,
+        now=latest_time,
+    )
+
+    assert first_context == second_context
+    assert "current_time:" in first_context
 
 
 def test_litellm_provider_message_builder_rejects_pending_tool_parts() -> None:
@@ -302,6 +456,54 @@ def test_litellm_provider_kwargs_enable_reasoning_effort() -> None:
     assert qwen_enabled["extra_body"] == {"enable_thinking": True}
     assert qwen_disabled["extra_body"] == {"enable_thinking": False}
     assert "reasoning_effort" not in qwen_enabled
+
+
+def test_litellm_request_log_is_disabled_by_default() -> None:
+    client = LiteLLMClient()
+    logger = RecordingLogger()
+    client._logger = logger
+
+    client._log_request_if_enabled(endpoint="stream_chat", request={"model": "gpt-test"})
+
+    assert logger.records == []
+
+
+def test_litellm_complete_text_logs_redacted_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured_kwargs: dict[str, object] = {}
+
+    async def fake_acompletion(**kwargs: object) -> object:
+        captured_kwargs.update(kwargs)
+        return SimpleNamespace(model_dump=lambda: {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setenv("QWEN_API_KEY", "sk-qwen")
+    monkeypatch.setenv("QWEN_BASE_URL", "https://qwen.example.com/v1")
+    monkeypatch.setattr("codepilot.llm.client.acompletion", fake_acompletion)
+    client = LiteLLMClient(log_requests=True)
+    logger = RecordingLogger()
+    client._logger = logger
+
+    result = asyncio.run(
+        client.complete_text(
+            llm_state=LLMState(
+                provider="qwen",
+                model="qwen3.5-flash",
+                max_tokens=128,
+                metadata={"litellm_model_prefix": "openai/"},
+            ),
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=64,
+        )
+    )
+
+    assert result == "ok"
+    assert captured_kwargs["api_key"] == "sk-qwen"
+    assert logger.records[0]["event"] == "llm api request"
+    assert logger.records[0]["endpoint"] == "complete_text"
+    logged_request = logger.records[0]["request"]
+    assert isinstance(logged_request, dict)
+    assert logged_request["api_key"] == "***REDACTED***"
+    assert logged_request["api_base"] == "https://qwen.example.com/v1"
+    assert logged_request["messages"] == [{"role": "user", "content": "hello"}]
 
 
 def test_litellm_provider_kwargs_support_deepseek_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,12 +5,14 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput
+from codepilot.scheduler.models import ScheduleRunStatus, ScheduleTrigger, compute_next_run_at
+from codepilot.scheduler.service import ScheduleValidationError, validate_schedule_task_payload
 from codepilot.utils import utc_now_iso
 
 
@@ -18,6 +20,40 @@ class LoadSessionRequest(BaseModel):
     """加载历史会话的请求体。"""
 
     session_id: str
+
+
+class ScheduleTaskRequest(BaseModel):
+    name: str
+    prompt: str
+    agent_name: str
+    provider: str
+    model: str
+    trigger: ScheduleTrigger
+    working_dir: str
+    enabled: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    isolation_mode: str = "subprocess"
+
+
+class ScheduleTaskPatchRequest(BaseModel):
+    name: str | None = None
+    prompt: str | None = None
+    agent_name: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    trigger: ScheduleTrigger | None = None
+    working_dir: str | None = None
+    enabled: bool | None = None
+    metadata: dict[str, Any] | None = None
+    isolation_mode: str | None = None
+
+
+class ScheduleRunReportRequest(BaseModel):
+    run_id: str
+    status: ScheduleRunStatus
+    session_id: str | None = None
+    summary: str | None = None
+    error: str | None = None
 
 
 def build_api_router(app_state: Any) -> APIRouter:
@@ -124,6 +160,100 @@ def build_api_router(app_state: Any) -> APIRouter:
             }
         )
 
+    @router.get("/schedules")
+    async def get_schedules() -> JSONResponse:
+        """返回当前工作区全部定时任务。"""
+        return JSONResponse({"schedules": [task.model_dump() for task in app_state.schedule_store.list_tasks()]})
+
+    @router.post("/schedules")
+    async def post_schedule(payload: ScheduleTaskRequest) -> JSONResponse:
+        """创建一个定时任务。"""
+        try:
+            validated = validate_schedule_task_payload(
+                settings=app_state.settings,
+                agent_profiles=app_state.agent_profiles,
+                payload=payload.model_dump(),
+            )
+        except ScheduleValidationError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        task = app_state.schedule_runner.create_task(**validated)
+        return JSONResponse({"ok": True, "schedule": task.model_dump()})
+
+    @router.patch("/schedules/{task_id}")
+    async def patch_schedule(task_id: str, payload: ScheduleTaskPatchRequest) -> JSONResponse:
+        """更新定时任务。"""
+        current = app_state.schedule_store.get_task(task_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail=f"schedule `{task_id}` 不存在")
+        raw_updates = payload.model_dump(exclude_unset=True)
+        merged = current.model_dump()
+        merged.update(raw_updates)
+        try:
+            validated = validate_schedule_task_payload(
+                settings=app_state.settings,
+                agent_profiles=app_state.agent_profiles,
+                payload=merged,
+            )
+        except ScheduleValidationError as exc:
+            raise HTTPException(status_code=400, detail=exc.message) from exc
+        updates = {key: validated[key] for key in raw_updates if key in validated}
+        if "trigger" in raw_updates:
+            updates["trigger"] = validated["trigger"]
+            updates["next_run_at"] = compute_next_run_at(validated["trigger"]) if merged.get("enabled", current.enabled) else None
+        task = app_state.schedule_runner.update_task(task_id, updates)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"schedule `{task_id}` 不存在")
+        return JSONResponse({"ok": True, "schedule": task.model_dump()})
+
+    @router.delete("/schedules/{task_id}")
+    async def delete_schedule(task_id: str) -> JSONResponse:
+        """删除定时任务；已运行的 worker 不会被强杀。"""
+        deleted = app_state.schedule_runner.delete_task(task_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail=f"schedule `{task_id}` 不存在")
+        return JSONResponse({"ok": True})
+
+    @router.get("/schedule-runs")
+    async def get_schedule_runs() -> JSONResponse:
+        """返回 active runs 和最近运行记录，供前端轻量轮询。"""
+        active = app_state.schedule_store.active_runs()
+        recent = app_state.schedule_store.recent_runs(limit=20)
+        return JSONResponse(
+            {
+                "active": [run.model_dump() for run in active],
+                "recent": [run.model_dump() for run in recent],
+            }
+        )
+
+    @router.post("/schedule-runs/{run_id}/report")
+    async def post_schedule_run_report(
+        run_id: str,
+        payload: ScheduleRunReportRequest,
+        request: Request,
+        x_codepilot_schedule_token: str | None = Header(default=None),
+    ) -> JSONResponse:
+        """接收本机 worker 上报的执行结果。"""
+        if payload.run_id != run_id:
+            raise HTTPException(status_code=400, detail="report run_id 与路径不一致")
+        if payload.status not in {ScheduleRunStatus.COMPLETED, ScheduleRunStatus.FAILED, ScheduleRunStatus.TIMEOUT}:
+            raise HTTPException(status_code=400, detail="report status 只能是 completed/failed/timeout")
+        client_host = request.client.host if request.client else ""
+        if client_host and client_host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise HTTPException(status_code=403, detail="schedule report 只接受本机请求")
+        if not x_codepilot_schedule_token or x_codepilot_schedule_token != app_state.schedule_store.token():
+            raise HTTPException(status_code=403, detail="schedule report token 无效")
+        try:
+            run = await app_state.schedule_runner.report(
+                run_id,
+                status=payload.status,
+                session_id=payload.session_id,
+                summary=payload.summary,
+                error=payload.error,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return JSONResponse({"ok": True, "run": run.model_dump()})
+
     @router.get("/session/stream")
     async def get_session_stream(request: Request, after_seq: int = 0) -> StreamingResponse:
         """建立当前会话的 SSE 长连接。
@@ -181,7 +311,6 @@ def build_api_router(app_state: Any) -> APIRouter:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return router
-
 
 def _to_sse(event: StreamEvent) -> str:
     """把内部事件对象格式化成标准 SSE 文本帧。"""

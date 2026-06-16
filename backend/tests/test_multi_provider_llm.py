@@ -84,7 +84,7 @@ def build_settings(environ: dict[str, str]) -> AppSettings:
     return settings.model_copy(update={"llm_runtime": runtime})
 
 
-def build_session_runner(settings: AppSettings) -> SessionRunner:
+def build_session_runner(settings: AppSettings, *, allow_human_interaction: bool = True) -> SessionRunner:
     workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
     return SessionRunner(
         workspace=workspace,
@@ -94,6 +94,7 @@ def build_session_runner(settings: AppSettings) -> SessionRunner:
         agent_loop=DummyAgentLoop(),
         agent_profiles={"build": object(), "plan": object()},
         title_service=NoopTitleService(),
+        allow_human_interaction=allow_human_interaction,
     )
 
 
@@ -608,6 +609,67 @@ def test_session_runner_updates_thinking_enabled_on_existing_session() -> None:
     assert second_session is not None
     assert second_session.metadata["thinking_enabled"] is False
     assert second_session.metadata["thinking_value"] is None
+
+
+def test_session_runner_resets_schedule_session_to_interactive_on_manual_continue() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings)
+
+    first_session = asyncio.run(
+        runner.handle_input(
+            GatewayInput(
+                type=GatewayInputType.USER_MESSAGE,
+                content="schedule run",
+                agent_name="build",
+                provider="openai",
+                model="gpt-5.3-codex",
+                metadata={
+                    "source": "schedule",
+                    "schedule_task_id": "scht_1",
+                    "schedule_run_id": "run_1",
+                    "schedule_task_name": "每日巡检",
+                },
+            )
+        )
+    )
+    assert first_session is not None
+    first_session.status = SessionStatus.COMPLETED
+    first_session.metadata["allow_human_interaction"] = False
+
+    second_session = asyncio.run(
+        runner.handle_input(
+            GatewayInput(
+                type=GatewayInputType.USER_MESSAGE,
+                session_id=first_session.session_id,
+                content="manual continue",
+                agent_name="build",
+                provider="openai",
+                model="gpt-5.3-codex",
+            )
+        )
+    )
+
+    assert second_session is not None
+    assert second_session.metadata["allow_human_interaction"] is True
+    assert second_session.metadata["source"] == "schedule"
+    assert second_session.metadata["schedule_task_id"] == "scht_1"
+
+
+def test_session_runner_keeps_non_interactive_metadata_for_worker_session() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings, allow_human_interaction=False)
+
+    session = runner._new_session(
+        GatewayInput(
+            type=GatewayInputType.USER_MESSAGE,
+            content="schedule run",
+            agent_name="build",
+            provider="openai",
+            model="gpt-5.3-codex",
+        )
+    )
+
+    assert session.metadata["allow_human_interaction"] is False
 
 
 def test_session_runner_rejects_unknown_agent_name() -> None:

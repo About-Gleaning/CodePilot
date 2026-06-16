@@ -22,11 +22,13 @@ class SessionTitleService:
         model: str = "qwen3.5-flash",
         litellm_model_prefix: str = "openai/",
         title_limit: int = 15,
+        llm_client: LiteLLMClient | None = None,
     ) -> None:
         self.provider = provider
         self.model = model
         self.litellm_model_prefix = litellm_model_prefix
         self.title_limit = title_limit
+        self._llm_client = llm_client or LiteLLMClient()
         self._logger = get_logger("codepilot.session.title")
 
     async def generate_for_session(self, session: SessionState, event_bus: Any) -> None:
@@ -61,7 +63,7 @@ class SessionTitleService:
             max_tokens=64,
             metadata={"litellm_model_prefix": self.litellm_model_prefix},
         )
-        response = await LiteLLMClient().complete_text(
+        response = await self._llm_client.complete_text(
             llm_state=llm_state,
             messages=[
                 {

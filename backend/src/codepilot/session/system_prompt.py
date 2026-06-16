@@ -36,6 +36,33 @@ def build_system_prompt(
     return "\n\n".join(section for section in sections if section)
 
 
+def build_runtime_context_prompt(
+    *,
+    session: SessionState,
+    workspace: Any,
+    agent_state: AgentState,
+    llm_state: LLMState,
+    now: datetime | None = None,
+) -> str:
+    """构造每轮动态上下文，放入最新用户消息尾部以避免破坏稳定 system 前缀。"""
+    workspace_path = Path(workspace.workspace_path)
+    local_now = now.astimezone() if now is not None else datetime.now().astimezone()
+    utc_offset = _format_utc_offset(local_now)
+    timezone_name = local_now.tzname() or "本地时区"
+    lines = [
+        "<runtime_context>",
+        f"current_time: {local_now:%Y-%m-%d} {_WEEKDAYS[local_now.weekday()]} {local_now:%H:%M:%S}",
+        f"timezone: {timezone_name}",
+        f"utc_offset: UTC{utc_offset}",
+        f"workspace: {workspace_path}",
+        f"agent: {agent_state.name}",
+        f"model: {llm_state.provider}/{llm_state.model}",
+        f"session_id: {session.session_id}",
+        "</runtime_context>",
+    ]
+    return "\n".join(lines)
+
+
 def _section(title: str, content: str | None) -> str:
     if not content:
         return ""
@@ -84,7 +111,6 @@ def _build_runtime_context(
 ) -> str:
     git_enabled = (workspace_path / ".git").exists()
     lines = [
-        *_build_current_time_context(),
         f"- 工作根目录：{workspace_path}",
         f"- 当前 Agent：{agent_state.name}",
         f"- Agent 角色：{agent_state.role}",
@@ -95,15 +121,6 @@ def _build_runtime_context(
         "- 用户偏好：预留，尚未接入用户偏好存储。",
     ]
     return "\n".join(lines)
-
-
-def _build_current_time_context(now: datetime | None = None) -> list[str]:
-    local_now = now.astimezone() if now is not None else datetime.now().astimezone()
-    utc_offset = _format_utc_offset(local_now)
-    timezone_name = local_now.tzname() or "本地时区"
-    return [
-        f"- 当前本地完整时间：{local_now:%Y-%m-%d} {_WEEKDAYS[local_now.weekday()]} {local_now:%H:%M:%S}（{timezone_name}，UTC{utc_offset}）",
-    ]
 
 
 def _format_utc_offset(value: datetime) -> str:

@@ -19,36 +19,15 @@ from dotenv import load_dotenv
 from codepilot.api import build_api_router
 from codepilot.config import AppSettings, WorkspaceState, build_workspace_id, load_settings
 from codepilot.events import EventBus
-from codepilot.hooks import (
-    AgentPluginHook,
-    ApprovalHook,
-    CommandPluginHook,
-    HookManager,
-    HookType,
-    HttpPluginHook,
-    PromptPluginHook,
-)
+from codepilot.hooks import HookManager
 from codepilot.llm import LiteLLMClient
 from codepilot.logging import configure_logging
 from codepilot.memory import JsonlEventStore, JsonlSessionMemory
-from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
-from codepilot.skills import SkillRegistry
-from codepilot.tools import (
-    BashTool,
-    EditFileTool,
-    LoadSkillTool,
-    McpToolAdapter,
-    ReadFileTool,
-    TaskTool,
-    ToolDispatcher,
-    ToolRegistry,
-    TodoReadTool,
-    TodoWriteTool,
-    WriteFileTool,
-    WritePlanTool,
-    QuestionTool,
-    WebFetchTool,
-)
+from codepilot.runtime import build_hook_manager as _build_hook_manager
+from codepilot.runtime import build_runtime_bundle
+from codepilot.scheduler import ScheduleRunner, ScheduleStore
+from codepilot.session import SessionRunner
+from codepilot.tools import ScheduleManageTool, ToolRegistry
 
 
 @dataclass(slots=True)
@@ -64,6 +43,8 @@ class AppContext:
     llm_client: LiteLLMClient
     agent_profiles: dict[str, object]
     session_runner: SessionRunner
+    schedule_store: ScheduleStore
+    schedule_runner: ScheduleRunner
 
 
 def create_app() -> FastAPI:
@@ -79,81 +60,46 @@ def create_app() -> FastAPI:
     # 先完成本地工作区初始化，再装配日志、会话与运行时组件，避免后续组件缺少目录依赖。
     workspace = _build_workspace_state(repo_root, settings)
     configure_logging(settings.logging, workspace.logs_dir)
-    event_bus = EventBus()
-    session_memory = JsonlSessionMemory(workspace.sessions_dir)
-    event_store = JsonlEventStore(workspace.sessions_dir)
-
-    # 用持久化事件序号恢复事件总线状态，防止服务重启后流式事件序号回退。
-    event_bus.set_initial_seq(event_store.latest_seq())
-    event_bus.subscribe_domain(session_memory.handle_domain_event)
-    event_bus.subscribe_stream(event_store.append)
-
-    skill_registry = SkillRegistry(workspace.codepilot_home / "skills")
-    skill_registry.discover()
-
-    tool_registry = ToolRegistry()
-    # 一期先注册内置工具与 MCP 占位适配器，后续再替换为真实 MCP 工具发现流程。
-    tool_registry.register(BashTool(settings=settings.tools.bash, timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(ReadFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(WriteFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(EditFileTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(WritePlanTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(TodoWriteTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(TodoReadTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(QuestionTool(timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
-    tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
-
-    hook_manager = _build_hook_manager(settings)
-    llm_client = LiteLLMClient()
-    tool_dispatcher = ToolDispatcher(tool_registry, hook_manager)
-    agent_profiles = build_agent_profiles(
-        max_iterations=settings.agent.max_loop_iterations,
-        subagent_max_iterations=settings.agent.subagent_max_loop_iterations,
+    runtime = build_runtime_bundle(settings=settings, workspace=workspace)
+    schedule_store = ScheduleStore(workspace.workspace_dir)
+    schedule_runner = ScheduleRunner(
+        store=schedule_store,
+        settings=settings,
+        workspace=workspace,
+        agent_profiles=runtime.agent_profiles,
     )
-    # AgentLoop 负责单轮推理与工具调用；SessionRunner 负责面向会话编排整个执行生命周期。
-    agent_loop = AgentLoop(
-        llm_client=llm_client,
-        tool_registry=tool_registry,
-        tool_dispatcher=tool_dispatcher,
-        hook_manager=hook_manager,
-        skill_registry=skill_registry,
-    )
-    tool_registry.register(
-        TaskTool(
-            agent_loop=agent_loop,
-            agent_profiles=agent_profiles,
+    runtime.tool_registry.register(
+        ScheduleManageTool(
+            store=schedule_store,
+            runner=schedule_runner,
+            settings=settings,
+            agent_profiles=runtime.agent_profiles,
             timeout_seconds=settings.tools.default_timeout_seconds,
         )
-    )
-    tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
-    session_runner = SessionRunner(
-        workspace=workspace,
-        config=settings,
-        event_bus=event_bus,
-        hook_manager=hook_manager,
-        agent_loop=agent_loop,
-        agent_profiles=agent_profiles,
     )
 
     app_state = AppContext(
         settings=settings,
         workspace=workspace,
-        event_bus=event_bus,
-        event_store=event_store,
-        session_memory=session_memory,
-        tool_registry=tool_registry,
-        hook_manager=hook_manager,
-        llm_client=llm_client,
-        agent_profiles=agent_profiles,
-        session_runner=session_runner,
+        event_bus=runtime.event_bus,
+        event_store=runtime.event_store,
+        session_memory=runtime.session_memory,
+        tool_registry=runtime.tool_registry,
+        hook_manager=runtime.hook_manager,
+        llm_client=runtime.llm_client,
+        agent_profiles=runtime.agent_profiles,
+        session_runner=runtime.session_runner,
+        schedule_store=schedule_store,
+        schedule_runner=schedule_runner,
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await app_state.schedule_runner.start()
         try:
             yield
         finally:
+            await app_state.schedule_runner.shutdown()
             await app_state.session_runner.shutdown()
 
     app = FastAPI(title="CodePilot", version="0.1.0", lifespan=lifespan)
@@ -212,69 +158,6 @@ def _build_workspace_state(repo_root: Path, settings: AppSettings) -> WorkspaceS
         logs_dir=logs_dir,
         workspace_meta_file=workspace_meta_file,
     )
-
-
-def _build_hook_manager(settings: AppSettings) -> HookManager:
-    """根据配置注册内置 Hook 与插件 Hook，生成运行期统一使用的 Hook 管理器。"""
-    manager = HookManager()
-    # 内置审批 Hook 始终注册，用于通过显式标记触发人工确认链路。
-    manager.register(
-        ApprovalHook(
-            hook_id="approval-hook",
-            hook_type=HookType.LOOP_BEFORE,
-            name="approval_hook",
-            description="使用 [[approve]] 标记触发人工审批。",
-            order=10,
-        )
-    )
-    for plugin in settings.hooks.plugins:
-        # 按配置中的插件类型映射到具体 Hook 实现，保持配置驱动，避免在其他位置分散判断逻辑。
-        if plugin.plugin_type == "prompt":
-            manager.register(
-                PromptPluginHook(
-                    hook_id=plugin.hook_id,
-                    hook_type=HookType(plugin.hook_type),
-                    name=plugin.hook_id,
-                    enabled=plugin.enabled,
-                    order=plugin.order,
-                    role=plugin.config.get("role", "system"),
-                    content=plugin.config.get("content", ""),
-                )
-            )
-        elif plugin.plugin_type == "command":
-            manager.register(
-                CommandPluginHook(
-                    hook_id=plugin.hook_id,
-                    hook_type=HookType(plugin.hook_type),
-                    name=plugin.hook_id,
-                    enabled=plugin.enabled,
-                    order=plugin.order,
-                    config=plugin.config,
-                )
-            )
-        elif plugin.plugin_type == "http":
-            manager.register(
-                HttpPluginHook(
-                    hook_id=plugin.hook_id,
-                    hook_type=HookType(plugin.hook_type),
-                    name=plugin.hook_id,
-                    enabled=plugin.enabled,
-                    order=plugin.order,
-                    config=plugin.config,
-                )
-            )
-        elif plugin.plugin_type == "agent":
-            manager.register(
-                AgentPluginHook(
-                    hook_id=plugin.hook_id,
-                    hook_type=HookType(plugin.hook_type),
-                    name=plugin.hook_id,
-                    enabled=plugin.enabled,
-                    order=plugin.order,
-                    config=plugin.config,
-                )
-            )
-    return manager
 
 
 def _resolve_repo_root() -> Path:

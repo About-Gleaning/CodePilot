@@ -50,6 +50,7 @@ class _RunContext:
     stop_event: Any
     agent_state: AgentState
     llm_state: LLMState
+    allow_human_interaction: bool = True
 
 
 class AgentLoop:
@@ -105,6 +106,7 @@ class AgentLoop:
         stop_event: Any,
         question_event: Any | None = None,
         question_result_holder: dict[str, QuestionResult | None] | None = None,
+        allow_human_interaction: bool = True,
     ) -> SessionState:
         """执行一次完整会话，直到完成、失败、取消或被人工拒绝。
 
@@ -124,6 +126,7 @@ class AgentLoop:
             stop_event=stop_event,
             agent_state=self._build_agent_state(session, agent_profile),
             llm_state=self._build_llm_state(session, config),
+            allow_human_interaction=allow_human_interaction,
         )
 
         try:
@@ -197,6 +200,7 @@ class AgentLoop:
             stop_event=stop_event,
             agent_state=agent_state,
             llm_state=self._build_llm_state(parent_session, config),
+            allow_human_interaction=parent_session.metadata.get("allow_human_interaction") is not False,
         )
         task_message = child_session.messages.pop()
         await self._message_appender.append(child_session, task_message, runtime)
@@ -279,6 +283,13 @@ class AgentLoop:
             return False
 
         if session_before.requires_human_input and session_before.human_request:
+            if not ctx.allow_human_interaction:
+                await self._fail_non_interactive_human_input(
+                    ctx,
+                    kind="approval",
+                    interaction_id=session_before.human_request.approval_id,
+                )
+                return False
             result = await self._wait_for_approval(
                 ctx,
                 PendingApproval(request=session_before.human_request, source="hook"),
@@ -354,9 +365,24 @@ class AgentLoop:
             ctx.session.status = SessionStatus.FAILED
             return False
         if turn_result.status == "needs_question" and turn_result.pending_question is not None:
+            if not ctx.allow_human_interaction:
+                await self._fail_non_interactive_human_input(
+                    ctx,
+                    kind="question",
+                    interaction_id=turn_result.pending_question.request.question_id,
+                )
+                return False
             return await self._handle_pending_question(ctx, turn_result.pending_question, iteration, turn_result.resume_batch)
         if turn_result.status != "needs_approval" or turn_result.pending_approval is None:
             return True
+
+        if not ctx.allow_human_interaction:
+            await self._fail_non_interactive_human_input(
+                ctx,
+                kind="approval",
+                interaction_id=turn_result.pending_approval.request.approval_id,
+            )
+            return False
 
         return await self._handle_pending_approval(
             ctx,
@@ -413,6 +439,26 @@ class AgentLoop:
             )
         )
 
+    async def _fail_non_interactive_human_input(self, ctx: _RunContext, *, kind: str, interaction_id: str) -> None:
+        """无人值守运行不能等待人工输入，必须立即失败，避免后台 worker 卡死。"""
+        message = "定时任务为无人值守运行，不能请求人工输入。"
+        ctx.session.status = SessionStatus.FAILED
+        ctx.session.metadata["non_interactive_error"] = message
+        ctx.session.updated_at = utc_now_iso()
+        await ctx.runtime.event_bus.publish_stream_event(
+            StreamEvent(
+                event_type="error",
+                session_id=ctx.session.session_id,
+                created_at=utc_now_iso(),
+                data={
+                    **self._agent_event_data(ctx.agent_state),
+                    "message": message,
+                    "kind": kind,
+                    "interaction_id": interaction_id,
+                },
+            )
+        )
+
     async def _handle_pending_question(
         self,
         ctx: _RunContext,
@@ -435,8 +481,22 @@ class AgentLoop:
         if resume_batch is not None and resume_batch.items:
             batch = await self._resume_tool_batch(ctx, resume_batch)
             if batch.pending_approval:
+                if not ctx.allow_human_interaction:
+                    await self._fail_non_interactive_human_input(
+                        ctx,
+                        kind="approval",
+                        interaction_id=batch.pending_approval.request.approval_id,
+                    )
+                    return False
                 return await self._handle_pending_approval(ctx, batch.pending_approval, iteration, resume_batch=batch.resume_batch)
             if batch.pending_question:
+                if not ctx.allow_human_interaction:
+                    await self._fail_non_interactive_human_input(
+                        ctx,
+                        kind="question",
+                        interaction_id=batch.pending_question.request.question_id,
+                    )
+                    return False
                 return await self._handle_pending_question(ctx, batch.pending_question, iteration, batch.resume_batch)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
@@ -554,6 +614,13 @@ class AgentLoop:
             metadata={"iteration": iteration},
         )
         if loop_after.requires_human_input and loop_after.human_request:
+            if not ctx.allow_human_interaction:
+                await self._fail_non_interactive_human_input(
+                    ctx,
+                    kind="approval",
+                    interaction_id=loop_after.human_request.approval_id,
+                )
+                return False
             result = await self._wait_for_approval(
                 ctx,
                 PendingApproval(request=loop_after.human_request, source="hook"),

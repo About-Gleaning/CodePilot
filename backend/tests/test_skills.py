@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from codepilot.session.agents import build_agent_profiles
 from codepilot.session.state import AgentState, LLMState, SessionState, SessionStatus
-from codepilot.session.system_prompt import _build_current_time_context, build_system_prompt
+from codepilot.session.system_prompt import build_runtime_context_prompt, build_system_prompt
 from codepilot.skills import SkillRegistry
 from codepilot.utils import utc_now_iso
 
@@ -95,29 +95,53 @@ def test_system_prompt_reports_empty_skills(tmp_path: Path) -> None:
     assert "当前没有可用 skills" in prompt
 
 
-def test_system_prompt_injects_explicit_time_context_without_model_inference(tmp_path: Path) -> None:
+def test_system_prompt_does_not_include_dynamic_time_context(tmp_path: Path) -> None:
+    session = build_session(tmp_path)
+    workspace = SimpleNamespace(workspace_path=tmp_path)
+    agent_state = AgentState(name="build", role="build")
+    llm_state = LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096)
+
     prompt = build_system_prompt(
-        session=build_session(tmp_path),
-        workspace=SimpleNamespace(workspace_path=tmp_path),
-        agent_state=AgentState(name="build", role="build"),
+        session=session,
+        workspace=workspace,
+        agent_state=agent_state,
         agent_profile=build_agent_profiles(max_iterations=3)["build"],
-        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+        llm_state=llm_state,
+        skill_registry=None,
+    )
+    same_prompt = build_system_prompt(
+        session=session,
+        workspace=workspace,
+        agent_state=agent_state,
+        agent_profile=build_agent_profiles(max_iterations=3)["build"],
+        llm_state=llm_state,
         skill_registry=None,
     )
 
-    assert "- 当前本地完整时间：" in prompt
-    assert "- 当前本地星期：" not in prompt
-    assert "- 当前时间：" not in prompt
+    assert prompt == same_prompt
+    assert "当前本地完整时间" not in prompt
+    assert "current_time:" not in prompt
 
 
-def test_build_current_time_context_formats_local_date_weekday_and_utc_offset() -> None:
+def test_runtime_context_prompt_formats_current_time_and_environment(tmp_path: Path) -> None:
     now = datetime(2026, 6, 5, 17, 11, 32, tzinfo=timezone(timedelta(hours=8), "CST"))
 
-    lines = _build_current_time_context(now)
+    prompt = build_runtime_context_prompt(
+        session=build_session(tmp_path),
+        workspace=SimpleNamespace(workspace_path=tmp_path),
+        agent_state=AgentState(name="build", role="build"),
+        llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+        now=now,
+    )
 
-    assert lines == [
-        "- 当前本地完整时间：2026-06-05 星期五 17:11:32（CST，UTC+08:00）",
-    ]
+    assert "<runtime_context>" in prompt
+    assert "current_time: 2026-06-05 星期五 17:11:32" in prompt
+    assert "timezone: CST" in prompt
+    assert "utc_offset: UTC+08:00" in prompt
+    assert f"workspace: {tmp_path}" in prompt
+    assert "agent: build" in prompt
+    assert "model: openai/gpt-5.3-codex" in prompt
+    assert "session_id: session_1" in prompt
 
 
 def build_session(workspace_path: Path) -> SessionState:

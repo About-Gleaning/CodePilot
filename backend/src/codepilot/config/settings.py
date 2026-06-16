@@ -99,6 +99,9 @@ class LLMSettings(BaseModel):
     providers: dict[str, LLMProviderSettings] = Field(default_factory=dict)
     max_tokens: int = 4096
     stream: bool = True
+    log_requests: bool = False
+    title_provider: str = "qwen"
+    title_model: str = "qwen3.5-flash"
 
 
 class AgentSettings(BaseModel):
