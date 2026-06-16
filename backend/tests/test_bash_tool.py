@@ -108,6 +108,19 @@ def test_cwd_not_found_does_not_request_approval(tmp_path: Path) -> None:
     assert result.result["error_type"] == "BashCwdNotFound"
 
 
+def test_unclosed_quote_preflight_returns_structured_error(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
+
+    result = asyncio.run(tool.preflight({"command": "echo 'abc"}, build_context(tmp_path)))
+
+    assert result.status == "blocked"
+    assert result.result is not None
+    assert result.result["status"] == "error"
+    assert result.result["error_type"] == "BashCommandParseError"
+    assert result.result["error_message"] == "No closing quotation"
+    assert result.result["recoverable"] is True
+
+
 def test_cwd_outside_workspace_is_rejected(tmp_path: Path) -> None:
     tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
 
@@ -390,3 +403,40 @@ def test_dispatcher_returns_blocked_preflight_result(tmp_path: Path) -> None:
     assert part.state.input == {"command": "rm -rf x"}
     assert part.state.output["status"] == "blocked"
     assert part.state.output["error_type"] == "BashCommandBlocked"
+
+
+def test_dispatcher_returns_preflight_parse_error_and_emits_failed_event(tmp_path: Path) -> None:
+    async def run_case() -> tuple[Any, list[Any]]:
+        registry = ToolRegistry()
+        registry.register(BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5))
+        dispatcher = ToolDispatcher(registry, HookManager())
+        session = SimpleNamespace(session_id="session_1", messages=[])
+        workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
+        agent = SimpleNamespace(name="build")
+        event_bus = EventBus()
+        stream_events: list[Any] = []
+        event_bus.subscribe_stream(stream_events.append)
+
+        batch = await dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            tool_calls=[{"tool_call_id": "call_1", "tool_name": "bash_tool", "arguments": {"command": "echo 'abc"}}],
+            runtime=RuntimeHandles(event_bus=event_bus),
+            config=SimpleNamespace(),
+        )
+        return batch, stream_events
+
+    batch, stream_events = asyncio.run(run_case())
+
+    assert batch.pending_approval is None
+    assert batch.pending_question is None
+    assert len(batch.tool_parts) == 1
+    part = batch.tool_parts[0]
+    assert part.state.status == "error"
+    assert part.state.error is not None
+    assert part.state.error.code == "BashCommandParseError"
+    assert part.state.output["error_message"] == "No closing quotation"
+    failed_events = [event for event in stream_events if event.event_type == "tool_call_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0].data["result"]["error_type"] == "BashCommandParseError"

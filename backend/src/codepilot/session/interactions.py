@@ -8,6 +8,7 @@ from typing import Any
 from codepilot.events import HumanInteractionEvent, MessageCreatedEvent, SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookResult, RuntimeHandles
 from codepilot.session.message import Message, TextPart, ToolPart, build_user_message_info
+from codepilot.session.message_ops import merge_declined_question_result, merge_rejected_tool_result
 from codepilot.session.state import (
     AgentState,
     ApprovalRequest,
@@ -96,6 +97,11 @@ class ApprovalCoordinator:
         if result is None:
             return None
 
+        resume_item = approval.resume_item or {}
+        tool_output = None
+        if not result.approved:
+            tool_output = merge_rejected_tool_result(session, approval, result)
+
         await runtime.event_bus.publish_domain_event(
             HumanInteractionEvent(
                 session_id=session.session_id,
@@ -105,7 +111,10 @@ class ApprovalCoordinator:
                     "kind": "approval",
                     "status": "approved" if result.approved else "rejected",
                     "interaction_id": result.approval_id,
+                    "message_id": find_tool_message_id(session, resume_item.get("tool_call_id")),
+                    "call_id": resume_item.get("tool_call_id"),
                     "result": result.model_dump(),
+                    "tool_output": tool_output,
                 },
             )
         )
@@ -204,6 +213,7 @@ class QuestionCoordinator:
             )
         )
         if result.declined:
+            merge_declined_question_result(session, question, result)
             await self.message_appender.append(
                 session,
                 self._build_question_decline_message(session, agent_state, question, result),

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from codepilot.events import EventBus, HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
+from codepilot.llm.client import LiteLLMClient
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
 from codepilot.session.message import StepFinishPart, ToolPartState
@@ -46,6 +47,32 @@ def build_question_message(session_id: str, message_id: str) -> Message:
                 call_id="call_question_1",
                 tool="question",
                 state=ToolPartState(status="pending", input={"questions": []}),
+            ),
+            StepFinishPart(reason="tool_pending"),
+        ],
+    )
+    message.info.finish = "tool_pending"
+    return message
+
+
+def build_approval_message(session_id: str, message_id: str) -> Message:
+    message = Message(
+        info=build_assistant_message_info(
+            message_id=message_id,
+            session_id=session_id,
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd="/tmp/codepilot",
+            root="/tmp/codepilot",
+        ),
+        parts=[
+            ToolPart(
+                call_id="call_approval_1",
+                tool="bash_tool",
+                state=ToolPartState(status="pending", input={"command": "rm -rf x"}),
             ),
             StepFinishPart(reason="tool_pending"),
         ],
@@ -294,6 +321,113 @@ def test_human_interaction_question_resolved_completes_pending_tool_on_replay(tm
         assert tool_part["state"]["output"]["answers"]["target"]["values"] == ["backend"]
         assert replayed_message["parts"][1]["reason"] == "tool_completed"
         assert replayed_message["info"]["finish"] == "tool_completed"
+
+    asyncio.run(run_case())
+
+
+def test_human_interaction_approval_rejected_closes_pending_tool_on_replay(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.CANCELLED)
+        message = build_approval_message(session.session_id, "msg_approval_1")
+
+        await persist_session(memory, session, [message])
+        await memory.handle_domain_event(
+            HumanInteractionEvent(
+                session_id=session.session_id,
+                interaction_id="approval_tool_call_1",
+                created_at="2026-05-29T10:04:00Z",
+                data={
+                    "kind": "approval",
+                    "status": "rejected",
+                    "interaction_id": "approval_tool_call_1",
+                    "message_id": "msg_approval_1",
+                    "call_id": "call_approval_1",
+                    "result": {
+                        "approval_id": "approval_tool_call_1",
+                        "approved": False,
+                        "comment": "拒绝执行",
+                        "created_at": "2026-05-29T10:04:00Z",
+                    },
+                    "tool_output": {
+                        "status": "error",
+                        "tool_name": "bash_tool",
+                        "error_type": "ToolApprovalRejected",
+                        "error_message": "用户拒绝执行该工具调用：拒绝执行",
+                        "recoverable": True,
+                        "approval_id": "approval_tool_call_1",
+                        "approved": False,
+                        "comment": "拒绝执行",
+                    },
+                },
+            )
+        )
+
+        replay = await memory.replay(session.session_id)
+
+        replayed_message = replay["messages"][0]
+        tool_part = replayed_message["parts"][0]
+        assert tool_part["state"]["status"] == "error"
+        assert tool_part["state"]["error"]["code"] == "ToolApprovalRejected"
+        assert tool_part["state"]["output"]["error_type"] == "ToolApprovalRejected"
+        assert replayed_message["parts"][1]["reason"] == "tool_completed"
+        assert replayed_message["info"]["finish"] == "tool_completed"
+
+        LiteLLMClient().build_provider_messages([Message.model_validate(replayed_message)])
+
+    asyncio.run(run_case())
+
+
+def test_human_interaction_question_declined_closes_pending_tool_on_replay(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.COMPLETED)
+        message = build_question_message(session.session_id, "msg_question_1")
+
+        await persist_session(memory, session, [message])
+        await memory.handle_domain_event(
+            HumanInteractionEvent(
+                session_id=session.session_id,
+                interaction_id="question_1",
+                created_at="2026-05-29T10:05:00Z",
+                data={
+                    "kind": "question",
+                    "status": "declined",
+                    "interaction_id": "question_1",
+                    "message_id": "msg_question_1",
+                    "call_id": "call_question_1",
+                    "result": {
+                        "question_id": "question_1",
+                        "answers": {},
+                        "declined": True,
+                        "comment": "退出",
+                        "created_at": "2026-05-29T10:05:00Z",
+                    },
+                    "tool_output": {
+                        "status": "error",
+                        "tool_name": "question",
+                        "error_type": "QuestionDeclined",
+                        "error_message": "用户拒绝回答 question 工具提出的问题：退出",
+                        "recoverable": True,
+                        "question_id": "question_1",
+                        "declined": True,
+                        "comment": "退出",
+                    },
+                },
+            )
+        )
+
+        replay = await memory.replay(session.session_id)
+
+        replayed_message = replay["messages"][0]
+        tool_part = replayed_message["parts"][0]
+        assert tool_part["state"]["status"] == "error"
+        assert tool_part["state"]["error"]["code"] == "QuestionDeclined"
+        assert tool_part["state"]["output"]["error_type"] == "QuestionDeclined"
+        assert replayed_message["parts"][1]["reason"] == "tool_completed"
+        assert replayed_message["info"]["finish"] == "tool_completed"
+
+        LiteLLMClient().build_provider_messages([Message.model_validate(replayed_message)])
 
     asyncio.run(run_case())
 

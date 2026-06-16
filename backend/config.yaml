@@ -63,6 +63,9 @@ llm:
       litellm_model_prefix: "openai/"
   max_tokens: 4096
   stream: true
+  log_requests: true
+  title_provider: "qwen"
+  title_model: "qwen3.5-flash"
 agent:
   default_agent_name: "life"
   max_loop_iterations: 200
@@ -81,8 +84,8 @@ context:
       enabled: true
       summary_max_tokens: 2048
     tool_result_placeholder:
-      enabled: true
-      keep_latest_tool_results: 5
+      enabled: true 
+      keep_latest_tool_results: 7
 tools:
   default_timeout_seconds: 120
   default_can_parallel: false

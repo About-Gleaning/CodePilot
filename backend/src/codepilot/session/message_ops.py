@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from codepilot.session.message import AssistantMessageInfo, Message, ToolPart, ToolPartState
-from codepilot.session.state import PendingQuestion, QuestionResult, SessionState
+from codepilot.session.message import AssistantMessageError, AssistantMessageInfo, Message, ToolPart, ToolPartState
+from codepilot.session.state import ApprovalResult, PendingApproval, PendingQuestion, QuestionResult, SessionState
 from codepilot.utils import utc_now_millis
 
 
@@ -63,8 +63,103 @@ def merge_question_result(session: SessionState, question: PendingQuestion, resu
             return
 
 
+def merge_declined_question_result(session: SessionState, question: PendingQuestion, result: QuestionResult) -> dict[str, Any] | None:
+    """把用户拒答作为 question 工具错误回填，避免下一轮上下文留下 pending 工具调用。"""
+    if question.resume_item is None:
+        return None
+    latest_message = _latest_assistant_message(session)
+    if latest_message is None:
+        return None
+
+    call_id = question.resume_item.get("tool_call_id")
+    output = build_question_tool_output(question, result)
+    for index, part in enumerate(latest_message.parts):
+        if isinstance(part, ToolPart) and part.call_id == call_id:
+            latest_message.parts[index] = ToolPart(
+                call_id=part.call_id,
+                tool=part.tool,
+                state=ToolPartState(
+                    status="error",
+                    input=part.state.input,
+                    raw=part.state.raw,
+                    output=output,
+                    error=AssistantMessageError(
+                        code="QuestionDeclined",
+                        message=str(output["error_message"]),
+                    ),
+                    time=part.state.time,
+                    attachments=part.state.attachments,
+                ),
+            )
+            _mark_assistant_tool_completed(latest_message)
+            return output
+    return None
+
+
+def merge_rejected_tool_result(session: SessionState, approval: PendingApproval, result: ApprovalResult) -> dict[str, Any] | None:
+    """把人工拒绝作为工具错误回填，确保后续 LLM 上下文满足工具调用闭环协议。"""
+    if approval.resume_item is None:
+        return None
+    latest_message = _latest_assistant_message(session)
+    if latest_message is None:
+        return None
+
+    call_id = approval.resume_item.get("tool_call_id")
+    output = build_rejected_tool_output(approval, result)
+    for index, part in enumerate(latest_message.parts):
+        if isinstance(part, ToolPart) and part.call_id == call_id:
+            latest_message.parts[index] = ToolPart(
+                call_id=part.call_id,
+                tool=part.tool,
+                state=ToolPartState(
+                    status="error",
+                    input=part.state.input,
+                    raw=part.state.raw,
+                    output=output,
+                    error=AssistantMessageError(
+                        code="ToolApprovalRejected",
+                        message=str(output["error_message"]),
+                    ),
+                    time=part.state.time,
+                    attachments=part.state.attachments,
+                ),
+            )
+            _mark_assistant_tool_completed(latest_message)
+            return output
+    return None
+
+
+def build_rejected_tool_output(approval: PendingApproval, result: ApprovalResult) -> dict[str, Any]:
+    """生成可发给模型的审批拒绝工具结果，保留用户备注用于下一轮决策。"""
+    resume_item = approval.resume_item or {}
+    tool_name = str(resume_item.get("tool_name") or approval.request.action.get("tool_name") or "unknown")
+    comment = (result.comment or "未提供备注").strip()
+    return {
+        "status": "error",
+        "tool_name": tool_name,
+        "error_type": "ToolApprovalRejected",
+        "error_message": f"用户拒绝执行该工具调用：{comment}",
+        "recoverable": True,
+        "approval_id": result.approval_id,
+        "approved": False,
+        "comment": result.comment,
+    }
+
+
 def build_question_tool_output(question: PendingQuestion, result: QuestionResult) -> dict[str, Any]:
     """统一生成 question 工具结果，供内存合并和 JSONL 回放共用。"""
+    if result.declined:
+        comment = (result.comment or "未提供备注").strip()
+        return {
+            "status": "error",
+            "tool_name": "question",
+            "error_type": "QuestionDeclined",
+            "error_message": f"用户拒绝回答 question 工具提出的问题：{comment}",
+            "recoverable": True,
+            "question_id": result.question_id,
+            "declined": True,
+            "comment": result.comment,
+        }
     return {
         "status": "ok",
         "tool_name": "question",

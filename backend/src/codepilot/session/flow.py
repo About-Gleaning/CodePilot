@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 from codepilot.context import ContextCompressionError, ContextCompressor
@@ -40,7 +41,7 @@ from codepilot.session.state import (
     SessionState,
     SessionStatus,
 )
-from codepilot.session.system_prompt import build_system_prompt
+from codepilot.session.system_prompt import build_runtime_context_prompt, build_system_prompt
 from codepilot.tools.dispatcher import ToolDispatcher, ToolResumeBatch
 from codepilot.tools.registry import ToolRegistry
 from codepilot.utils import new_message_id, utc_now_iso, utc_now_millis
@@ -273,9 +274,17 @@ class TurnExecutor:
             llm_state=llm_state,
             skill_registry=self.skill_registry,
         )
+        context_messages = self._messages_for_context(session, agent_state.context_id)
         provider_messages = self.llm_client.build_provider_messages(
-            self._messages_for_context(session, agent_state.context_id),
+            context_messages,
             system_prompt=system_prompt,
+            runtime_context=build_runtime_context_prompt(
+                session=session,
+                workspace=workspace,
+                agent_state=agent_state,
+                llm_state=llm_state,
+                now=_latest_user_message_datetime(context_messages),
+            ),
         )
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
@@ -709,6 +718,14 @@ class TurnExecutor:
                 data={**self._agent_event_data(agent_state_from_message(assistant_message)), "message": assistant_message.model_dump()},
             )
         )
+
+
+def _latest_user_message_datetime(messages: list[Message]) -> datetime | None:
+    """同一用户输入触发的多轮请求复用用户提交时刻，避免秒级 now 打断缓存前缀。"""
+    for message in reversed(messages):
+        if message.info.role == "user":
+            return datetime.fromtimestamp(message.info.time.created / 1000).astimezone()
+    return None
 
 
 def agent_state_from_message(message: Message) -> AgentState:

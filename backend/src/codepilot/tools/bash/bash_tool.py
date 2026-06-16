@@ -73,7 +73,14 @@ class BashTool(BaseTool):
                     "recoverable": True,
                 },
             )
-        decision = self._decide(request, context)
+        try:
+            decision = self._decide(request, context)
+        except ValueError as exc:
+            return ToolPreflightResult(
+                status="blocked",
+                reason=str(exc),
+                result=self._parse_error_result(request, exc),
+            )
         if decision.status == "allow":
             return ToolPreflightResult(status="allow")
         if decision.status == "requires_approval":
@@ -115,7 +122,10 @@ class BashTool(BaseTool):
                 "error_message": str(exc),
                 "recoverable": True,
             }
-        decision = self._decide(request, context, skip_approval=True)
+        try:
+            decision = self._decide(request, context, skip_approval=True)
+        except ValueError as exc:
+            return self._parse_error_result(request, exc)
         if decision.status == "blocked":
             return {
                 "status": "blocked",
@@ -148,6 +158,17 @@ class BashTool(BaseTool):
         if skip_approval and decision.status == "requires_approval":
             return decision.__class__(status="allow", reason="审批已通过。")
         return decision
+
+    def _parse_error_result(self, request: BashRequest, exc: ValueError) -> dict[str, Any]:
+        return {
+            "status": "error",
+            "tool_name": self.spec.name,
+            "command": request.command,
+            "cwd": request.cwd,
+            "error_type": "BashCommandParseError",
+            "error_message": str(exc),
+            "recoverable": True,
+        }
 
     def _is_readonly_agent(self, context: ToolExecutionContext) -> bool:
         return bool(getattr(context.agent, "readonly", getattr(context.agent, "name", None) in {"plan", "explore"}))

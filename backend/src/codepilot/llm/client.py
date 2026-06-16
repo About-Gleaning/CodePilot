@@ -15,6 +15,7 @@ from codepilot.session.message import AssistantMessageTokens, MessageTokenCache
 from codepilot.utils import utc_now_iso
 
 TOOL_RESULT_PLACEHOLDER = "[Old tool result content cleared]"
+_SENSITIVE_KEYS = {"api_key", "token", "password", "authorization", "cookie", "secret"}
 
 
 @dataclass(slots=True)
@@ -27,7 +28,8 @@ class LiteLLMStreamResult:
 
 
 class LiteLLMClient:
-    def __init__(self) -> None:
+    def __init__(self, *, log_requests: bool = False) -> None:
+        self._log_requests = log_requests
         self._logger = get_logger("codepilot.llm")
 
     async def stream_chat(
@@ -42,15 +44,13 @@ class LiteLLMClient:
         reasoning_parts: list[str] = []
         tool_call_map: dict[int, dict[str, Any]] = defaultdict(lambda: {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
 
-        stream = await acompletion(
-            model=self._resolve_model_name(llm_state),
-            messages=provider_messages,
-            stream=True,
-            tools=tools or None,
-            max_tokens=llm_state.max_tokens,
-            stream_options={"include_usage": True},
-            **self._build_provider_kwargs(llm_state),
+        request = self._build_stream_request(
+            llm_state=llm_state,
+            provider_messages=provider_messages,
+            tools=tools,
         )
+        self._log_request_if_enabled(endpoint="stream_chat", request=request)
+        stream = await acompletion(**request)
 
         tokens: AssistantMessageTokens | None = None
         agent_event_data = self._agent_event_data(session)
@@ -118,13 +118,13 @@ class LiteLLMClient:
         messages: list[dict[str, Any]],
         max_tokens: int,
     ) -> str:
-        response = await acompletion(
-            model=self._resolve_model_name(llm_state),
+        request = self._build_text_request(
+            llm_state=llm_state,
             messages=messages,
-            stream=False,
             max_tokens=max_tokens,
-            **self._build_provider_kwargs(llm_state),
         )
+        self._log_request_if_enabled(endpoint="complete_text", request=request)
+        response = await acompletion(**request)
         payload = response.model_dump() if hasattr(response, "model_dump") else dict(response)
         choices = payload.get("choices") or []
         if not choices:
@@ -132,10 +132,16 @@ class LiteLLMClient:
         message = choices[0].get("message") or {}
         return str(message.get("content") or "")
 
-    def build_provider_messages(self, messages: list[Message], system_prompt: str | None = None) -> list[dict[str, Any]]:
+    def build_provider_messages(
+        self,
+        messages: list[Message],
+        system_prompt: str | None = None,
+        runtime_context: str | None = None,
+    ) -> list[dict[str, Any]]:
         provider_messages: list[dict[str, Any]] = []
         if system_prompt:
             provider_messages.append({"role": "system", "content": system_prompt})
+        runtime_context_user_index = self._latest_user_message_index(messages) if runtime_context else None
         for message in messages:
             role = message.info.role
             content = message.text_content()
@@ -154,12 +160,74 @@ class LiteLLMClient:
                 )
                 provider_messages.extend(self._build_provider_tool_results(completed_tool_parts))
                 continue
+            if runtime_context_user_index is not None and message is messages[runtime_context_user_index]:
+                content = self._wrap_user_request_with_runtime_context(content, runtime_context or "")
             provider_messages.append({"role": role, "content": content})
         return provider_messages
+
+    def _latest_user_message_index(self, messages: list[Message]) -> int | None:
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index].info.role == "user":
+                return index
+        return None
+
+    def _wrap_user_request_with_runtime_context(self, content: str, runtime_context: str) -> str:
+        return f"{runtime_context.strip()}\n\n<user_request>\n{content}\n</user_request>"
 
     def _resolve_model_name(self, llm_state: LLMState) -> str:
         prefix = llm_state.metadata.get("litellm_model_prefix", "")
         return f"{prefix}{llm_state.model}"
+
+    def _build_stream_request(
+        self,
+        *,
+        llm_state: LLMState,
+        provider_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        return {
+            "model": self._resolve_model_name(llm_state),
+            "messages": provider_messages,
+            "stream": True,
+            "tools": tools or None,
+            "max_tokens": llm_state.max_tokens,
+            "stream_options": {"include_usage": True},
+            **self._build_provider_kwargs(llm_state),
+        }
+
+    def _build_text_request(
+        self,
+        *,
+        llm_state: LLMState,
+        messages: list[dict[str, Any]],
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        return {
+            "model": self._resolve_model_name(llm_state),
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_tokens,
+            **self._build_provider_kwargs(llm_state),
+        }
+
+    def _log_request_if_enabled(self, *, endpoint: str, request: dict[str, Any]) -> None:
+        if not self._log_requests:
+            return
+        # 请求体包含用户上下文和供应商参数，日志保留业务字段但必须递归脱敏凭证。
+        self._logger.info("llm api request", endpoint=endpoint, request=self._redact_request(request))
+
+    def _redact_request(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                if key.lower() in _SENSITIVE_KEYS and item is not None:
+                    redacted[key] = "***REDACTED***"
+                    continue
+                redacted[key] = self._redact_request(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_request(item) for item in value]
+        return value
 
     def _build_provider_kwargs(self, llm_state: LLMState) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}

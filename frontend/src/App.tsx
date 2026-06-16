@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
+import { FormEvent, RefObject, useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
@@ -261,6 +261,8 @@ const KEY_EVENT_TYPES = new Set([
   'error',
 ]);
 
+const PENDING_TOOL_MESSAGE_PREFIX = 'pending-tools:';
+
 function formatDateTimeLocal(date: Date): string {
   const pad = (value: number) => String(value).padStart(2, '0');
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
@@ -321,6 +323,7 @@ function buildScheduleTrigger(form: ScheduleFormState): ScheduleTrigger {
 type MessageRecord = {
   info?: {
     id?: string;
+    session_id?: string;
     role?: string;
     time?: {
       created?: number;
@@ -373,6 +376,12 @@ type ToolState = Record<string, unknown> & {
   error?: Record<string, unknown> | null;
 };
 
+type TodoItem = {
+  content: string;
+  status: 'pending' | 'in_progress' | 'completed';
+  priority: 'low' | 'medium' | 'high';
+};
+
 type EventTone = 'neutral' | 'running' | 'ok' | 'warn' | 'danger';
 
 type EventViewModel = {
@@ -393,6 +402,100 @@ type EventStats = {
 };
 
 type MobileTab = 'messages' | 'events' | 'history' | 'action';
+
+type AutoScrollState = {
+  anchorRef: RefObject<HTMLDivElement>;
+  isAtBottom: boolean;
+  scrollToBottom: () => void;
+};
+
+const AUTO_SCROLL_BOTTOM_THRESHOLD = 96;
+
+function useAutoScroll(signal: string, scrollRootRef?: RefObject<HTMLElement | null>): AutoScrollState {
+  const anchorRef = useRef<HTMLDivElement | null>(null);
+  const shouldFollowRef = useRef(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+
+  const getScrollRoot = () => scrollRootRef?.current || anchorRef.current;
+
+  const readIsAtBottom = (root: HTMLElement) => {
+    return root.scrollHeight - root.scrollTop - root.clientHeight <= AUTO_SCROLL_BOTTOM_THRESHOLD;
+  };
+
+  const scrollToBottom = () => {
+    const root = getScrollRoot();
+    if (!root) {
+      return;
+    }
+    shouldFollowRef.current = true;
+    root.scrollTo({ top: root.scrollHeight, behavior: 'smooth' });
+    setIsAtBottom(true);
+  };
+
+  useEffect(() => {
+    const root = getScrollRoot();
+    if (!root) {
+      return;
+    }
+    const handleScroll = () => {
+      const nextIsAtBottom = readIsAtBottom(root);
+      shouldFollowRef.current = nextIsAtBottom;
+      setIsAtBottom(nextIsAtBottom);
+    };
+    handleScroll();
+    root.addEventListener('scroll', handleScroll, { passive: true });
+    return () => root.removeEventListener('scroll', handleScroll);
+  }, [scrollRootRef]);
+
+  useEffect(() => {
+    const root = getScrollRoot();
+    if (!root || !shouldFollowRef.current) {
+      return;
+    }
+    // 流式 token 会高频更新，使用 rAF 合并到浏览器布局周期，减少滚动抖动。
+    window.requestAnimationFrame(() => {
+      root.scrollTo({ top: root.scrollHeight, behavior: 'auto' });
+      setIsAtBottom(true);
+    });
+  }, [signal]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.key !== 'End') {
+        return;
+      }
+      const target = event.target as HTMLElement | null;
+      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
+        return;
+      }
+      event.preventDefault();
+      scrollToBottom();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  return { anchorRef, isAtBottom, scrollToBottom };
+}
+
+function buildMessageStreamSignal(
+  messages: MessageRecord[],
+  liveDelta: string,
+  liveReasoningDelta: string,
+  subagentLiveDeltas: Record<string, string>,
+  subagentLiveReasoningDeltas: Record<string, string>,
+) {
+  const subagentDeltaLength = Object.values(subagentLiveDeltas).reduce((total, text) => total + text.length, 0);
+  const subagentReasoningLength = Object.values(subagentLiveReasoningDeltas).reduce((total, text) => total + text.length, 0);
+  return [
+    messages.length,
+    messages[messages.length - 1]?.info?.id || '',
+    liveDelta.length,
+    liveReasoningDelta.length,
+    subagentDeltaLength,
+    subagentReasoningLength,
+  ].join(':');
+}
 
 type MobileConsoleProps = {
   config: ConfigResponse | null;
@@ -436,6 +539,7 @@ type MobileConsoleProps = {
   onModelChange: (nextValue: string) => void;
   onThinkingChange: (nextValue: string) => void;
   onTaskChange: (nextValue: string) => void;
+  onTaskKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   onStart: (event: FormEvent<HTMLFormElement>) => void;
   onStop: () => void;
   onNewTask: () => void;
@@ -495,6 +599,8 @@ function App() {
   const questionOptionsRef = useRef<HTMLDivElement | null>(null);
   const questionNoteRef = useRef<HTMLTextAreaElement | null>(null);
   const hasActiveScheduleRuns = scheduleRuns.active.length > 0;
+  const messageStreamSignal = buildMessageStreamSignal(messages, liveDelta, liveReasoningDelta, subagentLiveDeltas, subagentLiveReasoningDeltas);
+  const desktopScroll = useAutoScroll(messageStreamSignal);
 
   useEffect(() => {
     void bootstrap();
@@ -696,6 +802,9 @@ function App() {
         setLiveReasoningDelta((prev) => prev + text);
       }
     }
+    if (event.event_type === 'tool_call_started') {
+      setMessages((prev) => upsertRunningToolMessage(prev, event));
+    }
     if (event.event_type === 'assistant_message_completed') {
       if (event.data.message && typeof event.data.message === 'object') {
         const message = event.data.message as MessageRecord;
@@ -715,7 +824,7 @@ function App() {
           setLiveDelta('');
           setLiveReasoningDelta('');
         }
-        setMessages((prev) => upsertMessage(prev, message));
+        setMessages((prev) => upsertMessage(removePendingToolMessagesForAssistant(prev, message), message));
       }
     }
     if (event.event_type === 'user_message_created') {
@@ -925,9 +1034,11 @@ function App() {
     setThinkingValue(resolveNextThinkingValue(findProviderOption(provider), nextModel, thinkingValue));
   }
 
-  async function handleStart(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function submitTask() {
     setFormError('');
+    if (!task.trim()) {
+      return;
+    }
     if (!provider) {
       setFormError('请先选择 provider');
       return;
@@ -960,6 +1071,19 @@ function App() {
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '提交任务失败');
     }
+  }
+
+  function handleStart(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    void submitTask();
+  }
+
+  function handleTaskKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (event.key !== 'Enter' || event.shiftKey) {
+      return;
+    }
+    event.preventDefault();
+    void submitTask();
   }
 
   function handleNewTask() {
@@ -1280,6 +1404,7 @@ function App() {
         onModelChange={handleModelChange}
         onThinkingChange={setThinkingValue}
         onTaskChange={setTask}
+        onTaskKeyDown={handleTaskKeyDown}
         onStart={handleStart}
         onStop={handleStop}
         onNewTask={handleNewTask}
@@ -1368,9 +1493,7 @@ function App() {
       <main className="terminal-stage">
         <header className="stage-header">
           <div>
-            <span className="eyebrow">interactive session</span>
             <h2>消息流</h2>
-            <p className="stage-subtitle">实时观察 Agent 输出、工具执行和人工审批状态。</p>
           </div>
         </header>
 
@@ -1381,45 +1504,20 @@ function App() {
           </section>
         ) : null}
 
-        <section className="message-viewport" aria-label="会话消息">
-          {messages.length === 0 && !liveDelta && !liveReasoningDelta ? (
-            <div className="empty-state">
-              <Sparkles size={20} />
-              <p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p>
-            </div>
+        <div className="message-scroll-shell">
+          <section className="message-viewport" aria-label="会话消息" ref={desktopScroll.anchorRef}>
+            <MessageStream
+              messages={messages}
+              liveDelta={liveDelta}
+              liveReasoningDelta={liveReasoningDelta}
+              subagentLiveDeltas={subagentLiveDeltas}
+              subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
+            />
+          </section>
+          {!desktopScroll.isAtBottom ? (
+            <ScrollToBottomButton className="message-scroll-button" onClick={desktopScroll.scrollToBottom} />
           ) : null}
-
-          {messages.map((message, index) => (
-            <MessageItem key={String(message.info?.id || index)} message={message} index={index} />
-          ))}
-
-          {liveDelta || liveReasoningDelta ? (
-            <article className="message-card assistant streaming-card">
-              <div className="message-meta">
-                <span className="role-badge assistant">
-                  <Bot size={13} />
-                  assistant
-                </span>
-                <span className="muted-inline">streaming</span>
-              </div>
-              <LiveReasoningBlock text={liveReasoningDelta} />
-              {liveDelta ? <MarkdownContent className="message-live-text" text={liveDelta} /> : null}
-            </article>
-          ) : null}
-          {Array.from(new Set([...Object.keys(subagentLiveDeltas), ...Object.keys(subagentLiveReasoningDeltas)])).map((key) => (
-            <article className="message-card assistant streaming-card subagent-card" key={key}>
-              <div className="message-meta">
-                <span className="role-badge assistant">
-                  <Bot size={13} />
-                  subagent
-                </span>
-                <span className="muted-inline">{key}</span>
-              </div>
-              <LiveReasoningBlock text={subagentLiveReasoningDeltas[key] || ''} />
-              {subagentLiveDeltas[key] ? <MarkdownContent className="message-live-text" text={subagentLiveDeltas[key]} /> : null}
-            </article>
-          ))}
-        </section>
+        </div>
 
         <form className={`composer ${approvalRequest || questionRequest ? 'has-approval' : ''}`} onSubmit={handleStart}>
           <div className="composer-config">
@@ -1569,6 +1667,7 @@ function App() {
               placeholder="输入任务。若要触发人工审批，可在文本中加入 [[approve]]。"
               value={task}
               onChange={(e) => setTask(e.target.value)}
+              onKeyDown={handleTaskKeyDown}
             />
           )}
 
@@ -1908,7 +2007,16 @@ function PanelTitle({ icon, title, badge, action }: { icon: React.ReactNode; tit
 function MobileConsole(props: MobileConsoleProps) {
   const [activeTab, setActiveTab] = useState<MobileTab>('messages');
   const [isConfigOpen, setIsConfigOpen] = useState(false);
+  const mobileContentRef = useRef<HTMLElement | null>(null);
   const hasHumanAction = Boolean(props.approvalRequest || props.questionRequest);
+  const messageStreamSignal = buildMessageStreamSignal(
+    props.messages,
+    props.liveDelta,
+    props.liveReasoningDelta,
+    props.subagentLiveDeltas,
+    props.subagentLiveReasoningDeltas,
+  );
+  const mobileScroll = useAutoScroll(messageStreamSignal, mobileContentRef);
   const mobileTabs: Array<{ value: MobileTab; label: string; icon: React.ReactNode; count?: number }> = [
     { value: 'messages', label: '消息', icon: <MessageSquareText size={15} />, count: props.messages.length },
     { value: 'events', label: '事件', icon: <ListTree size={15} />, count: props.events.length },
@@ -1957,7 +2065,7 @@ function MobileConsole(props: MobileConsoleProps) {
         </section>
       ) : null}
 
-      <main className="mobile-content">
+      <main className="mobile-content" ref={mobileContentRef}>
         {activeTab === 'messages' ? (
           <MobileMessagePanel
             messages={props.messages}
@@ -1965,6 +2073,7 @@ function MobileConsole(props: MobileConsoleProps) {
             liveReasoningDelta={props.liveReasoningDelta}
             subagentLiveDeltas={props.subagentLiveDeltas}
             subagentLiveReasoningDeltas={props.subagentLiveReasoningDeltas}
+            anchorRef={mobileScroll.anchorRef}
           />
         ) : null}
 
@@ -2038,6 +2147,9 @@ function MobileConsole(props: MobileConsoleProps) {
               </>
             )}
           </section>
+        ) : null}
+        {activeTab === 'messages' && !mobileScroll.isAtBottom ? (
+          <ScrollToBottomButton className="message-scroll-button mobile-scroll-button" onClick={mobileScroll.scrollToBottom} />
         ) : null}
       </main>
 
@@ -2159,6 +2271,7 @@ function MobileConsole(props: MobileConsoleProps) {
                 placeholder="输入任务..."
                 value={props.task}
                 onChange={(event) => props.onTaskChange(event.target.value)}
+                onKeyDown={props.onTaskKeyDown}
               />
               <button type="submit" className="button primary mobile-send-button" title="发送" aria-label="发送">
                 <Send size={15} />
@@ -2177,6 +2290,34 @@ function MobileMessagePanel({
   liveReasoningDelta,
   subagentLiveDeltas,
   subagentLiveReasoningDeltas,
+  anchorRef,
+}: {
+  messages: MessageRecord[];
+  liveDelta: string;
+  liveReasoningDelta: string;
+  subagentLiveDeltas: Record<string, string>;
+  subagentLiveReasoningDeltas: Record<string, string>;
+  anchorRef: RefObject<HTMLDivElement>;
+}) {
+  return (
+    <section className="mobile-panel mobile-message-list" aria-label="会话消息" ref={anchorRef}>
+      <MessageStream
+        messages={messages}
+        liveDelta={liveDelta}
+        liveReasoningDelta={liveReasoningDelta}
+        subagentLiveDeltas={subagentLiveDeltas}
+        subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
+      />
+    </section>
+  );
+}
+
+function MessageStream({
+  messages,
+  liveDelta,
+  liveReasoningDelta,
+  subagentLiveDeltas,
+  subagentLiveReasoningDeltas,
 }: {
   messages: MessageRecord[];
   liveDelta: string;
@@ -2185,7 +2326,7 @@ function MobileMessagePanel({
   subagentLiveReasoningDeltas: Record<string, string>;
 }) {
   return (
-    <section className="mobile-panel mobile-message-list" aria-label="会话消息">
+    <>
       {messages.length === 0 && !liveDelta && !liveReasoningDelta ? (
         <div className="empty-state">
           <Sparkles size={20} />
@@ -2224,7 +2365,15 @@ function MobileMessagePanel({
           {subagentLiveDeltas[key] ? <MarkdownContent className="message-live-text" text={subagentLiveDeltas[key]} /> : null}
         </article>
       ))}
-    </section>
+    </>
+  );
+}
+
+function ScrollToBottomButton({ className, onClick }: { className: string; onClick: () => void }) {
+  return (
+    <button type="button" className={className} onClick={onClick} title="滚动到底部 (Alt+End)" aria-label="滚动到底部">
+      <ChevronDown size={17} />
+    </button>
   );
 }
 
@@ -2616,21 +2765,6 @@ function TokenMeter({ summary, total }: { summary: TokenSummary; total: number }
         <span>cache hit</span>
         <strong>{formatPercent(cacheHitPercent)}</strong>
       </div>
-      <div className={`token-bar ${total > 0 ? '' : 'is-empty'}`} aria-hidden="true">
-        {total > 0 ? (
-          parts.map((part) =>
-            part.value > 0 ? (
-              <span
-                className={`token-segment ${part.className}`}
-                key={part.key}
-                style={{ width: `${(part.value / total) * 100}%` }}
-              />
-            ) : null,
-          )
-        ) : (
-          <span className="token-bar-empty" />
-        )}
-      </div>
       <div className="cache-meter" aria-label={`缓存命中率 ${formatPercent(cacheHitPercent)}`}>
         <span style={{ width: `${cacheHitPercent}%` }} />
       </div>
@@ -2721,11 +2855,20 @@ function renderMessageParts(parts: MessagePart[] | undefined, isAssistant: boole
   if (!parts?.length) {
     return <p className="empty-message">（空消息）</p>;
   }
+  const reasoningParts = parts.filter((part) => part.type === 'reasoning');
+  const remainingParts = parts.filter((part) => part.type !== 'reasoning');
   const visibleParts: React.ReactNode[] = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
+  reasoningParts.forEach((part, index) => {
+    const rendered = renderPart(part, index, isAssistant);
+    if (rendered !== null) {
+      visibleParts.push(rendered);
+    }
+  });
+
+  for (let index = 0; index < remainingParts.length; index += 1) {
+    const part = remainingParts[index];
     if (part.type !== 'tool') {
-      const rendered = renderPart(part, index, isAssistant);
+      const rendered = renderPart(part, index + reasoningParts.length, isAssistant);
       if (rendered !== null) {
         visibleParts.push(rendered);
       }
@@ -2735,8 +2878,8 @@ function renderMessageParts(parts: MessagePart[] | undefined, isAssistant: boole
     const groupId = getToolGroupId(part);
     const toolParts = [part];
     let nextIndex = index + 1;
-    while (groupId && parts[nextIndex]?.type === 'tool' && getToolGroupId(parts[nextIndex]) === groupId) {
-      toolParts.push(parts[nextIndex]);
+    while (groupId && remainingParts[nextIndex]?.type === 'tool' && getToolGroupId(remainingParts[nextIndex]) === groupId) {
+      toolParts.push(remainingParts[nextIndex]);
       nextIndex += 1;
     }
     if (groupId && toolParts.length > 1) {
@@ -2878,6 +3021,14 @@ function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
   const tool = stringValue(part.tool) || 'unknown_tool';
   const status = stringValue(state.status) || 'pending';
   const tone = getToolTone(status);
+
+  if (isTodoTool(tool)) {
+    return <TodoToolView tool={tool} input={input} output={output} state={state} status={status} tone={tone} index={index} />;
+  }
+  if (tool === 'question') {
+    return <QuestionToolView input={input} output={output} state={state} status={status} tone={tone} index={index} />;
+  }
+
   const display = buildToolDisplay(tool, input, output);
   const command = stringValue(output.command) || stringValue(input.command);
   const description = stringValue(input.description) || stringValue(output.description);
@@ -2885,7 +3036,6 @@ function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
   const filePath = stringValue(output.file_path) || stringValue(input.file_path);
   const url = stringValue(output.url) || stringValue(input.url);
   const finalUrl = stringValue(output.final_url);
-  const skillName = stringValue(output.name) || stringValue(input.name);
   const operation = buildToolOperation(output);
   const errorMessage = buildToolErrorMessage(state, output);
   const resultText = stringValue(output.output);
@@ -2912,7 +3062,6 @@ function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
       <div className="tool-meta-grid">
         {command ? <KeyValue label="command" value={command} mono /> : null}
         {cwd ? <KeyValue label="cwd" value={cwd} mono /> : null}
-        {skillName && tool === 'load_skill' ? <KeyValue label="skill" value={skillName} /> : null}
         {url && tool === 'webfetch' ? <KeyValue label="url" value={url} mono /> : null}
         {finalUrl && finalUrl !== url ? <KeyValue label="final" value={finalUrl} mono /> : null}
         {filePath ? <KeyValue label="file" value={filePath} mono /> : null}
@@ -2931,6 +3080,177 @@ function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
       {stdout ? <OutputBlock label="stdout" value={stdout} truncated={boolValue(output.stdout_truncated)} /> : null}
       {stderr ? <OutputBlock label="stderr" value={stderr} tone="warn" truncated={boolValue(output.stderr_truncated)} /> : null}
       {diff ? <OutputBlock label="diff" value={diff} tone="diff" /> : null}
+    </article>
+  );
+}
+
+function QuestionToolView({
+  input,
+  output,
+  state,
+  status,
+  tone,
+  index,
+}: {
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  state: ToolState;
+  status: string;
+  tone: string;
+  index?: number;
+}) {
+  const questions = extractQuestionItems(output.questions) || extractQuestionItems(input.questions) || [];
+  const answers = asRecord(output.answers);
+  const questionId = stringValue(output.question_id) || stringValue(input.question_id);
+  const errorMessage = buildToolErrorMessage(state, output);
+  const declined = boolValue(output.declined);
+  const summary = stringValue(output.output);
+  const hasAnswers = Object.keys(answers).length > 0;
+
+  return (
+    <article className={`tool-card question-tool-card ${tone}`}>
+      <header className="tool-card-header">
+        <div className="tool-title">
+          {tone === 'tool-error' ? <AlertTriangle size={15} /> : <MessageSquareText size={14} />}
+          {index ? <em>{index}</em> : null}
+          <span>{declined ? '用户拒绝回答' : hasAnswers ? '用户已回答问题' : '等待用户回答'}</span>
+          <small className="tool-name-tag">question</small>
+        </div>
+        <div className="tool-chips">
+          <StatusChip status={status} />
+          {questions.length > 0 ? <span>{questions.length} 题</span> : null}
+          {questionId ? <span>{questionId}</span> : null}
+        </div>
+      </header>
+
+      {errorMessage ? (
+        <div className="tool-error-message">
+          <AlertTriangle size={14} />
+          <span>{errorMessage}</span>
+        </div>
+      ) : null}
+
+      {questions.length > 0 ? (
+        <ol className="question-render-list" aria-label="question 工具问题">
+          {questions.map((question, questionIndex) => (
+            <li className="question-render-item" key={question.id || questionIndex}>
+              <div className="question-render-title">
+                <span>{questionIndex + 1}</span>
+                <strong>{question.question || question.id || `问题 ${questionIndex + 1}`}</strong>
+              </div>
+              <div className="question-render-options">
+                {question.options.map((option) => {
+                  const selected = isQuestionOptionSelected(answers, question.id, option.value);
+                  return (
+                    <span className={selected ? 'is-selected' : ''} key={option.value || option.label}>
+                      {option.label || option.value}
+                    </span>
+                  );
+                })}
+              </div>
+              <QuestionAnswerView answer={asRecord(answers[question.id])} />
+            </li>
+          ))}
+        </ol>
+      ) : null}
+
+      {!questions.length && summary ? <OutputBlock label="回答摘要" value={summary} /> : null}
+      {questions.length > 0 && summary ? <OutputBlock label="回答摘要" value={summary} /> : null}
+    </article>
+  );
+}
+
+function QuestionAnswerView({ answer }: { answer: Record<string, unknown> }) {
+  const values = Array.isArray(answer.values) ? answer.values.map(String).filter(Boolean) : [];
+  const note = stringValue(answer.note).trim();
+  if (!values.length && !note) {
+    return <p className="question-render-empty">尚未记录回答。</p>;
+  }
+  return (
+    <div className="question-render-answer">
+      {values.length > 0 ? (
+        <div>
+          <span>回答</span>
+          <code>{values.join('、')}</code>
+        </div>
+      ) : null}
+      {note ? (
+        <div>
+          <span>备注</span>
+          <code>{note}</code>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function TodoToolView({
+  tool,
+  input,
+  output,
+  state,
+  status,
+  tone,
+  index,
+}: {
+  tool: string;
+  input: Record<string, unknown>;
+  output: Record<string, unknown>;
+  state: ToolState;
+  status: string;
+  tone: string;
+  index?: number;
+}) {
+  const todos = extractTodos(tool, input, output);
+  const summary = summarizeTodos(todos);
+  const errorMessage = buildToolErrorMessage(state, output);
+  const action = tool === 'todo_write' ? '更新 TODO' : '读取 TODO';
+
+  return (
+    <article className={`tool-card todo-tool-card ${tone}`}>
+      <header className="tool-card-header">
+        <div className="tool-title">
+          {tone === 'tool-error' ? <AlertTriangle size={15} /> : <ListTree size={14} />}
+          {index ? <em>{index}</em> : null}
+          <span>{action}</span>
+          <small className="tool-name-tag">{tool}</small>
+        </div>
+        <div className="tool-chips">
+          <StatusChip status={status} />
+          <span>{summary.total} 项</span>
+          <span>{summary.inProgress} 进行中</span>
+          <span>{summary.completed} 完成</span>
+        </div>
+      </header>
+
+      {errorMessage ? (
+        <div className="tool-error-message">
+          <AlertTriangle size={14} />
+          <span>{errorMessage}</span>
+        </div>
+      ) : null}
+
+      <div className="todo-summary-strip" aria-label="TODO 汇总">
+        <span className="todo-summary-item todo-pending">待办 {summary.pending}</span>
+        <span className="todo-summary-item todo-in-progress">进行中 {summary.inProgress}</span>
+        <span className="todo-summary-item todo-completed">完成 {summary.completed}</span>
+      </div>
+
+      {todos.length > 0 ? (
+        <ol className="todo-render-list" aria-label="TODO 列表">
+          {todos.map((todo, todoIndex) => (
+            <li className={`todo-render-item ${todo.status}`} key={`${todo.status}-${todo.priority}-${todo.content}-${todoIndex}`}>
+              <span className="todo-status-mark" aria-hidden="true">
+                {todo.status === 'completed' ? <Check size={12} /> : todo.status === 'in_progress' ? <Play size={11} /> : <CircleDot size={11} />}
+              </span>
+              <span className="todo-render-content">{todo.content}</span>
+              <span className={`todo-priority ${todo.priority}`}>{formatTodoPriority(todo.priority)}</span>
+            </li>
+          ))}
+        </ol>
+      ) : (
+        <p className="todo-empty">当前没有 TODO。</p>
+      )}
     </article>
   );
 }
@@ -2976,16 +3296,7 @@ function OutputBlock({
 
 function StepFinishView({ part }: { part: MessagePart }) {
   const reason = stringValue(part.reason);
-  const label = reason && reason !== 'completed' ? reason : 'completed';
-  return (
-    <div className={`step-finish-note ${reason && reason !== 'completed' ? 'has-reason' : ''}`}>
-      <span aria-hidden="true">
-        <Check size={12} />
-      </span>
-      <strong>步骤结束</strong>
-      <code>{label}</code>
-    </div>
-  );
+  return <div className={`step-finish-note ${reason && reason !== 'completed' ? 'has-reason' : ''}`} aria-label="步骤结束" />;
 }
 
 function FilePartView({ part }: { part: MessagePart }) {
@@ -3104,6 +3415,86 @@ function getToolGroupId(part: MessagePart) {
   return stringValue(metadata.execution_group);
 }
 
+function isTodoTool(tool: string) {
+  return tool === 'todo_write' || tool === 'todo_read';
+}
+
+function extractQuestionItems(source: unknown): QuestionItem[] | null {
+  if (!Array.isArray(source)) {
+    return null;
+  }
+  const questions = source.flatMap((item) => {
+    const record = asRecord(item);
+    const id = stringValue(record.id);
+    const question = stringValue(record.question);
+    const rawOptions = Array.isArray(record.options) ? record.options : [];
+    const options = rawOptions.flatMap((rawOption) => {
+      const option = asRecord(rawOption);
+      const value = stringValue(option.value);
+      const label = stringValue(option.label);
+      if (!value && !label) {
+        return [];
+      }
+      return [{ value: value || label, label: label || value }];
+    });
+    if (!id && !question) {
+      return [];
+    }
+    return [{ id, question, multiple: boolValue(record.multiple), options }];
+  });
+  return questions.length ? questions : null;
+}
+
+function isQuestionOptionSelected(answers: Record<string, unknown>, questionId: string, optionValue: string) {
+  const answer = asRecord(answers[questionId]);
+  const values = Array.isArray(answer.values) ? answer.values.map(String) : [];
+  return values.includes(optionValue);
+}
+
+function extractTodos(tool: string, input: Record<string, unknown>, output: Record<string, unknown>) {
+  const source = tool === 'todo_write' ? input.todos : output.todos ?? input.todos;
+  if (!Array.isArray(source)) {
+    return [];
+  }
+  return source.flatMap((item) => {
+    const todo = asRecord(item);
+    const content = stringValue(todo.content).trim();
+    const status = stringValue(todo.status);
+    const priority = stringValue(todo.priority);
+    if (!content || !isTodoStatus(status) || !isTodoPriority(priority)) {
+      return [];
+    }
+    return [{ content, status, priority }];
+  });
+}
+
+function summarizeTodos(todos: TodoItem[]) {
+  return {
+    total: todos.length,
+    pending: todos.filter((todo) => todo.status === 'pending').length,
+    inProgress: todos.filter((todo) => todo.status === 'in_progress').length,
+    completed: todos.filter((todo) => todo.status === 'completed').length,
+  };
+}
+
+function isTodoStatus(value: string): value is TodoItem['status'] {
+  return value === 'pending' || value === 'in_progress' || value === 'completed';
+}
+
+function isTodoPriority(value: string): value is TodoItem['priority'] {
+  return value === 'low' || value === 'medium' || value === 'high';
+}
+
+function formatTodoPriority(priority: TodoItem['priority']) {
+  if (priority === 'high') {
+    return '高';
+  }
+  if (priority === 'medium') {
+    return '中';
+  }
+  return '低';
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
@@ -3207,6 +3598,85 @@ function upsertMessage(prev: MessageRecord[], next: MessageRecord): MessageRecor
   const copy = [...prev];
   copy[index] = next;
   return copy;
+}
+
+function upsertRunningToolMessage(prev: MessageRecord[], event: StreamEvent): MessageRecord[] {
+  const data = event.data || {};
+  const toolName = stringValue(data.tool_name);
+  const callId = stringValue(data.tool_call_id);
+  if (!toolName || !callId) {
+    return prev;
+  }
+  const messageId = buildPendingToolMessageId(data, event.session_id);
+  const part = buildRunningToolPart(toolName, callId, asRecord(data.args), event.created_at);
+  const messageIndex = prev.findIndex((item) => item.info?.id === messageId);
+  if (messageIndex < 0) {
+    return [...prev, buildPendingToolMessage(messageId, event)];
+  }
+
+  const message = prev[messageIndex];
+  const parts = message.parts || [];
+  const partIndex = parts.findIndex((item) => item.type === 'tool' && stringValue(item.call_id) === callId);
+  const nextParts = [...parts];
+  if (partIndex >= 0) {
+    nextParts[partIndex] = part;
+  } else {
+    nextParts.push(part);
+  }
+  const copy = [...prev];
+  copy[messageIndex] = { ...message, parts: nextParts };
+  return copy;
+}
+
+function removePendingToolMessagesForAssistant(prev: MessageRecord[], message: MessageRecord): MessageRecord[] {
+  if (message.info?.role !== 'assistant') {
+    return prev;
+  }
+  const messageId = buildPendingToolMessageId(message.info, message.info.session_id);
+  return prev.filter((item) => item.info?.id !== messageId);
+}
+
+function buildPendingToolMessage(messageId: string, event: StreamEvent): MessageRecord {
+  const data = event.data || {};
+  const createdAt = Date.parse(event.created_at);
+  const toolName = stringValue(data.tool_name);
+  const callId = stringValue(data.tool_call_id);
+
+  return {
+    info: {
+      id: messageId,
+      role: 'assistant',
+      session_id: event.session_id || '',
+      time: { created: Number.isFinite(createdAt) ? createdAt : Date.now() },
+      agent: stringValue(data.agent),
+      agent_kind: stringValue(data.agent_kind) || 'agent',
+      context_id: stringValue(data.context_id) || 'main',
+      parent_call_id: stringValue(data.parent_call_id) || null,
+    },
+    parts: [buildRunningToolPart(toolName, callId, asRecord(data.args), event.created_at)],
+  };
+}
+
+function buildRunningToolPart(toolName: string, callId: string, args: Record<string, unknown>, createdAt: string): MessagePart {
+  return {
+    type: 'tool',
+    call_id: callId,
+    tool: toolName,
+    state: {
+      status: 'running',
+      input: args,
+      raw: JSON.stringify(args, null, 2),
+      time: { start: createdAt },
+    },
+    metadata: { temporary: true },
+  };
+}
+
+function buildPendingToolMessageId(data: Record<string, unknown>, sessionId?: string | null) {
+  const agentKind = stringValue(data.agent_kind) || 'agent';
+  const contextId = stringValue(data.context_id) || 'main';
+  const parentCallId = stringValue(data.parent_call_id);
+  return `${PENDING_TOOL_MESSAGE_PREFIX}${sessionId || 'session'}:${agentKind}:${contextId}:${parentCallId}`;
 }
 
 function summarizeEventStats(events: StreamEvent[]): EventStats {

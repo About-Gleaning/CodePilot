@@ -106,9 +106,11 @@ def build_session_summary(records: list[dict[str, Any]]) -> dict[str, Any] | Non
 
 
 def apply_human_interaction(messages: list[dict[str, Any]], record: dict[str, Any]) -> None:
-    """回放人工交互记录；当前只有 question resolved 会补全工具状态。"""
+    """回放人工交互记录，补齐需要返回给 LLM 的工具结果。"""
     data = record.get("data") if isinstance(record.get("data"), dict) else {}
-    if data.get("kind") != "question" or data.get("status") != "resolved":
+    kind = data.get("kind")
+    status = data.get("status")
+    if (kind, status) not in {("question", "resolved"), ("question", "declined"), ("approval", "rejected")}:
         return
     message_id = str(data.get("message_id") or "")
     call_id = str(data.get("call_id") or "")
@@ -119,7 +121,12 @@ def apply_human_interaction(messages: list[dict[str, Any]], record: dict[str, An
         info = message.get("info") if isinstance(message.get("info"), dict) else {}
         if info.get("id") != message_id:
             continue
-        complete_question_tool_part(message, data, call_id)
+        if kind == "question" and status == "resolved":
+            complete_question_tool_part(message, data, call_id)
+        elif kind == "question":
+            decline_question_tool_part(message, data, call_id)
+        else:
+            reject_approval_tool_part(message, data, call_id)
         return
 
 
@@ -150,6 +157,108 @@ def complete_question_tool_part(message: dict[str, Any], data: dict[str, Any], c
     info = message.get("info") if isinstance(message.get("info"), dict) else {}
     if info.get("role") == "assistant":
         info["finish"] = "tool_completed"
+
+
+def reject_approval_tool_part(message: dict[str, Any], data: dict[str, Any], call_id: str) -> None:
+    """根据审批拒绝事件把 pending 工具调用补成 error，避免历史上下文无法继续发送。"""
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return
+    matched = False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "tool" and part.get("call_id") == call_id:
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            output = data.get("tool_output") if isinstance(data.get("tool_output"), dict) else fallback_rejected_tool_output(data, part)
+            part["state"] = {
+                **state,
+                "status": "error",
+                "output": output,
+                "error": {
+                    "code": "ToolApprovalRejected",
+                    "message": str(output.get("error_message") or "用户拒绝执行该工具调用。"),
+                    "detail": {},
+                },
+            }
+            matched = True
+    if not matched:
+        return
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "step-finish" and part.get("reason") == "tool_pending":
+            part["reason"] = "tool_completed"
+    info = message.get("info") if isinstance(message.get("info"), dict) else {}
+    if info.get("role") == "assistant":
+        info["finish"] = "tool_completed"
+
+
+def decline_question_tool_part(message: dict[str, Any], data: dict[str, Any], call_id: str) -> None:
+    """根据 question 拒答事件把 pending question 工具调用补成 error。"""
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return
+    matched = False
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "tool" and part.get("call_id") == call_id and part.get("tool") == "question":
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            output = data.get("tool_output") if isinstance(data.get("tool_output"), dict) else fallback_declined_question_output(data)
+            part["state"] = {
+                **state,
+                "status": "error",
+                "output": output,
+                "error": {
+                    "code": "QuestionDeclined",
+                    "message": str(output.get("error_message") or "用户拒绝回答 question 工具提出的问题。"),
+                    "detail": {},
+                },
+            }
+            matched = True
+    if not matched:
+        return
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "step-finish" and part.get("reason") == "tool_pending":
+            part["reason"] = "tool_completed"
+    info = message.get("info") if isinstance(message.get("info"), dict) else {}
+    if info.get("role") == "assistant":
+        info["finish"] = "tool_completed"
+
+
+def fallback_rejected_tool_output(data: dict[str, Any], part: dict[str, Any]) -> dict[str, Any]:
+    """兼容缺少 tool_output 的旧审批事件。"""
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    comment = str(result.get("comment") or "未提供备注").strip()
+    return {
+        "status": "error",
+        "tool_name": str(part.get("tool") or "unknown"),
+        "error_type": "ToolApprovalRejected",
+        "error_message": f"用户拒绝执行该工具调用：{comment}",
+        "recoverable": True,
+        "approval_id": data.get("interaction_id"),
+        "approved": False,
+        "comment": result.get("comment"),
+    }
+
+
+def fallback_declined_question_output(data: dict[str, Any]) -> dict[str, Any]:
+    """兼容缺少 tool_output 的旧 question 拒答事件。"""
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    comment = str(result.get("comment") or "未提供备注").strip()
+    return {
+        "status": "error",
+        "tool_name": "question",
+        "error_type": "QuestionDeclined",
+        "error_message": f"用户拒绝回答 question 工具提出的问题：{comment}",
+        "recoverable": True,
+        "question_id": data.get("interaction_id"),
+        "declined": True,
+        "comment": result.get("comment"),
+    }
 
 
 def fallback_question_output(data: dict[str, Any]) -> dict[str, Any]:

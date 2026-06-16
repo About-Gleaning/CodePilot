@@ -23,6 +23,7 @@ from codepilot.hooks import (
 from codepilot.llm import LiteLLMClient
 from codepilot.memory import JsonlEventStore, JsonlSessionMemory
 from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
+from codepilot.session.title import SessionTitleService
 from codepilot.skills import SkillRegistry
 from codepilot.tools import (
     BashTool,
@@ -86,7 +87,7 @@ def build_runtime_bundle(
     tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
 
     hook_manager = build_hook_manager(settings)
-    llm_client = LiteLLMClient()
+    llm_client = LiteLLMClient(log_requests=settings.llm.log_requests)
     tool_dispatcher = ToolDispatcher(tool_registry, hook_manager)
     agent_profiles = build_agent_profiles(
         max_iterations=settings.agent.max_loop_iterations,
@@ -115,6 +116,7 @@ def build_runtime_bundle(
         hook_manager=hook_manager,
         agent_loop=agent_loop,
         agent_profiles=agent_profiles,
+        title_service=build_title_service(settings),
         allow_human_interaction=allow_human_interaction,
     )
     return RuntimeBundle(
@@ -126,6 +128,23 @@ def build_runtime_bundle(
         llm_client=llm_client,
         agent_profiles=agent_profiles,
         session_runner=session_runner,
+    )
+
+
+def build_title_service(settings: AppSettings) -> SessionTitleService:
+    """从配置解析标题生成模型；标题请求固定不打印 LLM 请求日志。"""
+    provider = settings.llm.title_provider
+    model = settings.llm.title_model
+    activated_provider = settings.llm_runtime.activated_providers.get(provider)
+    if activated_provider is None:
+        raise ValueError(f"标题生成 provider `{provider}` 未激活或不存在")
+    if model not in activated_provider.models:
+        raise ValueError(f"标题生成 model `{model}` 不属于 provider `{provider}`")
+    return SessionTitleService(
+        provider=provider,
+        model=model,
+        litellm_model_prefix=activated_provider.litellm_model_prefix,
+        llm_client=LiteLLMClient(log_requests=False),
     )
 
 
