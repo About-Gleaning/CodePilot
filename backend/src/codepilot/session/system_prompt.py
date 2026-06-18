@@ -5,6 +5,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
+from codepilot.memory import read_long_memory
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.state import AgentState, LLMState, SessionState
@@ -27,6 +28,7 @@ def build_system_prompt(
     sections = [
         _section("常驻层：Agent 角色说明", agent_profile.system_prompt),
         _section("常驻层：工作区 AGENTS.md", _read_workspace_agents(workspace_path)),
+        _section("常驻层：长期记忆", _read_long_memory_for_agent(workspace, agent_state)),
         _section("按需加载层：Skills 与领域知识", _build_skills_context(skill_registry)),
         _section(
             "运行时注入层：当前上下文",
@@ -77,6 +79,13 @@ def _read_workspace_agents(workspace_path: Path) -> str | None:
         return agents_path.read_text(encoding="utf-8").strip()
     except OSError:
         return None
+
+
+def _read_long_memory_for_agent(workspace: Any, agent_state: AgentState) -> str | None:
+    codepilot_home = getattr(workspace, "codepilot_home", None)
+    if codepilot_home is None:
+        return None
+    return read_long_memory(Path(codepilot_home), agent_name=agent_state.name)
 
 
 def _build_skills_context(skill_registry: SkillRegistry | None) -> str:

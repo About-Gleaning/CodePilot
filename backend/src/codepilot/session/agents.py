@@ -83,6 +83,7 @@ def build_agent_profiles(max_iterations: int, subagent_max_iterations: int = 8) 
                 "webfetch",
                 "todo_write",
                 "todo_read",
+                "long_memory_write",
                 "question",
                 "task",
                 "schedule_manage",

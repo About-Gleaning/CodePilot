@@ -138,14 +138,8 @@
 4. 继续执行直到全部完成
 
 ## Memory 系统
-记忆文件：`~/.codepilot/instructions/memory.instruction.md`
-- 用户要求记住信息时，更新该文件
-- 文件头部必须包含：
-```yaml
-  ---
-  applyTo: '**'
-  ---
-```
+- 长期记忆文件为 `codepilot_home/instructions/memory.instruction.md`。
+- 是否注入长期记忆由文件头 `applyTo` 决定；build agent 不主动写入长期记忆。
 
 ## Git 规则
 - **只有用户明确要求时**才执行 stage 和 commit

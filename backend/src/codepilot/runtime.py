@@ -29,6 +29,7 @@ from codepilot.tools import (
     BashTool,
     EditFileTool,
     LoadSkillTool,
+    LongMemoryWriteTool,
     McpToolAdapter,
     QuestionTool,
     ReadFileTool,
@@ -83,6 +84,7 @@ def build_runtime_bundle(
     tool_registry.register(TodoWriteTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(TodoReadTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(QuestionTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(LongMemoryWriteTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
 
