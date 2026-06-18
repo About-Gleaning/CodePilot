@@ -11,6 +11,7 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDot,
+  Copy,
   Pencil,
   FileText,
   HardDrive,
@@ -410,6 +411,7 @@ type AutoScrollState = {
 };
 
 const AUTO_SCROLL_BOTTOM_THRESHOLD = 96;
+const RADAR_PAGE_SIZE = 14;
 
 function useAutoScroll(signal: string, scrollRootRef?: RefObject<HTMLElement | null>): AutoScrollState {
   const anchorRef = useRef<HTMLDivElement | null>(null);
@@ -1754,20 +1756,7 @@ function App() {
           onRunClick={(run) => void handleScheduleRunClick(run)}
         />
 
-        <section className="panel event-panel">
-          <PanelTitle icon={<ListTree size={16} />} title="任务雷达" badge={`${events.length}/200`} />
-          <EventRadarHeader stats={eventStats} latestEvent={latestEventView} />
-          <div className="event-list">
-            {events.length === 0 ? (
-              <p className="quiet-copy">等待关键事件。</p>
-            ) : (
-              events
-                .slice()
-                .reverse()
-                .map((event) => <EventItem key={event.seq} event={event} />)
-            )}
-          </div>
-        </section>
+        <EventRadarPanel events={events} stats={eventStats} latestEvent={latestEventView} />
       </aside>
 
       <HistoryModal
@@ -1815,8 +1804,12 @@ function SchedulePanel({
 }) {
   const providerOption = config?.activated_providers.find((item) => item.provider === form.provider) || null;
   const modelOptions = providerOption?.models || [];
-  const visibleRuns = dedupeRuns([...runs.active, ...runs.recent]).slice(0, 6);
+  const visibleRuns = dedupeRuns([...runs.active, ...runs.recent]).slice(0, 8);
   const isEditing = Boolean(form.editing_id);
+  const enabledCount = schedules.filter((task) => task.enabled).length;
+  const nextTask = schedules
+    .filter((task) => task.next_run_at)
+    .sort((left, right) => String(left.next_run_at).localeCompare(String(right.next_run_at)))[0];
   return (
     <section className="panel schedule-panel">
       <PanelTitle
@@ -1835,6 +1828,20 @@ function SchedulePanel({
           <span>{error}</span>
         </div>
       ) : null}
+      <div className="schedule-overview" aria-label="定时任务概览">
+        <span>
+          <strong>{enabledCount}</strong>
+          启用
+        </span>
+        <span>
+          <strong>{runs.active.length}</strong>
+          运行中
+        </span>
+        <span title={nextTask?.next_run_at || '-'}>
+          <strong>{nextTask ? formatSessionTime(nextTask.next_run_at || '') : '-'}</strong>
+          下次
+        </span>
+      </div>
       {isFormOpen ? (
         <form className="schedule-form" onSubmit={onSubmit}>
           <div className="schedule-form-title">
@@ -1940,6 +1947,10 @@ function SchedulePanel({
           </button>
         </form>
       ) : null}
+      <div className="schedule-section-title">
+        <span>任务</span>
+        <code>{schedules.length}</code>
+      </div>
       <div className="schedule-task-list">
         {schedules.length === 0 ? (
           <p className="quiet-copy">暂无定时任务。</p>
@@ -1973,6 +1984,10 @@ function SchedulePanel({
             </div>
           ))
         )}
+      </div>
+      <div className="schedule-section-title">
+        <span>最近运行</span>
+        <code>{visibleRuns.length}</code>
       </div>
       <div className="schedule-run-list">
         {visibleRuns.length === 0 ? (
@@ -2082,20 +2097,7 @@ function MobileConsole(props: MobileConsoleProps) {
         ) : null}
 
         {activeTab === 'events' ? (
-          <section className="mobile-panel">
-            <PanelTitle icon={<ListTree size={16} />} title="任务雷达" badge={`${props.events.length}/200`} />
-            <EventRadarHeader stats={props.eventStats} latestEvent={props.latestEventView} />
-            <div className="event-list mobile-event-list">
-              {props.events.length === 0 ? (
-                <p className="quiet-copy">等待关键事件。</p>
-              ) : (
-                props.events
-                  .slice()
-                  .reverse()
-                  .map((event) => <EventItem key={event.seq} event={event} />)
-              )}
-            </div>
-          </section>
+          <EventRadarPanel events={props.events} stats={props.eventStats} latestEvent={props.latestEventView} variant="mobile" />
         ) : null}
 
         {activeTab === 'history' ? (
@@ -2722,6 +2724,107 @@ function RuntimeSignal({ statusText, latestEvent }: { statusText: string; latest
   );
 }
 
+function EventRadarPanel({
+  events,
+  stats,
+  latestEvent,
+  variant = 'desktop',
+}: {
+  events: StreamEvent[];
+  stats: EventStats;
+  latestEvent: EventViewModel | null;
+  variant?: 'desktop' | 'mobile';
+}) {
+  const [isVisible, setIsVisible] = useState(true);
+  const [page, setPage] = useState(1);
+  const totalPages = Math.max(1, Math.ceil(events.length / RADAR_PAGE_SIZE));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * RADAR_PAGE_SIZE;
+  const visibleEvents = events.slice().reverse().slice(pageStart, pageStart + RADAR_PAGE_SIZE);
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
+  const rootClassName = `${variant === 'mobile' ? 'mobile-panel' : 'panel'} event-panel ${isVisible ? '' : 'is-collapsed'}`;
+  const rangeLabel =
+    events.length === 0
+      ? '0'
+      : `${pageStart + 1}-${Math.min(pageStart + visibleEvents.length, events.length)}`;
+
+  return (
+    <section className={rootClassName}>
+      <PanelTitle
+        icon={<ListTree size={16} />}
+        title="任务雷达"
+        badge={`${events.length}/200`}
+        action={
+          <button
+            type="button"
+            className={`button secondary icon-button radar-visibility-toggle ${isVisible ? 'is-open' : ''}`}
+            onClick={() => setIsVisible((prev) => !prev)}
+            title={isVisible ? '隐藏任务雷达' : '显示任务雷达'}
+            aria-label={isVisible ? '隐藏任务雷达' : '显示任务雷达'}
+            aria-expanded={isVisible}
+          >
+            <ChevronDown size={14} />
+          </button>
+        }
+      />
+      {isVisible ? (
+        <>
+          <EventRadarHeader stats={stats} latestEvent={latestEvent} />
+          <div className="event-list">
+            {events.length === 0 ? (
+              <p className="quiet-copy">等待关键事件。</p>
+            ) : (
+              visibleEvents.map((event) => <EventItem key={event.seq} event={event} />)
+            )}
+          </div>
+          {totalPages > 1 ? (
+            <div className="radar-pagination" aria-label="任务雷达分页">
+              <span>
+                {rangeLabel} / {events.length}
+              </span>
+              <div>
+                <button
+                  type="button"
+                  className="button ghost icon-button"
+                  onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                  disabled={currentPage === 1}
+                  title="上一页"
+                  aria-label="上一页"
+                >
+                  <ChevronLeft size={14} />
+                </button>
+                <code>{currentPage}/{totalPages}</code>
+                <button
+                  type="button"
+                  className="button ghost icon-button"
+                  onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+                  disabled={currentPage === totalPages}
+                  title="下一页"
+                  aria-label="下一页"
+                >
+                  <ChevronRight size={14} />
+                </button>
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <button type="button" className="radar-collapsed-strip" onClick={() => setIsVisible(true)}>
+          <span>已隐藏</span>
+          <strong>{latestEvent?.title || '暂无关键事件'}</strong>
+          <code>{events.length} events</code>
+        </button>
+      )}
+    </section>
+  );
+}
+
 function EventRadarHeader({ stats, latestEvent }: { stats: EventStats; latestEvent: EventViewModel | null }) {
   const headline = stats.failed > 0 ? '存在失败节点' : stats.blockers > 0 ? '等待人工处理' : latestEvent?.title || '监听关键事件';
   const detail =
@@ -2787,6 +2890,7 @@ function TokenMeter({ summary, total }: { summary: TokenSummary; total: number }
 }
 
 function MessageItem({ message, index }: { message: MessageRecord; index: number }) {
+  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
   const role = String(message.info?.role || 'unknown');
   const isAssistant = role === 'assistant';
   const agentKind = String(message.info?.agent_kind || 'agent');
@@ -2795,6 +2899,17 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
   const stepFinishParts = parts.filter((part) => part.type === 'step-finish');
   const bodyParts = stepFinishParts.length ? parts.filter((part) => part.type !== 'step-finish') : parts;
   const shouldRenderCard = bodyParts.length > 0 || stepFinishParts.length === 0;
+  const copyText = buildMessageCopyText(parts);
+  const canCopy = copyText.length > 0;
+
+  async function handleCopyMessage() {
+    if (!canCopy) {
+      return;
+    }
+    const ok = await copyPlainText(copyText);
+    setCopyState(ok ? 'copied' : 'failed');
+    window.setTimeout(() => setCopyState('idle'), 1400);
+  }
 
   return (
     <>
@@ -2814,6 +2929,19 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
             {isAssistant && message.info?.tokens ? (
               <span className="muted-inline">{formatTokenUsage(message.info.tokens)}</span>
             ) : null}
+            {canCopy ? (
+              <button
+                type="button"
+                className={`message-copy-button ${copyState === 'copied' ? 'is-copied' : ''} ${
+                  copyState === 'failed' ? 'is-failed' : ''
+                }`}
+                onClick={() => void handleCopyMessage()}
+                title={copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制消息'}
+                aria-label={copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制消息'}
+              >
+                {copyState === 'copied' ? <Check size={13} /> : <Copy size={13} />}
+              </button>
+            ) : null}
           </div>
           <div className="message-body">{renderMessageParts(bodyParts, isAssistant)}</div>
         </article>
@@ -2823,6 +2951,42 @@ function MessageItem({ message, index }: { message: MessageRecord; index: number
       ))}
     </>
   );
+}
+
+function buildMessageCopyText(parts: MessagePart[]) {
+  return parts
+    .filter((part) => part.type === 'text')
+    .map((part) => stringValue(part.text).trim())
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+async function copyPlainText(text: string) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // 部分浏览器或非安全上下文会拒绝 Clipboard API，继续走 textarea 兜底。
+  }
+  return copyPlainTextWithFallback(text);
+}
+
+function copyPlainTextWithFallback(text: string) {
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.top = '-1000px';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  try {
+    return document.execCommand('copy');
+  } finally {
+    document.body.removeChild(textarea);
+  }
 }
 
 function EventItem({ event }: { event: StreamEvent }) {

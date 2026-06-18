@@ -85,7 +85,7 @@ context:
       summary_max_tokens: 2048
     tool_result_placeholder:
       enabled: true 
-      keep_latest_tool_results: 7
+      keep_latest_tool_results: 10
 tools:
   default_timeout_seconds: 120
   default_can_parallel: false
