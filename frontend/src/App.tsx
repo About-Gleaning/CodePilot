@@ -1079,6 +1079,10 @@ function App() {
   }
 
   function handleTaskKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // 输入法组合态下的 Enter 应交给输入法确认候选，不能触发任务发送。
+    if (event.nativeEvent.isComposing || event.keyCode === 229) {
+      return;
+    }
     if (event.key !== 'Enter' || event.shiftKey) {
       return;
     }
