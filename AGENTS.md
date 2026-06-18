@@ -45,6 +45,10 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 运行期 skills 默认从 `storage.codepilot_home/skills` 扫描，每个 skill 是一个含 `SKILL.md` 的一级子目录。system prompt 只注册可用 skill 的名称和描述；完整规范必须通过 `load_skill` 工具按需加载。`load_skill` 只读取 `SKILL.md`，不执行附带脚本，也不把 skill 清单放入工具描述，避免 system prompt 与工具 schema 出现两套来源。
 
+## Long Memory Guidelines
+
+长期记忆文件固定写入 `storage.codepilot_home/instructions/memory.instruction.md`，文件必须包含 YAML frontmatter。当前只有 `life` Agent 可以通过 `long_memory_write` 工具追加长期记忆；system prompt 注入范围以文件头 `applyTo` 为准，支持单值、数组和 `**` 全局匹配。读取时必须剥离 frontmatter，只注入正文记忆。
+
 ## Testing Guidelines
 
 后端使用 `pytest` 与 `pytest-asyncio`，测试文件命名为 `test_*.py`。新增修复应先覆盖可复现行为，再实现代码；涉及异步会话、工具调用、上下文压缩或配置加载时，应补充对应单元测试。前端当前未配置测试框架，至少执行 `pnpm build` 验证类型与打包。

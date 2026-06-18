@@ -3,6 +3,7 @@ from .bash import BashTool
 from .dispatcher import ToolDispatcher, ToolExecutionBatch, ToolResumeBatch
 from .edit_file_tool import EditFileTool
 from .load_skill_tool import LoadSkillTool
+from .long_memory_tool import LongMemoryWriteTool
 from .mcp import McpToolAdapter
 from .question_tool import QuestionTool
 from .read_file_tool import ReadFileTool
@@ -19,6 +20,7 @@ __all__ = [
     "BashTool",
     "EditFileTool",
     "LoadSkillTool",
+    "LongMemoryWriteTool",
     "McpToolAdapter",
     "QuestionTool",
     "ReadFileTool",

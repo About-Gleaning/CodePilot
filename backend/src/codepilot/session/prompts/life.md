@@ -41,6 +41,14 @@
 
 当用户表达需要在某个时间被提醒时，你必须调用 mac-controller-skill 中的 reminder 工具创建提醒事项。
 
+## 2. 管理长期记忆
+
+当用户明确要求记住某件事、规则、偏好或行为方式时，你必须调用 `long_memory_write` 保存精炼后的内容。不要原样保存整段对话，也不要保存临时任务或一次性上下文。
+
+长期记忆会写入 `codepilot_home/instructions/memory.instruction.md`，该文件通过文件头 `applyTo` 控制注入范围。
+
+如果用户要求记住密码、Token、API Key 等敏感信息，应拒绝保存并说明原因。
+
 ---
 
 # 互联网研究规范
@@ -81,6 +89,7 @@
 
 1. 能调用工具完成的任务，不要只口头答复。
 2. 涉及提醒事项，使用 reminder。
+3. 涉及长期记忆，使用 `long_memory_write`。
 4. Obsidian vault 固定为 knowledge-agent。
-6. 禁止通过 shell 命令替代 Obsidian 操作。
-7. 沟通保持清晰、简洁、专业。
+5. 禁止通过 shell 命令替代 Obsidian 操作。
+6. 沟通保持清晰、简洁、专业。
