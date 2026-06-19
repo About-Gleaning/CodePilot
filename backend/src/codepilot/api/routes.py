@@ -6,13 +6,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput
 from codepilot.scheduler.models import ScheduleRunStatus, ScheduleTrigger, compute_next_run_at
 from codepilot.scheduler.service import ScheduleValidationError, validate_schedule_task_payload
+from codepilot.session.attachments import AttachmentError, SUPPORTED_IMAGE_MIMES, attachment_message_dir, detect_image_mime, sanitize_attachment_filename
 from codepilot.utils import utc_now_iso
 
 
@@ -159,6 +160,25 @@ def build_api_router(app_state: Any) -> APIRouter:
                 "sse": settings.sse.model_dump(),
             }
         )
+
+    @router.get("/attachments/{session_id}/{message_id}/{filename}")
+    async def get_attachment(session_id: str, message_id: str, filename: str) -> FileResponse:
+        """返回用户上传图片预览，读取范围限制在当前 workspace 的附件目录。"""
+        try:
+            safe_filename = sanitize_attachment_filename(filename)
+            if safe_filename != filename:
+                raise AttachmentError("附件文件名非法。")
+            target_dir = attachment_message_dir(app_state.workspace, session_id, message_id).resolve()
+            target = (target_dir / safe_filename).resolve(strict=False)
+            if not target.is_relative_to(target_dir) or not target.exists() or not target.is_file():
+                raise AttachmentError("附件不存在。")
+        except AttachmentError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        with target.open("rb") as file:
+            media_type = detect_image_mime(file.read(16))
+        if media_type not in SUPPORTED_IMAGE_MIMES:
+            raise HTTPException(status_code=415, detail="附件类型不支持预览")
+        return FileResponse(target, media_type=media_type, filename=target.name)
 
     @router.get("/schedules")
     async def get_schedules() -> JSONResponse:
@@ -311,6 +331,7 @@ def build_api_router(app_state: Any) -> APIRouter:
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     return router
+
 
 def _to_sse(event: StreamEvent) -> str:
     """把内部事件对象格式化成标准 SSE 文本帧。"""

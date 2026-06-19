@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from codepilot.config.settings import LLMProviderSettings, LLMSettings
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, build_user_message_info
+from codepilot.session.message import FilePart
 
 
 class DummyEventBus:
@@ -391,6 +393,51 @@ def test_session_runner_writes_thinking_enabled_to_new_session_metadata() -> Non
     runner._session = session
     assert runner.get_status_snapshot()["thinking_enabled"] is True
     assert runner.get_status_snapshot()["thinking_value"] == "medium"
+
+
+def test_session_runner_persists_user_image_attachment(tmp_path: Path) -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    workspace = SimpleNamespace(
+        workspace_id="ws_1",
+        workspace_path=tmp_path / "repo",
+        workspace_dir=tmp_path / "runtime",
+    )
+    workspace.workspace_path.mkdir()
+    runner = SessionRunner(
+        workspace=workspace,
+        config=settings,
+        event_bus=DummyEventBus(),
+        hook_manager=None,
+        agent_loop=DummyAgentLoop(),
+        agent_profiles={"build": object()},
+        title_service=NoopTitleService(),
+    )
+    png_data = b"\x89PNG\r\n\x1a\n" + b"image-bytes"
+    gateway_input = GatewayInput(
+        type=GatewayInputType.USER_MESSAGE,
+        content="分析图片",
+        agent_name="build",
+        provider="openai",
+        model="gpt-5.3-codex",
+        attachments=[
+            {
+                "filename": "../sample",
+                "mime": "image/png",
+                "data_base64": base64.b64encode(png_data).decode("ascii"),
+            }
+        ],
+    )
+
+    runner._session = runner._new_session(gateway_input)
+    message = runner._build_user_message(gateway_input)
+
+    file_parts = [part for part in message.parts if isinstance(part, FilePart)]
+    assert len(file_parts) == 1
+    assert file_parts[0].filename == "sample.png"
+    assert file_parts[0].mime == "image/png"
+    assert file_parts[0].source is not None
+    assert Path(file_parts[0].source.value).read_bytes() == png_data
+    assert "data_base64" not in message.model_dump_json()
 
 
 def test_session_runner_rejects_invalid_thinking_value() -> None:

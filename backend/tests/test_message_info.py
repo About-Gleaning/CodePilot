@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,7 +10,7 @@ from pydantic import ValidationError
 from codepilot.llm import LiteLLMClient
 from codepilot.session import LLMState, SessionState, SessionStatus
 from codepilot.session.flow import _latest_user_message_datetime
-from codepilot.session.message import Message, TextPart, ToolPart, ToolPartState, build_assistant_message_info, build_user_message_info
+from codepilot.session.message import FilePart, FileSource, Message, TextPart, ToolPart, ToolPartState, build_assistant_message_info, build_user_message_info
 from codepilot.session.system_prompt import build_runtime_context_prompt
 
 
@@ -171,6 +172,85 @@ def test_litellm_provider_message_builder_prepends_system_prompt() -> None:
         {"role": "system", "content": "system rules"},
         {"role": "user", "content": "hello"},
     ]
+
+
+def test_litellm_provider_message_builder_adds_user_image_blocks(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    client = LiteLLMClient()
+    message = Message(
+        info=build_user_message_info(
+            message_id="msg_user_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_000,
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+        ),
+        parts=[
+            TextPart(text="看图"),
+            FilePart(mime="image/png", filename="sample.png", source=FileSource(type="file", value=str(image_path))),
+        ],
+    )
+
+    provider_messages = client.build_provider_messages([message])
+
+    content = provider_messages[0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "看图"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_litellm_provider_message_builder_adds_tool_image_message(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    client = LiteLLMClient()
+    message = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd=str(tmp_path),
+            root=str(tmp_path),
+        ),
+        parts=[
+            TextPart(text="我来读取图片"),
+            ToolPart(
+                call_id="call_read_1",
+                tool="read_file",
+                state=ToolPartState(
+                    status="completed",
+                    input={"file_path": str(image_path)},
+                    output={
+                        "status": "ok",
+                        "tool_name": "read_file",
+                        "attachments": [
+                            {
+                                "type": "image",
+                                "mime": "image/png",
+                                "filename": "sample.png",
+                                "source_path": str(image_path),
+                            }
+                        ],
+                    },
+                ),
+            ),
+        ],
+    )
+
+    provider_messages = client.build_provider_messages([message])
+
+    assert [item["role"] for item in provider_messages] == ["assistant", "tool", "user"]
+    content = provider_messages[2]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "text"
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
 def test_litellm_provider_message_builder_wraps_latest_user_with_runtime_context() -> None:

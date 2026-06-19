@@ -4,6 +4,7 @@ import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from litellm import acompletion
@@ -11,6 +12,8 @@ from litellm import acompletion
 from codepilot.events import StreamEvent
 from codepilot.logging import get_logger
 from codepilot.session import LLMState, Message, SessionState, ToolPart
+from codepilot.session.attachments import SUPPORTED_IMAGE_MIMES, AttachmentError, image_file_to_data_url
+from codepilot.session.message import FilePart
 from codepilot.session.message import AssistantMessageTokens, MessageTokenCache
 from codepilot.utils import utc_now_iso
 
@@ -162,7 +165,7 @@ class LiteLLMClient:
                 continue
             if runtime_context_user_index is not None and message is messages[runtime_context_user_index]:
                 content = self._wrap_user_request_with_runtime_context(content, runtime_context or "")
-            provider_messages.append({"role": role, "content": content})
+            provider_messages.append({"role": role, "content": self._build_provider_content(message, content)})
         return provider_messages
 
     def _latest_user_message_index(self, messages: list[Message]) -> int | None:
@@ -227,6 +230,8 @@ class LiteLLMClient:
             return redacted
         if isinstance(value, list):
             return [self._redact_request(item) for item in value]
+        if isinstance(value, str) and value.startswith("data:image/"):
+            return "[image data url redacted]"
         return value
 
     def _build_provider_kwargs(self, llm_state: LLMState) -> dict[str, Any]:
@@ -318,6 +323,7 @@ class LiteLLMClient:
 
     def _build_provider_tool_results(self, tool_parts: list[ToolPart]) -> list[dict[str, Any]]:
         provider_messages: list[dict[str, Any]] = []
+        image_messages: list[dict[str, Any]] = []
         for part in tool_parts:
             if part.state.status not in {"completed", "error"}:
                 continue
@@ -331,4 +337,60 @@ class LiteLLMClient:
                     "content": content,
                 }
             )
+            image_message = self._build_tool_image_message(part, payload)
+            if image_message:
+                image_messages.append(image_message)
+        provider_messages.extend(image_messages)
         return provider_messages
+
+    def _build_provider_content(self, message: Message, text: str) -> str | list[dict[str, Any]]:
+        image_blocks = [block for part in message.parts if isinstance(part, FilePart) for block in self._file_part_image_blocks(part)]
+        if not image_blocks:
+            return text
+        content: list[dict[str, Any]] = []
+        if text:
+            content.append({"type": "text", "text": text})
+        content.extend(image_blocks)
+        return content
+
+    def _file_part_image_blocks(self, part: FilePart) -> list[dict[str, Any]]:
+        if part.mime not in SUPPORTED_IMAGE_MIMES:
+            return []
+        raw_path = part.source.value if part.source and part.source.type == "file" else ""
+        if not raw_path:
+            return []
+        try:
+            data_url = image_file_to_data_url(Path(raw_path), part.mime)
+        except (OSError, AttachmentError):
+            return []
+        return [{"type": "image_url", "image_url": {"url": data_url}}]
+
+    def _build_tool_image_message(self, part: ToolPart, payload: dict[str, Any]) -> dict[str, Any] | None:
+        attachments = payload.get("attachments")
+        if not isinstance(attachments, list):
+            return None
+        blocks: list[dict[str, Any]] = []
+        names: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict) or attachment.get("type") != "image":
+                continue
+            mime = str(attachment.get("mime") or "")
+            source_path = str(attachment.get("source_path") or "")
+            if mime not in SUPPORTED_IMAGE_MIMES or not source_path:
+                continue
+            try:
+                data_url = image_file_to_data_url(Path(source_path), mime)
+            except (OSError, AttachmentError):
+                continue
+            names.append(str(attachment.get("filename") or Path(source_path).name))
+            blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+        if not blocks:
+            return None
+        title = "、".join(names) if names else part.tool
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{part.tool} 工具读取到以下图片附件：{title}。请结合图片内容继续完成任务。"},
+                *blocks,
+            ],
+        }

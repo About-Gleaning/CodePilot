@@ -5,6 +5,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from codepilot.session.attachments import MAX_IMAGE_ATTACHMENTS_PER_MESSAGE, SUPPORTED_IMAGE_MIMES
+
 
 class GatewayInputType(str, Enum):
     """Gateway 层支持的输入类型，用于把前端操作分发到不同会话控制分支。"""
@@ -14,6 +16,14 @@ class GatewayInputType(str, Enum):
     QUESTION_REPLY = "question_reply"
     QUESTION_DECLINE = "question_decline"
     STOP = "stop"
+
+
+class UploadedAttachmentInput(BaseModel):
+    """前端上传的附件输入；首期只允许图片。"""
+
+    filename: str = Field(description="原始文件名，仅用于展示和生成安全落盘文件名。")
+    mime: str = Field(description="浏览器识别到的 MIME 类型。")
+    data_base64: str = Field(description="附件内容的 base64 编码，不应写入会话持久化记录。")
 
 
 class GatewayInput(BaseModel):
@@ -34,6 +44,7 @@ class GatewayInput(BaseModel):
     question_id: str | None = Field(default=None, description="待处理的用户问题请求 ID，仅 question_reply/question_decline 类型必填。")
     answers: dict[str, Any] | None = Field(default=None, description="用户对 question 工具问题的回答。")
     comment: str | None = Field(default=None, description="人工审批备注，用于记录同意或拒绝的补充说明。")
+    attachments: list[UploadedAttachmentInput] = Field(default_factory=list, description="用户消息携带的附件，首期仅支持图片。")
     metadata: dict[str, Any] = Field(default_factory=dict, description="预留扩展元数据，传递非核心输入上下文。")
 
     @model_validator(mode="after")
@@ -48,6 +59,13 @@ class GatewayInput(BaseModel):
                 raise ValueError("user_message 必须提供 provider")
             if not self.model:
                 raise ValueError("user_message 必须提供 model")
+            if len(self.attachments) > MAX_IMAGE_ATTACHMENTS_PER_MESSAGE:
+                raise ValueError(f"单条消息最多上传 {MAX_IMAGE_ATTACHMENTS_PER_MESSAGE} 张图片")
+            for attachment in self.attachments:
+                if attachment.mime not in SUPPORTED_IMAGE_MIMES:
+                    raise ValueError("当前仅支持 png/jpeg/webp/gif 图片附件")
+        elif self.attachments:
+            raise ValueError("只有 user_message 支持 attachments")
         if self.type == GatewayInputType.HUMAN_REPLY:
             if not self.approval_id:
                 raise ValueError("human_reply 必须提供 approval_id")

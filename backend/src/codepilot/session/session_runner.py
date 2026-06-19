@@ -8,6 +8,7 @@ from __future__ import annotations
 """
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from codepilot.config.settings import resolve_llm_selection, resolve_thinking_value
@@ -15,7 +16,8 @@ from codepilot.events import MessageCreatedEvent, SessionLifecycleEvent, Session
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.hooks import HookManager, RuntimeHandles
 from codepilot.session.agents import AgentProfile
-from codepilot.session.message import Message, TextPart, build_user_message_info
+from codepilot.session.attachments import attachment_message_dir, decode_image_attachment, sanitize_attachment_filename
+from codepilot.session.message import FilePart, FileSource, Message, MessagePart, TextPart, build_user_message_info
 from codepilot.session.session import AgentLoop
 from codepilot.session.state import ApprovalResult, QuestionResult, SessionState, SessionStatus
 from codepilot.session.title import SessionTitleService
@@ -436,17 +438,80 @@ class SessionRunner:
     def _build_user_message(self, gateway_input: GatewayInput) -> Message:
         """把网关输入转换为统一的用户消息结构，写入 session 消息列表。"""
         assert self._session is not None
+        message_id = new_message_id()
+        parts: list[MessagePart] = [TextPart(text=gateway_input.content or "")]
+        parts.extend(self._build_attachment_parts(gateway_input, message_id))
         return Message(
             info=build_user_message_info(
-                message_id=new_message_id(),
+                message_id=message_id,
                 session_id=self._session.session_id,
                 created_at_ms=utc_now_millis(),
                 agent=self._session.agent_name,
                 provider_id=self._session.provider,
                 model_id=self._session.model,
             ),
-            parts=[TextPart(text=gateway_input.content or "")],
+            parts=parts,
         )
+
+    def _build_attachment_parts(self, gateway_input: GatewayInput, message_id: str) -> list[FilePart]:
+        """保存用户上传图片，并用 FilePart 记录最小可回放元数据。"""
+
+        assert self._session is not None
+        if not gateway_input.attachments:
+            return []
+        target_dir = attachment_message_dir(self._workspace, self._session.session_id, message_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        parts: list[FilePart] = []
+        used_names: set[str] = set()
+        for index, attachment in enumerate(gateway_input.attachments, start=1):
+            data, mime = decode_image_attachment(attachment.data_base64, attachment.mime)
+            filename = self._dedupe_attachment_filename(
+                self._ensure_image_extension(sanitize_attachment_filename(attachment.filename), mime),
+                used_names,
+                index,
+            )
+            target = target_dir / filename
+            target.write_bytes(data)
+            parts.append(
+                FilePart(
+                    mime=mime,
+                    filename=filename,
+                    url=f"/api/attachments/{self._session.session_id}/{message_id}/{filename}",
+                    source=FileSource(type="file", value=str(target)),
+                    metadata={"bytes": len(data), "uploaded": True},
+                )
+            )
+        return parts
+
+    def _dedupe_attachment_filename(self, filename: str, used_names: set[str], index: int) -> str:
+        """同一条消息内附件同名时追加序号，避免覆盖。"""
+
+        candidate = filename
+        if candidate not in used_names:
+            used_names.add(candidate)
+            return candidate
+        path = Path(filename)
+        suffix = path.suffix
+        stem = path.stem or f"image_{index}"
+        counter = 2
+        while True:
+            candidate = f"{stem}_{counter}{suffix}"
+            if candidate not in used_names:
+                used_names.add(candidate)
+                return candidate
+            counter += 1
+
+    def _ensure_image_extension(self, filename: str, mime: str) -> str:
+        suffixes = {
+            "image/png": {".png"},
+            "image/jpeg": {".jpg", ".jpeg"},
+            "image/webp": {".webp"},
+            "image/gif": {".gif"},
+        }[mime]
+        path = Path(filename)
+        if path.suffix.lower() in suffixes:
+            return filename
+        return f"{path.stem or filename}{sorted(suffixes)[0]}"
 
     def _default_title(self, content: str, session_id: str) -> str:
         """用首条用户输入生成默认标题，避免新会话历史列表出现空标题。"""

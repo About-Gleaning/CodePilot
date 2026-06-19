@@ -76,6 +76,19 @@ def test_read_file_rejects_existing_path_outside_workspace(tmp_path: Path) -> No
     assert result.get("output") is None
 
 
+def test_read_file_returns_image_attachment_for_png(tmp_path: Path) -> None:
+    target = tmp_path / "sample.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(target)}, context)
+
+    assert result["status"] == "ok"
+    assert result["mime"] == "image/png"
+    assert result["attachments"][0]["source_path"] == str(target)
+    assert "已读取图片文件" in str(result["output"])
+
+
 def test_write_file_creates_new_file_and_rejects_overwrite(tmp_path: Path) -> None:
     context = build_context(tmp_path, tmp_path / ".codepilot")
     tool = WriteFileTool(timeout_seconds=1)

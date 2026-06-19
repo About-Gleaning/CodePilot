@@ -2,10 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
+from codepilot.session.attachments import (
+    AttachmentError,
+    MAX_IMAGE_ATTACHMENT_BYTES,
+    SUPPORTED_IMAGE_MIMES,
+    detect_image_mime,
+    resolve_stored_attachment_path,
+)
 from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
 from codepilot.tools.file_tool_common import (
     build_tool_failure,
     build_tool_success,
+    FileToolError,
     load_tool_description,
     read_utf8_text_file,
     resolve_workspace_file_path,
@@ -41,7 +49,10 @@ class ReadFileTool(BaseTool):
         context: ToolExecutionContext | None = None,
     ) -> dict[str, Any]:
         try:
-            target = resolve_workspace_file_path(str(args.get("file_path", "")), context, allow_missing=False)
+            target = self._resolve_read_target(str(args.get("file_path", "")), context)
+            image_result = self._read_image_file(target)
+            if image_result is not None:
+                return build_tool_success(self.spec.name, **image_result)
             text = read_utf8_text_file(target, tool_name=self.spec.name)
             if text == "":
                 return build_tool_success(self.spec.name, file_path=str(target), output=EMPTY_FILE_OUTPUT, is_empty=True)
@@ -57,3 +68,47 @@ class ReadFileTool(BaseTool):
             return build_tool_success(self.spec.name, file_path=str(target), output=output, is_empty=False)
         except Exception as exc:  # noqa: BLE001
             return build_tool_failure(self.spec.name, exc)
+
+    def _resolve_read_target(self, file_path: str, context: ToolExecutionContext | None) -> Any:
+        try:
+            return resolve_workspace_file_path(file_path, context, allow_missing=False)
+        except FileToolError as exc:
+            if exc.error_type != "FilePathForbidden" or context is None:
+                raise
+            try:
+                return resolve_stored_attachment_path(context.workspace, file_path)
+            except AttachmentError:
+                raise exc
+
+    def _read_image_file(self, target: Any) -> dict[str, Any] | None:
+        if target.is_dir():
+            return None
+        with target.open("rb") as file:
+            header = file.read(16)
+        mime = detect_image_mime(header)
+        if mime not in SUPPORTED_IMAGE_MIMES:
+            return None
+        size = target.stat().st_size
+        if size > MAX_IMAGE_ATTACHMENT_BYTES:
+            return {
+                "file_path": str(target),
+                "mime": mime,
+                "bytes": size,
+                "output": f"图片文件超过 {MAX_IMAGE_ATTACHMENT_BYTES // 1024 // 1024}MB，未发送给 LLM：{target.name}。",
+                "attachments": [],
+            }
+        return {
+            "file_path": str(target),
+            "mime": mime,
+            "bytes": size,
+            "output": f"已读取图片文件：{target.name}（{mime}，{size} bytes）。",
+            "attachments": [
+                {
+                    "type": "image",
+                    "mime": mime,
+                    "filename": target.name,
+                    "source_path": str(target),
+                    "bytes": size,
+                }
+            ],
+        }

@@ -16,6 +16,7 @@ import {
   FileText,
   HardDrive,
   History,
+  ImagePlus,
   ListTree,
   MessageSquareText,
   OctagonAlert,
@@ -211,6 +212,15 @@ type QuestionAnswer = {
 type SelectOption = {
   value: string;
   label: string;
+};
+
+type PendingAttachment = {
+  id: string;
+  filename: string;
+  mime: string;
+  data_base64: string;
+  previewUrl: string;
+  size: number;
 };
 
 const WEEKDAY_OPTIONS: SelectOption[] = [
@@ -507,6 +517,7 @@ type MobileConsoleProps = {
   model: string;
   agentName: string;
   task: string;
+  attachments: PendingAttachment[];
   formError: string;
   approvalComment: string;
   approvalRequest: ApprovalRequest | null;
@@ -541,6 +552,8 @@ type MobileConsoleProps = {
   onModelChange: (nextValue: string) => void;
   onThinkingChange: (nextValue: string) => void;
   onTaskChange: (nextValue: string) => void;
+  onAttachmentFiles: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
   onTaskKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
   onStart: (event: FormEvent<HTMLFormElement>) => void;
   onStop: () => void;
@@ -569,6 +582,7 @@ function App() {
   const [model, setModel] = useState('');
   const [agentName, setAgentName] = useState('build');
   const [task, setTask] = useState('');
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [formError, setFormError] = useState('');
   const [approvalComment, setApprovalComment] = useState('');
   const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
@@ -1057,6 +1071,7 @@ function App() {
         agent_name: agentName,
         provider,
         model,
+        attachments: attachments.map(({ filename, mime, data_base64 }) => ({ filename, mime, data_base64 })),
         metadata: thinkingValue ? { thinking_value: thinkingValue } : {},
         ...(currentSessionId ? { session_id: currentSessionId } : {}),
       };
@@ -1068,6 +1083,7 @@ function App() {
         connectStream(0);
       }
       setTask('');
+      clearAttachments();
       await refreshStatus();
       await refreshSessionHistory();
     } catch (error) {
@@ -1078,6 +1094,41 @@ function App() {
   function handleStart(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     void submitTask();
+  }
+
+  async function handleAttachmentFiles(files: FileList | null) {
+    if (!files?.length) {
+      return;
+    }
+    setFormError('');
+    try {
+      const nextAttachments = await Promise.all(Array.from(files).map(fileToPendingAttachment));
+      setAttachments((prev) => {
+        const merged = [...prev, ...nextAttachments];
+        const kept = merged.slice(0, 4);
+        merged.slice(4).forEach((item) => URL.revokeObjectURL(item.previewUrl));
+        return kept;
+      });
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : '读取附件失败');
+    }
+  }
+
+  function removeAttachment(id: string) {
+    setAttachments((prev) => {
+      const target = prev.find((item) => item.id === id);
+      if (target) {
+        URL.revokeObjectURL(target.previewUrl);
+      }
+      return prev.filter((item) => item.id !== id);
+    });
+  }
+
+  function clearAttachments() {
+    setAttachments((prev) => {
+      prev.forEach((item) => URL.revokeObjectURL(item.previewUrl));
+      return [];
+    });
   }
 
   function handleTaskKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -1114,6 +1165,7 @@ function App() {
     setActiveQuestionOptionIndex(0);
     setQuestionError('');
     setFormError('');
+    clearAttachments();
     setLastSeq(0);
     lastSeqRef.current = 0;
   }
@@ -1376,6 +1428,7 @@ function App() {
         model={model}
         agentName={agentName}
         task={task}
+        attachments={attachments}
         formError={formError}
         approvalComment={approvalComment}
         approvalRequest={approvalRequest}
@@ -1410,6 +1463,8 @@ function App() {
         onModelChange={handleModelChange}
         onThinkingChange={setThinkingValue}
         onTaskChange={setTask}
+        onAttachmentFiles={(files) => void handleAttachmentFiles(files)}
+        onRemoveAttachment={removeAttachment}
         onTaskKeyDown={handleTaskKeyDown}
         onStart={handleStart}
         onStop={handleStop}
@@ -1668,13 +1723,16 @@ function App() {
               ) : null}
             </section>
           ) : (
-            <textarea
-              rows={4}
-              placeholder="输入任务。若要触发人工审批，可在文本中加入 [[approve]]。"
-              value={task}
-              onChange={(e) => setTask(e.target.value)}
-              onKeyDown={handleTaskKeyDown}
-            />
+            <>
+              <textarea
+                rows={4}
+                placeholder="输入任务。若要触发人工审批，可在文本中加入 [[approve]]。"
+                value={task}
+                onChange={(e) => setTask(e.target.value)}
+                onKeyDown={handleTaskKeyDown}
+              />
+              <AttachmentTray attachments={attachments} onRemove={removeAttachment} />
+            </>
           )}
 
           <div className="composer-actions">
@@ -1711,6 +1769,7 @@ function App() {
               </>
             ) : (
               <>
+                <AttachmentPicker onFiles={(files) => void handleAttachmentFiles(files)} />
                 <button type="button" className="button secondary" onClick={handleStop}>
                   <Square size={14} />
                   停止
@@ -2271,7 +2330,9 @@ function MobileConsole(props: MobileConsoleProps) {
           </div>
         ) : (
           <>
+            <AttachmentTray attachments={props.attachments} onRemove={props.onRemoveAttachment} compact />
             <div className="mobile-input-row">
+              <AttachmentPicker onFiles={props.onAttachmentFiles} compact />
               <textarea
                 rows={2}
                 placeholder="输入任务..."
@@ -2315,6 +2376,52 @@ function MobileMessagePanel({
         subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
       />
     </section>
+  );
+}
+
+function AttachmentPicker({ onFiles, compact = false }: { onFiles: (files: FileList | null) => void; compact?: boolean }) {
+  return (
+    <label className={`attachment-picker ${compact ? 'is-compact' : ''}`} title="上传图片">
+      <ImagePlus size={15} />
+      {!compact ? <span>图片</span> : null}
+      <input
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/gif"
+        multiple
+        onChange={(event) => {
+          onFiles(event.target.files);
+          event.currentTarget.value = '';
+        }}
+      />
+    </label>
+  );
+}
+
+function AttachmentTray({
+  attachments,
+  onRemove,
+  compact = false,
+}: {
+  attachments: PendingAttachment[];
+  onRemove: (id: string) => void;
+  compact?: boolean;
+}) {
+  if (!attachments.length) {
+    return null;
+  }
+  return (
+    <div className={`attachment-tray ${compact ? 'is-compact' : ''}`} aria-label="待发送图片">
+      {attachments.map((attachment) => (
+        <div className="attachment-chip" key={attachment.id}>
+          <img src={attachment.previewUrl} alt={attachment.filename} />
+          <span title={attachment.filename}>{attachment.filename}</span>
+          <small>{formatBytes(attachment.size)}</small>
+          <button type="button" onClick={() => onRemove(attachment.id)} title="移除图片" aria-label={`移除 ${attachment.filename}`}>
+            <X size={12} />
+          </button>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -3470,8 +3577,21 @@ function StepFinishView({ part }: { part: MessagePart }) {
 function FilePartView({ part }: { part: MessagePart }) {
   const filename = stringValue(part.filename) || '文件';
   const mime = stringValue(part.mime);
+  const url = stringValue(part.url);
   const source = asRecord(part.source);
   const sourceValue = stringValue(source.value);
+  if (mime.startsWith('image/') && url) {
+    return (
+      <figure className="message-image-attachment">
+        <img src={url} alt={filename} />
+        <figcaption>
+          <FileText size={13} />
+          <span title={filename}>{filename}</span>
+          <small>{mime}</small>
+        </figcaption>
+      </figure>
+    );
+  }
   return <CompactNote tone="file" title={filename} value={[mime, sourceValue].filter(Boolean).join(' · ')} />;
 }
 
@@ -3673,6 +3793,49 @@ function stringValue(value: unknown) {
 
 function boolValue(value: unknown) {
   return value === true;
+}
+
+async function fileToPendingAttachment(file: File): Promise<PendingAttachment> {
+  const supported = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+  if (!supported.has(file.type)) {
+    throw new Error('当前仅支持 png/jpeg/webp/gif 图片。');
+  }
+  if (file.size > 5 * 1024 * 1024) {
+    throw new Error('单张图片不能超过 5MB。');
+  }
+  const dataUrl = await readFileAsDataUrl(file);
+  const marker = ';base64,';
+  const markerIndex = dataUrl.indexOf(marker);
+  if (markerIndex < 0) {
+    throw new Error('图片编码失败。');
+  }
+  return {
+    id: `${file.name}-${file.size}-${file.lastModified}-${Math.random().toString(16).slice(2)}`,
+    filename: file.name,
+    mime: file.type,
+    data_base64: dataUrl.slice(markerIndex + marker.length),
+    previewUrl: URL.createObjectURL(file),
+    size: file.size,
+  };
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('读取图片失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) {
+    return `${value}B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)}KB`;
+  }
+  return `${(value / 1024 / 1024).toFixed(1)}MB`;
 }
 
 function numberValue(value: unknown) {

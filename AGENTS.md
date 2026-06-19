@@ -49,6 +49,12 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 长期记忆文件固定写入 `storage.codepilot_home/instructions/memory.instruction.md`，文件必须包含 YAML frontmatter。当前只有 `life` Agent 可以通过 `long_memory_write` 工具追加长期记忆；system prompt 注入范围以文件头 `applyTo` 为准，支持单值、数组和 `**` 全局匹配。读取时必须剥离 frontmatter，只注入正文记忆。
 
+## Attachment Runtime Guidelines
+
+用户上传附件属于 CodePilot 运行态数据，必须保存到 `workspace_dir/attachments/<session_id>/<message_id>/`，会话 JSONL 只保存 `FilePart` 元数据、受控预览 URL 和本地文件路径，不得持久化 base64 原文。首期附件仅支持 `image/png`、`image/jpeg`、`image/webp` 和 `image/gif`，单图默认不超过 5MB，单条用户消息最多 4 张；前端可做提前拦截，但后端必须基于文件头再次校验 MIME 和大小。
+
+附件预览接口只能读取当前 workspace 的 attachments 目录，必须清理文件名并校验解析后的路径仍位于目标消息目录内。`read_file` 读取图片时可返回图片附件元数据；LLM 请求构造阶段再按需把图片编码为 data URL，日志与持久化记录不得写入图片 base64。
+
 ## Testing Guidelines
 
 后端使用 `pytest` 与 `pytest-asyncio`，测试文件命名为 `test_*.py`。新增修复应先覆盖可复现行为，再实现代码；涉及异步会话、工具调用、上下文压缩或配置加载时，应补充对应单元测试。前端当前未配置测试框架，至少执行 `pnpm build` 验证类型与打包。
