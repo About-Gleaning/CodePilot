@@ -145,6 +145,7 @@ class LiteLLMClient:
         if system_prompt:
             provider_messages.append({"role": "system", "content": system_prompt})
         runtime_context_user_index = self._latest_user_message_index(messages) if runtime_context else None
+        suppress_rich_content = self._should_suppress_rich_content(messages)
         for message in messages:
             role = message.info.role
             content = message.text_content()
@@ -161,11 +162,20 @@ class LiteLLMClient:
                         "tool_calls": [self._build_provider_tool_call(part) for part in completed_tool_parts],
                     }
                 )
-                provider_messages.extend(self._build_provider_tool_results(completed_tool_parts))
+                provider_messages.extend(self._build_provider_tool_results(completed_tool_parts, suppress_rich_content=suppress_rich_content))
                 continue
             if runtime_context_user_index is not None and message is messages[runtime_context_user_index]:
                 content = self._wrap_user_request_with_runtime_context(content, runtime_context or "")
-            provider_messages.append({"role": role, "content": self._build_provider_content(message, content)})
+            provider_messages.append(
+                {
+                    "role": role,
+                    "content": self._build_provider_content(
+                        message,
+                        content,
+                        suppress_rich_content=suppress_rich_content,
+                    ),
+                }
+            )
         return provider_messages
 
     def _latest_user_message_index(self, messages: list[Message]) -> int | None:
@@ -173,6 +183,19 @@ class LiteLLMClient:
             if messages[index].info.role == "user":
                 return index
         return None
+
+    def _should_suppress_rich_content(self, messages: list[Message]) -> bool:
+        """非致命 LLM 错误后的下一轮只发送文本，确保诊断消息能到达模型。"""
+        latest_recoverable_error_index: int | None = None
+        latest_user_index: int | None = None
+        for index, message in enumerate(messages):
+            if message.info.role == "user":
+                latest_user_index = index
+            if message.info.role == "assistant" and getattr(message.info, "finish", None) == "llm_error_recoverable":
+                latest_recoverable_error_index = index
+        return latest_recoverable_error_index is not None and (
+            latest_user_index is None or latest_recoverable_error_index > latest_user_index
+        )
 
     def _wrap_user_request_with_runtime_context(self, content: str, runtime_context: str) -> str:
         return f"{runtime_context.strip()}\n\n<user_request>\n{content}\n</user_request>"
@@ -321,7 +344,7 @@ class LiteLLMClient:
             },
         }
 
-    def _build_provider_tool_results(self, tool_parts: list[ToolPart]) -> list[dict[str, Any]]:
+    def _build_provider_tool_results(self, tool_parts: list[ToolPart], *, suppress_rich_content: bool = False) -> list[dict[str, Any]]:
         provider_messages: list[dict[str, Any]] = []
         image_messages: list[dict[str, Any]] = []
         for part in tool_parts:
@@ -337,13 +360,16 @@ class LiteLLMClient:
                     "content": content,
                 }
             )
-            image_message = self._build_tool_image_message(part, payload)
-            if image_message:
-                image_messages.append(image_message)
+            if not suppress_rich_content:
+                image_message = self._build_tool_image_message(part, payload)
+                if image_message:
+                    image_messages.append(image_message)
         provider_messages.extend(image_messages)
         return provider_messages
 
-    def _build_provider_content(self, message: Message, text: str) -> str | list[dict[str, Any]]:
+    def _build_provider_content(self, message: Message, text: str, *, suppress_rich_content: bool = False) -> str | list[dict[str, Any]]:
+        if suppress_rich_content:
+            return text
         image_blocks = [block for part in message.parts if isinstance(part, FilePart) for block in self._file_part_image_blocks(part)]
         if not image_blocks:
             return text

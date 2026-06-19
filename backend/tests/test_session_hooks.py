@@ -165,6 +165,7 @@ class StubLiteLLMClient:
         self.error = error
         self.calls = 0
         self.last_provider_messages: list[Any] = []
+        self.provider_message_calls: list[list[Any]] = []
 
     def build_provider_messages(
         self,
@@ -188,9 +189,32 @@ class StubLiteLLMClient:
     ) -> Any:
         self.calls += 1
         self.last_provider_messages = provider_messages
+        self.provider_message_calls.append(provider_messages)
         if self.error:
             raise self.error
         return SimpleNamespace(text="done", reasoning="", tool_calls=[])
+
+
+class SequencedLiteLLMClient(StubLiteLLMClient):
+    def __init__(self, results: list[Any]) -> None:
+        super().__init__()
+        self.results = results
+
+    async def stream_chat(
+        self,
+        session: SessionState,
+        llm_state: Any,
+        provider_messages: list[Any],
+        tools: list[dict[str, Any]],
+        event_bus: EventBus,
+    ) -> Any:
+        self.calls += 1
+        self.last_provider_messages = provider_messages
+        self.provider_message_calls.append(provider_messages)
+        result = self.results[min(self.calls - 1, len(self.results) - 1)]
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class StubLLMAPIError(RuntimeError):
@@ -655,7 +679,7 @@ def test_agent_loop_compresses_context_before_llm_before_hook() -> None:
     assert result.metadata["trace"] == ["context_compression", "llm_before"]
 
 
-def test_agent_loop_converts_llm_error_to_assistant_message() -> None:
+def test_agent_loop_stops_when_llm_auth_error() -> None:
     settings = build_settings()
     session = build_session()
     workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
@@ -686,7 +710,7 @@ def test_agent_loop_converts_llm_error_to_assistant_message() -> None:
         )
     )
     loop = AgentLoop(
-        llm_client=StubLiteLLMClient(error=StubLLMAPIError("bad request: invalid model", 400)),
+        llm_client=StubLiteLLMClient(error=StubLLMAPIError("invalid api key", 401)),
         tool_registry=StubToolRegistry(),
         tool_dispatcher=StubToolDispatcher(),
         hook_manager=hook_manager,
@@ -712,14 +736,62 @@ def test_agent_loop_converts_llm_error_to_assistant_message() -> None:
     error_message = session.messages[-2]
     assert error_message.info.role == "assistant"
     assert error_message.info.error is not None
-    assert error_message.info.error.code == "llm_bad_request"
-    assert error_message.info.error.detail["status_code"] == 400
+    assert error_message.info.error.code == "llm_auth_error"
+    assert error_message.info.error.detail["status_code"] == 401
     assert error_message.info.finish == "llm_error"
-    assert "LLM 调用失败，AgentLoop 已停止：bad request: invalid model" == error_message.text_content()
+    assert "LLM 调用失败，AgentLoop 已停止：invalid api key" == error_message.text_content()
     assert [event.event_type for event in stream_events].count("assistant_message_completed") == 1
     loop_finished_events = [event for event in stream_events if event.event_type == "loop_finished"]
     assert loop_finished_events[-1].data["status"] == SessionStatus.FAILED.value
     assert stream_events[-1].event_type == "session_failed"
+
+
+def test_agent_loop_wraps_nonfatal_llm_error_for_next_iteration() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    llm_client = SequencedLiteLLMClient(
+        [
+            StubLLMAPIError("unknown variant image_url, expected text", 400),
+            SimpleNamespace(text="当前模型不支持图片输入。", reasoning="", tool_calls=[]),
+        ]
+    )
+    loop = AgentLoop(
+        llm_client=llm_client,
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=StubToolDispatcher(),
+        hook_manager=HookManager(),
+    )
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.status == SessionStatus.COMPLETED
+    assert llm_client.calls == 2
+    recoverable_message = result.messages[-2]
+    assert recoverable_message.info.role == "assistant"
+    assert recoverable_message.info.error is not None
+    assert recoverable_message.info.error.code == "llm_bad_request"
+    assert recoverable_message.info.finish == "llm_error_recoverable"
+    assert "失败报文（已脱敏）" in recoverable_message.text_content()
+    second_call_messages = llm_client.provider_message_calls[1]
+    assert any(
+        isinstance(message, Message) and "unknown variant image_url, expected text" in message.text_content()
+        for message in second_call_messages
+    )
+    assert result.messages[-1].text_content() == "当前模型不支持图片输入。"
 
 
 def test_agent_loop_stops_when_llm_quota_error() -> None:
@@ -753,6 +825,39 @@ def test_agent_loop_stops_when_llm_quota_error() -> None:
     error_message = result.messages[-1]
     assert error_message.info.error is not None
     assert error_message.info.error.code == "llm_insufficient_quota"
+    assert error_message.info.finish == "llm_error"
+
+
+def test_agent_loop_stops_when_llm_service_unavailable() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    loop = AgentLoop(
+        llm_client=StubLiteLLMClient(error=StubLLMAPIError("upstream service unavailable", 503)),
+        tool_registry=StubToolRegistry(),
+        tool_dispatcher=StubToolDispatcher(),
+        hook_manager=HookManager(),
+    )
+
+    result = asyncio.run(
+        loop.run(
+            session=session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+            runtime=runtime,
+            config=settings,
+            approval_event=asyncio.Event(),
+            approval_result_holder={"result": None},
+            stop_event=asyncio.Event(),
+        )
+    )
+
+    assert result.status == SessionStatus.FAILED
+    error_message = result.messages[-1]
+    assert error_message.info.error is not None
+    assert error_message.info.error.code == "llm_service_unavailable"
     assert error_message.info.finish == "llm_error"
 
 

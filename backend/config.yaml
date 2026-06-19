@@ -24,12 +24,6 @@ llm:
             extra_body_key: "enable_thinking"
             allowed_values: ["on", "off"]
             default_value: "on"
-        - id: "qwen3-coder-next"
-          thinking:
-            kind: "extra_body_boolean"
-            extra_body_key: "enable_thinking"
-            allowed_values: ["on", "off"]
-            default_value: "on"
         - id: "qwen3.5-flash"
           thinking:
             kind: "extra_body_boolean"

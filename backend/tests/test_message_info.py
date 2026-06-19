@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -202,6 +203,46 @@ def test_litellm_provider_message_builder_adds_user_image_blocks(tmp_path: Path)
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_litellm_provider_message_builder_suppresses_rich_content_after_recoverable_error(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    client = LiteLLMClient()
+    user_message = Message(
+        info=build_user_message_info(
+            message_id="msg_user_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_000,
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+        ),
+        parts=[
+            TextPart(text="看图"),
+            FilePart(mime="image/png", filename="sample.png", source=FileSource(type="file", value=str(image_path))),
+        ],
+    )
+    recoverable_error = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd=str(tmp_path),
+            root=str(tmp_path),
+        ),
+        parts=[TextPart(text="LLM 调用发生非致命错误。")],
+    )
+    recoverable_error.info.finish = "llm_error_recoverable"
+
+    provider_messages = client.build_provider_messages([user_message, recoverable_error])
+
+    assert provider_messages[0] == {"role": "user", "content": "看图"}
+    assert provider_messages[1] == {"role": "assistant", "content": "LLM 调用发生非致命错误。"}
+
+
 def test_litellm_provider_message_builder_adds_tool_image_message(tmp_path: Path) -> None:
     image_path = tmp_path / "sample.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
@@ -251,6 +292,67 @@ def test_litellm_provider_message_builder_adds_tool_image_message(tmp_path: Path
     assert content[0]["type"] == "text"
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_litellm_provider_message_builder_suppresses_tool_image_after_recoverable_error(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image-bytes")
+    client = LiteLLMClient()
+    tool_message = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_1",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_001,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd=str(tmp_path),
+            root=str(tmp_path),
+        ),
+        parts=[
+            ToolPart(
+                call_id="call_read_1",
+                tool="read_file",
+                state=ToolPartState(
+                    status="completed",
+                    input={"file_path": str(image_path)},
+                    output={
+                        "status": "ok",
+                        "tool_name": "read_file",
+                        "attachments": [
+                            {
+                                "type": "image",
+                                "mime": "image/png",
+                                "filename": "sample.png",
+                                "source_path": str(image_path),
+                            }
+                        ],
+                    },
+                ),
+            )
+        ],
+    )
+    recoverable_error = Message(
+        info=build_assistant_message_info(
+            message_id="msg_assistant_2",
+            session_id="session_1",
+            created_at_ms=1_746_000_000_002,
+            parent_id="msg_user_1",
+            agent="build",
+            provider_id="openai",
+            model_id="gpt-5.3-codex",
+            cwd=str(tmp_path),
+            root=str(tmp_path),
+        ),
+        parts=[TextPart(text="LLM 调用发生非致命错误。")],
+    )
+    recoverable_error.info.finish = "llm_error_recoverable"
+
+    provider_messages = client.build_provider_messages([tool_message, recoverable_error])
+
+    assert [message["role"] for message in provider_messages] == ["assistant", "tool", "assistant"]
+    assert all("image_url" not in json.dumps(message, ensure_ascii=False) for message in provider_messages)
 
 
 def test_litellm_provider_message_builder_wraps_latest_user_with_runtime_context() -> None:

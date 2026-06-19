@@ -295,15 +295,29 @@ class TurnExecutor:
             )
         )
         try:
+            tool_schemas = self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools, agent_profile=agent_profile)
             stream_result = await self.llm_client.stream_chat(
                 session=session,
                 llm_state=llm_state,
                 provider_messages=provider_messages,
-                tools=self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools, agent_profile=agent_profile),
+                tools=tool_schemas,
                 event_bus=_AgentEventBus(runtime.event_bus, self._agent_event_data(agent_state)),
             )
         except Exception as exc:  # noqa: BLE001
-            assistant_message = self._build_llm_error_message(session, agent_state, exc)
+            error = self._convert_llm_exception(exc)
+            if not self._is_fatal_llm_error(error):
+                assistant_message = self._build_recoverable_llm_error_message(
+                    session=session,
+                    agent_state=agent_state,
+                    error=error,
+                    provider_messages=provider_messages,
+                    tools=tool_schemas,
+                    llm_state=llm_state,
+                )
+                await self.message_appender.append(session, assistant_message, runtime)
+                await self.publish_assistant_message_completed(session, assistant_message, runtime)
+                return TurnResult(status="continue")
+            assistant_message = self._build_llm_error_message(session, agent_state, error)
             await self.message_appender.append(session, assistant_message, runtime)
             await self.publish_assistant_message_completed(session, assistant_message, runtime)
             return TurnResult(status="failed")
@@ -567,10 +581,11 @@ class TurnExecutor:
         message.info.tokens = tokens
         return message
 
-    def _build_llm_error_message(self, session: SessionState, agent_state: AgentState, exc: Exception) -> Message:
+    def _build_llm_error_message(self, session: SessionState, agent_state: AgentState, error: AssistantMessageError | Exception) -> Message:
         """把模型调用异常转换成可展示、可追踪的 assistant 错误消息。"""
 
-        error = self._convert_llm_exception(exc)
+        if not isinstance(error, AssistantMessageError):
+            error = self._convert_llm_exception(error)
         message = self._build_assistant_message(
             session=session,
             agent_state=agent_state,
@@ -582,6 +597,47 @@ class TurnExecutor:
         assert isinstance(message.info, AssistantMessageInfo)
         message.info.error = error
         self._append_step_finish(message, reason="llm_error")
+        return message
+
+    def _build_recoverable_llm_error_message(
+        self,
+        *,
+        session: SessionState,
+        agent_state: AgentState,
+        error: AssistantMessageError,
+        provider_messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        llm_state: LLMState,
+    ) -> Message:
+        """把非致命 LLM 错误转为下一轮可见的纯文本诊断消息。"""
+
+        failed_request = {
+            "provider": llm_state.provider,
+            "model": llm_state.model,
+            "messages": provider_messages,
+            "tools": tools,
+        }
+        request_text = self._dump_failed_llm_request(failed_request)
+        message = self._build_assistant_message(
+            session=session,
+            agent_state=agent_state,
+            text=(
+                "LLM 调用发生非致命错误，AgentLoop 将继续下一轮。\n"
+                "这是一条运行时诊断消息，不是用户输入。下一轮需要根据错误信息向用户说明失败原因，"
+                "不要声称已经看到了未成功发送给模型的内容。\n\n"
+                f"错误 code：{error.code or 'llm_api_error'}\n"
+                f"异常类型：{error.detail.get('exception_type') or 'UnknownError'}\n"
+                f"HTTP 状态码：{error.detail.get('status_code')}\n"
+                f"错误信息：{error.message}\n\n"
+                f"失败报文（已脱敏）：\n```json\n{request_text}\n```"
+            ),
+            reasoning="",
+            tool_calls=[],
+            tokens=None,
+        )
+        assert isinstance(message.info, AssistantMessageInfo)
+        message.info.error = error
+        self._append_step_finish(message, reason="llm_error_recoverable")
         return message
 
     def _build_context_compression_error_message(self, session: SessionState, agent_state: AgentState, exc: Exception) -> Message:
@@ -620,6 +676,8 @@ class TurnExecutor:
             code = "llm_auth_error"
         elif status_code == 429:
             code = "llm_rate_limited"
+        elif self._is_service_unavailable_error(lower_message, status_code, exc):
+            code = "llm_service_unavailable"
         elif status_code == 400:
             code = "llm_bad_request"
 
@@ -631,6 +689,52 @@ class TurnExecutor:
                 "status_code": status_code,
             },
         )
+
+    def _is_fatal_llm_error(self, error: AssistantMessageError) -> bool:
+        return error.code in {
+            "llm_auth_error",
+            "llm_insufficient_quota",
+            "llm_rate_limited",
+            "llm_service_unavailable",
+        }
+
+    def _is_service_unavailable_error(self, lower_message: str, status_code: int | None, exc: Exception) -> bool:
+        if status_code is not None and status_code >= 500:
+            return True
+        exception_name = exc.__class__.__name__.lower()
+        fatal_keywords = (
+            "service unavailable",
+            "temporarily unavailable",
+            "upstream unavailable",
+            "timeout",
+            "timed out",
+            "connection",
+            "connect error",
+        )
+        return any(keyword in lower_message or keyword in exception_name for keyword in fatal_keywords)
+
+    def _dump_failed_llm_request(self, request: dict[str, Any]) -> str:
+        redacted = self._redact_failed_llm_request(request)
+        text = json.dumps(redacted, ensure_ascii=False, indent=2, default=str)
+        max_chars = 20_000
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + "\n... 已截断失败报文，避免诊断消息过长。"
+
+    def _redact_failed_llm_request(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                if key.lower() in {"api_key", "token", "password", "authorization", "cookie", "secret"}:
+                    redacted[key] = "***REDACTED***"
+                    continue
+                redacted[key] = self._redact_failed_llm_request(item)
+            return redacted
+        if isinstance(value, list):
+            return [self._redact_failed_llm_request(item) for item in value]
+        if isinstance(value, str) and value.startswith("data:image/"):
+            return "[image data url redacted]"
+        return value
 
     def _extract_status_code(self, exc: Exception) -> int | None:
         status_code = getattr(exc, "status_code", None)
