@@ -18,13 +18,13 @@ llm:
     qwen:
       label: "Qwen"
       models:
-        - id: "qwen3-max"
+        - id: "qwen3.7-plus"
           thinking:
             kind: "extra_body_boolean"
             extra_body_key: "enable_thinking"
             allowed_values: ["on", "off"]
             default_value: "on"
-        - id: "qwen3.5-flash"
+        - id: "qwen3.5-omni-flash"
           thinking:
             kind: "extra_body_boolean"
             extra_body_key: "enable_thinking"
@@ -58,8 +58,8 @@ llm:
   max_tokens: 4096
   stream: true
   log_requests: true
-  title_provider: "qwen"
-  title_model: "qwen3.5-flash"
+  title_provider: "deepseek"
+  title_model: "deepseek-v4-flash"
 agent:
   default_agent_name: "life"
   max_loop_iterations: 200

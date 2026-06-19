@@ -4,7 +4,10 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from codepilot.session.agents import build_agent_profiles
+from codepilot.session.attachments import MAX_IMAGE_ATTACHMENT_BYTES
 from codepilot.skills import SkillRegistry
 from codepilot.tools import (
     EditFileTool,
@@ -87,6 +90,58 @@ def test_read_file_returns_image_attachment_for_png(tmp_path: Path) -> None:
     assert result["mime"] == "image/png"
     assert result["attachments"][0]["source_path"] == str(target)
     assert "已读取图片文件" in str(result["output"])
+
+
+@pytest.mark.parametrize(
+    ("filename", "header", "expected_mime"),
+    [
+        ("sample.jpg", b"\xff\xd8\xff" + b"image-bytes", "image/jpeg"),
+        ("sample.webp", b"RIFFxxxxWEBP" + b"image-bytes", "image/webp"),
+        ("sample.gif", b"GIF89a" + b"image-bytes", "image/gif"),
+    ],
+)
+def test_read_file_returns_image_attachment_for_supported_images(
+    tmp_path: Path,
+    filename: str,
+    header: bytes,
+    expected_mime: str,
+) -> None:
+    target = tmp_path / filename
+    target.write_bytes(header)
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(target)}, context)
+
+    assert result["status"] == "ok"
+    assert result["mime"] == expected_mime
+    assert result["attachments"][0]["type"] == "image"
+    assert result["attachments"][0]["mime"] == expected_mime
+    assert result["attachments"][0]["source_path"] == str(target)
+
+
+def test_read_file_skips_llm_attachment_for_oversized_image(tmp_path: Path) -> None:
+    target = tmp_path / "large.png"
+    # 只需构造合法图片头和超限字节数，避免依赖真实图片解码。
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * MAX_IMAGE_ATTACHMENT_BYTES)
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(target)}, context)
+
+    assert result["status"] == "ok"
+    assert result["mime"] == "image/png"
+    assert result["attachments"] == []
+    assert "未发送给 LLM" in str(result["output"])
+
+
+def test_read_file_rejects_non_image_binary_file(tmp_path: Path) -> None:
+    target = tmp_path / "archive.bin"
+    target.write_bytes(b"\x80\x81\x82")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(target)}, context)
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "FileEncodingUnsupported"
 
 
 def test_write_file_creates_new_file_and_rejects_overwrite(tmp_path: Path) -> None:
