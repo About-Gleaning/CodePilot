@@ -212,8 +212,9 @@ llm:
 
 ## 使用说明
 
-- 默认主 agent 提供：`build`、`plan`
+- 内置主 agent 提供：`build`、`plan`
 - 默认 subagent 提供：`explore`
+- 自定义 agent 从 `{codepilot_home}/agents/*.md` 加载，例如本机默认目录为 `~/codepilot/agents/`
 - `build / plan` 共用同一个 `AgentLoop`
 - 若要触发人工审批，可以在任务文本中加入 `[[approve]]`
 - `echo_tool` 为无副作用示例工具，便于验证 LLM tool call 链路
@@ -226,35 +227,54 @@ Agent 分为两类：
 - 主 agent：`kind="agent"`，会通过 `/api/config` 返回给前端，可在前端下拉框直接选择。
 - subagent：`kind="subagent"`，不会出现在前端下拉框，只能由主 agent 通过 `task` 工具同步分派。
 
-新增主 agent 的步骤：
+Agent 配置采用 Markdown 文件声明，文件头是 YAML frontmatter，正文就是该 Agent 的 system prompt。
 
-1. 在 `backend/src/codepilot/session/prompts/` 新增同名 prompt 文件，例如 `review.md`。文件名必须与 `AgentProfile.name` 一致，否则后端启动时会读取失败。
-2. 在 `backend/src/codepilot/session/agents.py` 的 `build_agent_profiles()` 返回值中新增 `AgentProfile`：
+内置 agent 位于 `backend/src/codepilot/session/agent_profiles/`，当前固定包含 `build`、`plan`、`explore`。普通自定义 agent 不要改内置目录，放到运行态目录：
 
-```python
-"review": AgentProfile(
-    name="review",
-    description="执行代码审查，优先发现缺陷、风险和缺失测试。",
-    system_prompt=_load_system_prompt("review"),
-    kind="agent",
-    allowed_tools=[
-        "bash_tool",
-        "read_file",
-        "load_skill",
-        "webfetch",
-        "todo_write",
-        "todo_read",
-        "question",
-    ],
-    readonly=True,
-    max_iterations=max_iterations,
-    can_call_subagent=False,
-),
+```text
+{codepilot_home}/agents/
 ```
 
-3. 按能力配置 `allowed_tools`。`allowed_tools` 只决定当前 agent 调用 LLM 时能看到哪些工具 schema；工具仍必须先在 `backend/src/codepilot/main.py` 注册到 `ToolRegistry`。
-4. 如需让该 agent 派发 subagent，在 `allowed_tools` 中加入 `task`，并设置 `can_call_subagent=True`。
-5. 如需设为默认 agent，修改 `backend/config.yaml`：
+默认 `codepilot_home` 是 `~/codepilot`，因此本机自定义 agent 目录通常是：
+
+```text
+~/codepilot/agents/
+```
+
+新增主 agent 的步骤：
+
+1. 创建自定义 agent 目录：
+
+```bash
+mkdir -p ~/codepilot/agents
+```
+
+2. 新建一个 `.md` 文件，例如 `~/codepilot/agents/review.md`：
+
+```markdown
+---
+name: review
+kind: agent
+description: 执行代码审查，优先发现缺陷、风险和缺失测试。
+tools:
+  - bash_tool
+  - read_file
+  - load_skill
+  - webfetch
+  - todo_write
+  - todo_read
+  - question
+readonly: true
+can_call_subagent: false
+---
+你是一个代码审查 Agent。你的首要目标是发现真实缺陷、行为回归、风险和缺失测试。
+
+输出时优先列出问题，按严重程度排序，并给出文件和行号。
+```
+
+3. 重启后端。`kind: agent` 的自定义 agent 会通过 `/api/config` 返回给前端，可在前端下拉框选择。
+
+4. 如需设为默认 agent，修改 `backend/config.yaml`：
 
 ```yaml
 agent:
@@ -263,30 +283,43 @@ agent:
 
 新增 subagent 的步骤：
 
-1. 在 `backend/src/codepilot/session/prompts/` 新增同名 prompt 文件，例如 `search.md`。
-2. 在 `build_agent_profiles()` 中新增 `kind="subagent"` 的 `AgentProfile`：
+1. 同样在 `{codepilot_home}/agents/` 下创建 `.md` 文件，例如 `~/codepilot/agents/search.md`：
 
-```python
-"search": AgentProfile(
-    name="search",
-    description="只读搜索和定位代码上下文。",
-    system_prompt=_load_system_prompt("search"),
-    kind="subagent",
-    allowed_tools=["bash_tool", "read_file", "load_skill", "webfetch"],
-    readonly=True,
-    max_iterations=subagent_max_iterations,
-    can_call_subagent=False,
-),
+```markdown
+---
+name: search
+kind: subagent
+description: 只读搜索和定位代码上下文。
+tools:
+  - bash_tool
+  - read_file
+  - load_skill
+  - webfetch
+readonly: true
+can_call_subagent: false
+---
+你是一个只读搜索 subagent。你只负责定位文件、阅读上下文、总结发现，不修改任何文件。
 ```
 
-3. 不需要修改前端。`TaskTool` 会自动扫描所有 `kind="subagent"` 的 profile，并把它们写入 `task` 工具描述。
+2. 重启后端。不需要修改前端。`TaskTool` 会自动扫描所有 `kind="subagent"` 的 profile，并把它们写入 `task` 工具描述。
+
+字段说明：
+
+- `name`：agent 名称，必须全局唯一；自定义 agent 不能覆盖内置 `build`、`plan`、`explore`。
+- `kind`：`agent` 或 `subagent`。
+- `description`：简短用途说明，会展示给前端或写入 `task` 工具描述。
+- `tools`：该 agent 可见的工具名列表。工具必须已在后端 `ToolRegistry` 注册。
+- `readonly`：是否只读；只读 agent 不应配置写入类工具。
+- `max_iterations`：可选；不填时主 agent 使用 `agent.max_loop_iterations`，subagent 使用 `agent.subagent_max_loop_iterations`。
+- `can_call_subagent`：是否允许调用 subagent。设为 `true` 时，`tools` 必须包含 `task`；subagent 不允许再调用 subagent。
 
 安全与测试要求：
 
 - 只读 agent 不要配置 `write_file`、`edit_file` 等写入工具。
 - subagent 不要配置 `task`，避免递归分派。
-- Agent 专属工具必须做双重约束：除 `allowed_tools` 外，还要在工具 `execute()` 内通过 `context.agent.name` 做运行时校验。
-- 新增或调整 agent 后，更新 `backend/tests/test_file_tools.py` 中的权限断言；新增 subagent 时，必要时同步更新 `backend/tests/test_task_tool.py` 中的 `task` 工具描述断言。
+- Agent 专属工具必须做双重约束：除 Markdown `tools` 字段外，还要在工具 `execute()` 内通过 `context.agent.name` 做运行时校验。
+- 如果新增工具，不只要写到 agent 的 `tools` 字段，还必须先在后端运行时注册到 `ToolRegistry`。
+- 调整内置 agent 或 loader 行为时，更新 `backend/tests/test_agents.py` 和相关权限断言；新增 subagent 时，必要时同步更新 `backend/tests/test_task_tool.py` 中的 `task` 工具描述断言。
 - 验证命令：`cd backend && uv run pytest`；若影响前端 agent 下拉或配置返回，再执行 `cd frontend && pnpm build`。
 
 ## 当前约束
