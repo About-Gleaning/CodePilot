@@ -72,7 +72,7 @@ context:
       trigger_tokens: 128000
       trigger_ratio:
       context_window_tokens:
-  latest_rounds_to_keep: 3
+  latest_rounds_to_keep: 5
   strategies:
     llm_summary:
       enabled: true

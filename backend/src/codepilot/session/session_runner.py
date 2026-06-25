@@ -74,7 +74,7 @@ class SessionRunner:
             "workspace_path": str(self._workspace.workspace_path),
             "session_id": self._session.session_id if self._session else None,
             "status": self._session.status.value if self._session else SessionStatus.IDLE.value,
-            "agent_name": self._session.agent_name if self._session else self._config.agent.default_agent_name,
+            "agent_name": self._session.agent_name if self._session else self._default_agent_name(),
             "provider": self._session.provider if self._session else None,
             "model": self._session.model if self._session else None,
             "thinking_enabled": bool(self._session.metadata.get("thinking_enabled")) if self._session else False,
@@ -383,7 +383,7 @@ class SessionRunner:
             session_id=new_session_id(),
             workspace_id=self._workspace.workspace_id,
             workspace_path=str(self._workspace.workspace_path),
-            agent_name=gateway_input.agent_name or self._config.agent.default_agent_name,
+            agent_name=gateway_input.agent_name or self._default_agent_name(),
             provider=activated_provider.provider,
             model=selected_model,
             status=SessionStatus.RUNNING,
@@ -430,10 +430,18 @@ class SessionRunner:
 
     def _ensure_agent_supported(self, agent_name: str | None) -> None:
         """在进入执行链前显式校验 agent，避免后续字典取值抛出不友好的 KeyError。"""
-        if not agent_name or agent_name not in self._agent_profiles:
+        target_name = agent_name or self._default_agent_name()
+        if target_name not in self._agent_profiles:
             raise ValueError(f"agent `{agent_name}` 不存在或不可用")
-        if getattr(self._agent_profiles[agent_name], "kind", "agent") != "agent":
-            raise ValueError(f"agent `{agent_name}` 不能直接从前端选择")
+        if getattr(self._agent_profiles[target_name], "kind", "agent") != "agent":
+            raise ValueError(f"agent `{target_name}` 不能直接从前端选择")
+
+    def _default_agent_name(self) -> str:
+        """配置指向不存在的自定义 agent 时回退到内置 build。"""
+        configured = str(getattr(self._config.agent, "default_agent_name", "") or "").strip()
+        if configured in self._agent_profiles and getattr(self._agent_profiles[configured], "kind", "agent") == "agent":
+            return configured
+        return "build"
 
     def _build_user_message(self, gateway_input: GatewayInput) -> Message:
         """把网关输入转换为统一的用户消息结构，写入 session 消息列表。"""

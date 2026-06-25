@@ -437,10 +437,10 @@ def test_agent_tool_permissions_are_scoped() -> None:
     assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
-    assert "markitdown_convert" in profiles["life"].allowed_tools
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["build"].allowed_tools)
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["plan"].allowed_tools)
     assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "webfetch", "markitdown_convert"]
+    assert set(profiles) == {"build", "plan", "explore"}
     assert profiles["build"].kind == "agent"
     assert profiles["plan"].kind == "agent"
     assert profiles["explore"].kind == "subagent"

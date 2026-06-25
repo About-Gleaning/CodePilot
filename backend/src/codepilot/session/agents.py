@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
+import yaml
 from pydantic import BaseModel, Field
 
 
-_PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
-
-
-def _load_system_prompt(agent_name: str) -> str:
-    prompt_path = _PROMPT_DIR / f"{agent_name}.md"
-    return prompt_path.read_text(encoding="utf-8").strip()
+BUILTIN_AGENT_DIR = Path(__file__).resolve().parent / "agent_profiles"
+BUILTIN_AGENT_NAMES = frozenset({"build", "plan", "explore"})
 
 
 class AgentProfile(BaseModel):
@@ -25,84 +22,156 @@ class AgentProfile(BaseModel):
     can_call_subagent: bool = False
 
 
-def build_agent_profiles(max_iterations: int, subagent_max_iterations: int = 8) -> dict[str, AgentProfile]:
-    return {
-        "build": AgentProfile(
-            name="build",
-            description="自主完成代码开发、修复和验证任务。",
-            system_prompt=_load_system_prompt("build"),
-            kind="agent",
-            allowed_tools=[
-                "bash_tool",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "load_skill",
-                "webfetch",
-                "markitdown_convert",
-                "todo_write",
-                "todo_read",
-                "question",
-                "task",
-                "schedule_manage",
-            ],
-            readonly=False,
-            max_iterations=max_iterations,
-            can_call_subagent=True,
-        ),
-        "plan": AgentProfile(
-            name="plan",
-            description="制定只读执行计划，并在计划模式下沉淀方案。",
-            system_prompt=_load_system_prompt("plan"),
-            kind="agent",
-            allowed_tools=[
-                "bash_tool",
-                "read_file",
-                "write_plan",
-                "load_skill",
-                "webfetch",
-                "markitdown_convert",
-                "todo_write",
-                "todo_read",
-                "question",
-                "task",
-            ],
-            readonly=True,
-            max_iterations=max_iterations,
-            can_call_subagent=True,
-        ),
-        "life": AgentProfile(
-            name="life",
-            description="用户的生活助手",
-            system_prompt=_load_system_prompt("life"),
-            kind="agent",
-            allowed_tools=[
-                "bash_tool",
-                "read_file",
-                "write_file",
-                "edit_file",
-                "load_skill",
-                "webfetch",
-                "markitdown_convert",
-                "todo_write",
-                "todo_read",
-                "long_memory_write",
-                "question",
-                "task",
-                "schedule_manage",
-            ],
-            readonly=False,
-            max_iterations=max_iterations,
-            can_call_subagent=True,
-        ),
-        "explore": AgentProfile(
-            name="explore",
-            description="只读文件搜索、代码定位和上下文探查专家。",
-            system_prompt=_load_system_prompt("explore"),
-            kind="subagent",
-            allowed_tools=["bash_tool", "read_file", "load_skill", "webfetch", "markitdown_convert"],
-            readonly=True,
-            max_iterations=subagent_max_iterations,
-            can_call_subagent=False,
-        ),
-    }
+class AgentProfileError(ValueError):
+    """Agent markdown 配置错误。"""
+
+
+def build_agent_profiles(
+    max_iterations: int,
+    subagent_max_iterations: int = 8,
+    *,
+    custom_agents_root: str | Path | None = None,
+) -> dict[str, AgentProfile]:
+    """从内置目录和自定义目录加载 Agent 配置。"""
+    profiles = _load_builtin_agent_profiles(max_iterations, subagent_max_iterations)
+    custom_profiles = _load_custom_agent_profiles(custom_agents_root, max_iterations, subagent_max_iterations)
+    for name, profile in custom_profiles.items():
+        if name in profiles:
+            raise AgentProfileError(f"自定义 agent `{name}` 不能覆盖内置 agent")
+        profiles[name] = profile
+    return profiles
+
+
+def _load_builtin_agent_profiles(max_iterations: int, subagent_max_iterations: int) -> dict[str, AgentProfile]:
+    profiles = _load_agent_profiles_from_dir(BUILTIN_AGENT_DIR, max_iterations, subagent_max_iterations)
+    missing = sorted(BUILTIN_AGENT_NAMES - set(profiles))
+    if missing:
+        raise AgentProfileError(f"缺少内置 agent：{', '.join(missing)}")
+    extra = sorted(set(profiles) - BUILTIN_AGENT_NAMES)
+    if extra:
+        raise AgentProfileError(f"内置目录只能包含 build、plan、explore，发现：{', '.join(extra)}")
+    return profiles
+
+
+def _load_custom_agent_profiles(
+    custom_agents_root: str | Path | None,
+    max_iterations: int,
+    subagent_max_iterations: int,
+) -> dict[str, AgentProfile]:
+    if custom_agents_root is None:
+        return {}
+    root = Path(custom_agents_root).expanduser().resolve()
+    if not root.is_dir():
+        return {}
+    return _load_agent_profiles_from_dir(root, max_iterations, subagent_max_iterations)
+
+
+def _load_agent_profiles_from_dir(
+    root: Path,
+    max_iterations: int,
+    subagent_max_iterations: int,
+) -> dict[str, AgentProfile]:
+    profiles: dict[str, AgentProfile] = {}
+    for path in sorted(root.glob("*.md"), key=lambda item: item.name.lower()):
+        profile = parse_agent_markdown(path, max_iterations=max_iterations, subagent_max_iterations=subagent_max_iterations)
+        if profile.name in profiles:
+            raise AgentProfileError(f"agent `{profile.name}` 重复定义")
+        profiles[profile.name] = profile
+    return profiles
+
+
+def parse_agent_markdown(
+    path: Path,
+    *,
+    max_iterations: int,
+    subagent_max_iterations: int,
+) -> AgentProfile:
+    raw = path.read_text(encoding="utf-8")
+    metadata, body = _split_frontmatter(raw, path)
+    name = _require_string(metadata, "name", path)
+    kind = _require_kind(metadata, path)
+    description = _require_string(metadata, "description", path)
+    tools = _require_string_list(metadata, "tools", path)
+    readonly = _optional_bool(metadata, "readonly", default=False, path=path)
+    can_call_subagent = _optional_bool(metadata, "can_call_subagent", default=False, path=path)
+    configured_iterations = _optional_positive_int(metadata, "max_iterations", path=path)
+    iterations = configured_iterations or (subagent_max_iterations if kind == "subagent" else max_iterations)
+    prompt = body.strip()
+    if not prompt:
+        raise AgentProfileError(f"{path} 的正文 prompt 不能为空")
+    if can_call_subagent and "task" not in tools:
+        raise AgentProfileError(f"agent `{name}` can_call_subagent=true 时必须在 tools 中声明 task")
+    if kind == "subagent" and can_call_subagent:
+        raise AgentProfileError(f"subagent `{name}` 不能调用其他 subagent")
+    return AgentProfile(
+        name=name,
+        description=description,
+        system_prompt=prompt,
+        kind=kind,
+        allowed_tools=tools,
+        readonly=readonly,
+        max_iterations=iterations,
+        can_call_subagent=can_call_subagent,
+    )
+
+
+def _split_frontmatter(raw: str, path: Path) -> tuple[dict[str, Any], str]:
+    if not raw.startswith("---\n"):
+        raise AgentProfileError(f"{path} 缺少 YAML frontmatter")
+    marker = "\n---\n"
+    end = raw.find(marker, 4)
+    if end < 0:
+        raise AgentProfileError(f"{path} 的 YAML frontmatter 未正确结束")
+    metadata_raw = raw[4:end]
+    body = raw[end + len(marker) :]
+    try:
+        metadata = yaml.safe_load(metadata_raw) or {}
+    except yaml.YAMLError as exc:
+        raise AgentProfileError(f"{path} 的 YAML frontmatter 解析失败：{exc}") from exc
+    if not isinstance(metadata, dict):
+        raise AgentProfileError(f"{path} 的 YAML frontmatter 必须是对象")
+    return metadata, body
+
+
+def _require_string(metadata: dict[str, Any], key: str, path: Path) -> str:
+    value = metadata.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise AgentProfileError(f"{path} 缺少有效字段 `{key}`")
+    return value.strip()
+
+
+def _require_kind(metadata: dict[str, Any], path: Path) -> Literal["agent", "subagent"]:
+    kind = _require_string(metadata, "kind", path)
+    if kind not in {"agent", "subagent"}:
+        raise AgentProfileError(f"{path} 字段 `kind` 只能是 agent 或 subagent")
+    return kind
+
+
+def _require_string_list(metadata: dict[str, Any], key: str, path: Path) -> list[str]:
+    value = metadata.get(key)
+    if not isinstance(value, list):
+        raise AgentProfileError(f"{path} 字段 `{key}` 必须是字符串数组")
+    tools: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise AgentProfileError(f"{path} 字段 `{key}` 只能包含非空字符串")
+        tools.append(item.strip())
+    if not tools:
+        raise AgentProfileError(f"{path} 字段 `{key}` 不能为空")
+    return tools
+
+
+def _optional_bool(metadata: dict[str, Any], key: str, *, default: bool, path: Path) -> bool:
+    value = metadata.get(key, default)
+    if not isinstance(value, bool):
+        raise AgentProfileError(f"{path} 字段 `{key}` 必须是布尔值")
+    return value
+
+
+def _optional_positive_int(metadata: dict[str, Any], key: str, *, path: Path) -> int | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise AgentProfileError(f"{path} 字段 `{key}` 必须是正整数")
+    return value
