@@ -34,13 +34,14 @@ from .state import (
 )
 
 if TYPE_CHECKING:
-    from .agents import AgentProfile
+    from .agents import AgentProfile, AgentProfileError
     from .session import AgentLoop
     from .session_runner import SessionRunner
 
 __all__ = [
     "AgentLoop",
     "AgentProfile",
+    "AgentProfileError",
     "AgentState",
     "ApprovalRequest",
     "ApprovalResult",
@@ -73,7 +74,7 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     # 延迟导入重模块，避免 hooks.contracts -> session.state 时触发 session 包级循环导入。
-    if name in {"AgentProfile", "build_agent_profiles"}:
+    if name in {"AgentProfile", "AgentProfileError", "build_agent_profiles"}:
         module = import_module("codepilot.session.agents")
         return getattr(module, name)
     if name == "AgentLoop":

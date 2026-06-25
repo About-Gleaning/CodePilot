@@ -11,7 +11,6 @@ from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolPreflightRe
 from codepilot.tools.file_tool_common import FileToolError, build_tool_failure, build_tool_success, load_tool_description
 
 
-ALLOWED_SCHEDULE_TOOL_AGENTS = {"build", "life"}
 SCHEDULE_ACTIONS = {
     "list_tasks",
     "create_task",
@@ -123,8 +122,8 @@ class ScheduleManageTool(BaseTool):
     def _ensure_allowed(self, context: ToolExecutionContext | None) -> None:
         if context is None:
             raise FileToolError("schedule_manage 缺少运行上下文。", error_type="ToolContextMissing")
-        agent_name = str(getattr(context.agent, "name", "") or "")
-        if agent_name not in ALLOWED_SCHEDULE_TOOL_AGENTS:
+        allowed_tools = getattr(context.agent, "allowed_tools", []) or []
+        if self.spec.name not in allowed_tools:
             raise FileToolError("当前 Agent 不允许管理定时任务。", error_type="ScheduleToolAgentForbidden")
 
     def _list_tasks(self) -> dict[str, Any]:

@@ -23,13 +23,15 @@ Python 使用 4 空格缩进、类型标注和清晰的模块边界；文件、�
 
 新增内置工具时，工具实现统一放在 `backend/src/codepilot/tools/`，继承 `BaseTool`，在 `ToolSpec` 中声明全局唯一 `name`、面向 LLM 的 `description`、严格的 `input_schema`、`can_parallel`、`requires_approval` 和 `timeout_seconds`，并实现异步 `execute()`。较长工具说明优先放在 `backend/src/codepilot/tools/descriptions/`，避免把复杂提示词硬编码在工具类中。
 
-工具接入必须同时完成三步：在 `backend/src/codepilot/tools/__init__.py` 导出工具类；在 `backend/src/codepilot/main.py` 注册到 `ToolRegistry`；在 `backend/src/codepilot/session/agents.py` 的目标 `AgentProfile.allowed_tools` 中加入工具名。注册到 `ToolRegistry` 只表示运行时知道该工具，不代表任何 Agent 可用；`allowed_tools` 才决定当前 Agent 调用 LLM 时能看到哪些工具 schema。
+工具接入必须同时完成三步：在 `backend/src/codepilot/tools/__init__.py` 导出工具类；在运行时装配处注册到 `ToolRegistry`；在目标 Agent Markdown 文件的 `tools` 字段中加入工具名。注册到 `ToolRegistry` 只表示运行时知道该工具，不代表任何 Agent 可用；Agent Markdown 的 `tools` 才决定当前 Agent 调用 LLM 时能看到哪些工具 schema。
 
 Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要在 `execute()` 内通过 `context.agent.name` 做运行时校验，避免模型历史、手工构造请求或后续编排绕过 Agent 权限。可参考 `write_plan` 的 plan agent 限制方式。
 
 工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，默认禁止访问工作区外路径；`read_file` 读取工作区外文件和 `bash_tool` 使用工作区外 `cwd` 只能在人工审批通过后执行，或在 `human_in_the_loop.enabled=false` 的全自动模式下直接执行；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
 
 ## Agent & Subagent Runtime Guidelines
+
+Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；自定义 Agent 位于 `storage.codepilot_home/agents/*.md`，例如用户自定义 `life.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。自定义 Agent 不允许覆盖内置 Agent 名称；没有自定义 Agent 时只暴露三个内置 Agent。
 
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。
 

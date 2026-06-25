@@ -87,10 +87,11 @@ def build_schedule_tool(tmp_path, store: ScheduleStore | None = None) -> Schedul
 
 
 def build_tool_context(tmp_path, *, agent_name: str = "build") -> ToolExecutionContext:
+    allowed_tools = ["schedule_manage"] if agent_name == "build" else []
     return ToolExecutionContext(
         session=SimpleNamespace(session_id="session_1"),
         workspace=SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path),
-        agent=SimpleNamespace(name=agent_name),
+        agent=SimpleNamespace(name=agent_name, allowed_tools=allowed_tools),
     )
 
 
@@ -124,7 +125,6 @@ def test_worker_runtime_removes_question_and_keeps_approval_policy() -> None:
     assert tool_registry.get("approval_required").spec.requires_approval is True
     assert "question" not in runtime.agent_profiles["build"].allowed_tools
     assert "question" not in runtime.agent_profiles["plan"].allowed_tools
-    assert "question" not in runtime.agent_profiles["life"].allowed_tools
 
 
 def test_schedule_store_persists_tasks_atomically(tmp_path) -> None:
@@ -664,6 +664,5 @@ def test_schedule_manage_tool_is_only_exposed_to_writable_agents() -> None:
     profiles = build_agent_profiles(max_iterations=10)
 
     assert "schedule_manage" in profiles["build"].allowed_tools
-    assert "schedule_manage" in profiles["life"].allowed_tools
     assert "schedule_manage" not in profiles["plan"].allowed_tools
     assert "schedule_manage" not in profiles["explore"].allowed_tools

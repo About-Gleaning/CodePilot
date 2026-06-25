@@ -140,8 +140,8 @@ def test_long_memory_write_requires_context() -> None:
     assert result["error_type"] == "ToolContextMissing"
 
 
-def test_agent_profiles_expose_long_memory_only_to_life() -> None:
-    profiles = build_agent_profiles(max_iterations=3)
+def test_agent_profiles_expose_long_memory_only_to_life(tmp_path: Path) -> None:
+    profiles = build_agent_profiles(max_iterations=3, custom_agents_root=_write_life_agent(tmp_path))
 
     assert "long_memory_write" in profiles["life"].allowed_tools
     assert "long_memory_write" not in profiles["build"].allowed_tools
@@ -156,7 +156,7 @@ def test_system_prompt_includes_long_memory_when_apply_to_matches(tmp_path: Path
         session=_session(tmp_path, agent_name="life"),
         workspace=_workspace(tmp_path),
         agent_state=AgentState(name="life", role="life"),
-        agent_profile=build_agent_profiles(max_iterations=3)["life"],
+        agent_profile=build_agent_profiles(max_iterations=3, custom_agents_root=_write_life_agent(tmp_path))["life"],
         llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
         skill_registry=None,
     )
@@ -223,7 +223,7 @@ def test_system_prompt_omits_long_memory_when_apply_to_missing(tmp_path: Path) -
         session=_session(tmp_path, agent_name="life"),
         workspace=_workspace(tmp_path),
         agent_state=AgentState(name="life", role="life"),
-        agent_profile=build_agent_profiles(max_iterations=3)["life"],
+        agent_profile=build_agent_profiles(max_iterations=3, custom_agents_root=_write_life_agent(tmp_path))["life"],
         llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
         skill_registry=None,
     )
@@ -239,7 +239,7 @@ def test_system_prompt_omits_empty_long_memory_body(tmp_path: Path) -> None:
         session=_session(tmp_path, agent_name="life"),
         workspace=_workspace(tmp_path),
         agent_state=AgentState(name="life", role="life"),
-        agent_profile=build_agent_profiles(max_iterations=3)["life"],
+        agent_profile=build_agent_profiles(max_iterations=3, custom_agents_root=_write_life_agent(tmp_path))["life"],
         llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
         skill_registry=None,
     )
@@ -253,6 +253,38 @@ def _tool_context(tmp_path: Path, *, agent_name: str = "life") -> ToolExecutionC
         workspace=_workspace(tmp_path),
         agent=SimpleNamespace(name=agent_name),
     )
+
+
+def _write_life_agent(tmp_path: Path) -> Path:
+    agents_root = tmp_path / "agents"
+    agents_root.mkdir(parents=True, exist_ok=True)
+    (agents_root / "life.md").write_text(
+        """---
+name: life
+kind: agent
+description: 用户的生活助手
+tools:
+  - bash_tool
+  - read_file
+  - write_file
+  - edit_file
+  - load_skill
+  - webfetch
+  - markitdown_convert
+  - todo_write
+  - todo_read
+  - long_memory_write
+  - question
+  - task
+  - schedule_manage
+readonly: false
+can_call_subagent: true
+---
+生活助手 prompt。
+""",
+        encoding="utf-8",
+    )
+    return agents_root
 
 
 def _workspace(tmp_path: Path) -> SimpleNamespace:

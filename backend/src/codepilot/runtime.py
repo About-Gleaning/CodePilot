@@ -96,6 +96,7 @@ def build_runtime_bundle(
     agent_profiles = build_agent_profiles(
         max_iterations=settings.agent.max_loop_iterations,
         subagent_max_iterations=settings.agent.subagent_max_loop_iterations,
+        custom_agents_root=workspace.codepilot_home / "agents",
     )
     agent_loop = AgentLoop(
         llm_client=llm_client,
