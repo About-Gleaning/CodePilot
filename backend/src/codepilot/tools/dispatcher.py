@@ -258,6 +258,7 @@ class ToolDispatcher:
             config=config,
             tool_call_id=tool_call_id,
             stop_event=stop_event,
+            skip_approval=skip_approval,
         )
         if not skip_approval:
             try:

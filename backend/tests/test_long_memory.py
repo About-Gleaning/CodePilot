@@ -23,10 +23,13 @@ applyTo:
 def test_long_memory_write_creates_instruction_file_with_frontmatter(tmp_path: Path) -> None:
     tool = LongMemoryWriteTool(timeout_seconds=5)
 
-    result = asyncio.run(tool.execute({"content": "用户喜欢简洁直接的回答"}, context=_tool_context(tmp_path)))
+    result = asyncio.run(
+        tool.execute({"old_string": "", "new_string": "用户喜欢简洁直接的回答"}, context=_tool_context(tmp_path))
+    )
 
     memory_path = _memory_path(tmp_path)
     assert result["status"] == "ok"
+    assert result["operation"] == "append"
     assert memory_path.read_text(encoding="utf-8") == MEMORY_HEADER + "\n- 用户喜欢简洁直接的回答\n"
     assert not (tmp_path / "memory" / "long-memory.md").exists()
 
@@ -34,8 +37,8 @@ def test_long_memory_write_creates_instruction_file_with_frontmatter(tmp_path: P
 def test_long_memory_write_appends_without_repeating_frontmatter(tmp_path: Path) -> None:
     tool = LongMemoryWriteTool(timeout_seconds=5)
 
-    asyncio.run(tool.execute({"content": "第一条记忆"}, context=_tool_context(tmp_path)))
-    asyncio.run(tool.execute({"content": "第二条记忆"}, context=_tool_context(tmp_path)))
+    asyncio.run(tool.execute({"old_string": "", "new_string": "第一条记忆"}, context=_tool_context(tmp_path)))
+    asyncio.run(tool.execute({"old_string": "", "new_string": "第二条记忆"}, context=_tool_context(tmp_path)))
 
     content = _memory_path(tmp_path).read_text(encoding="utf-8")
     assert content.count("type: memory_instruction") == 1
@@ -43,10 +46,74 @@ def test_long_memory_write_appends_without_repeating_frontmatter(tmp_path: Path)
     assert "- 第二条记忆\n" in content
 
 
+def test_long_memory_write_replaces_unique_text_and_returns_diff(tmp_path: Path) -> None:
+    tool = LongMemoryWriteTool(timeout_seconds=5)
+    _write_memory(tmp_path, "applyTo:\n  - life", "- 用户喜欢详细解释。\n")
+
+    result = asyncio.run(
+        tool.execute(
+            {"old_string": "用户喜欢详细解释", "new_string": "用户喜欢简洁直接的回答"},
+            context=_tool_context(tmp_path),
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["operation"] == "replace"
+    assert result["replaced_count"] == 1
+    assert "- 用户喜欢详细解释。" in str(result["diff"])
+    assert "+- 用户喜欢简洁直接的回答。" in str(result["diff"])
+    assert "- 用户喜欢简洁直接的回答。\n" in _memory_path(tmp_path).read_text(encoding="utf-8")
+
+
+def test_long_memory_write_rejects_missing_old_string(tmp_path: Path) -> None:
+    tool = LongMemoryWriteTool(timeout_seconds=5)
+    _write_memory(tmp_path, "applyTo:\n  - life", "- 用户喜欢简洁直接的回答。\n")
+
+    result = asyncio.run(
+        tool.execute(
+            {"old_string": "不存在的记忆", "new_string": "用户喜欢详细解释"},
+            context=_tool_context(tmp_path),
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "LongMemoryTextNotFound"
+
+
+def test_long_memory_write_rejects_non_unique_old_string(tmp_path: Path) -> None:
+    tool = LongMemoryWriteTool(timeout_seconds=5)
+    _write_memory(tmp_path, "applyTo:\n  - life", "- 用户喜欢简洁。\n- 用户喜欢中文简洁回答。\n")
+
+    result = asyncio.run(
+        tool.execute(
+            {"old_string": "用户喜欢", "new_string": "用户喜欢详细解释"},
+            context=_tool_context(tmp_path),
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "LongMemoryMatchNotUnique"
+
+
+def test_long_memory_write_rejects_unchanged_replacement(tmp_path: Path) -> None:
+    tool = LongMemoryWriteTool(timeout_seconds=5)
+    _write_memory(tmp_path, "applyTo:\n  - life", "- 用户喜欢简洁。\n")
+
+    result = asyncio.run(
+        tool.execute(
+            {"old_string": "用户喜欢简洁", "new_string": "用户喜欢简洁"},
+            context=_tool_context(tmp_path),
+        )
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "LongMemoryContentUnchanged"
+
+
 def test_long_memory_write_rejects_empty_content(tmp_path: Path) -> None:
     tool = LongMemoryWriteTool(timeout_seconds=5)
 
-    result = asyncio.run(tool.execute({"content": "   "}, context=_tool_context(tmp_path)))
+    result = asyncio.run(tool.execute({"old_string": "", "new_string": "   "}, context=_tool_context(tmp_path)))
 
     assert result["status"] == "error"
     assert result["error_type"] == "LongMemoryContentEmpty"
@@ -56,7 +123,9 @@ def test_long_memory_write_rejects_empty_content(tmp_path: Path) -> None:
 def test_long_memory_write_rejects_non_life_agent(tmp_path: Path) -> None:
     tool = LongMemoryWriteTool(timeout_seconds=5)
 
-    result = asyncio.run(tool.execute({"content": "用户偏好"}, context=_tool_context(tmp_path, agent_name="build")))
+    result = asyncio.run(
+        tool.execute({"old_string": "", "new_string": "用户偏好"}, context=_tool_context(tmp_path, agent_name="build"))
+    )
 
     assert result["status"] == "error"
     assert result["error_type"] == "LongMemoryAgentForbidden"
@@ -65,7 +134,7 @@ def test_long_memory_write_rejects_non_life_agent(tmp_path: Path) -> None:
 def test_long_memory_write_requires_context() -> None:
     tool = LongMemoryWriteTool(timeout_seconds=5)
 
-    result = asyncio.run(tool.execute({"content": "用户偏好"}, context=None))
+    result = asyncio.run(tool.execute({"old_string": "", "new_string": "用户偏好"}, context=None))
 
     assert result["status"] == "error"
     assert result["error_type"] == "ToolContextMissing"

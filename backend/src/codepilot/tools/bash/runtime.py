@@ -17,13 +17,13 @@ class BashRuntimeError(Exception):
         self.error_type = error_type
 
 
-def resolve_cwd(cwd: str, workspace_root: Path) -> Path:
+def resolve_cwd(cwd: str, workspace_root: Path, *, allow_outside_workspace: bool = False) -> Path:
     raw_path = Path(cwd or ".").expanduser()
     if raw_path.is_absolute():
         target = raw_path.resolve(strict=False)
     else:
         target = (workspace_root / raw_path).resolve(strict=False)
-    if not target.is_relative_to(workspace_root):
+    if not allow_outside_workspace and not target.is_relative_to(workspace_root):
         raise BashRuntimeError(f"cwd 超出工作区范围：{cwd}", error_type="BashCwdForbidden")
     if not target.exists():
         raise BashRuntimeError(f"cwd 不存在：{target}", error_type="BashCwdNotFound")
@@ -39,10 +39,11 @@ async def run_bash_command(
     workspace_root: Path,
     settings: BashToolSettings,
     default_timeout_seconds: int,
+    allow_outside_workspace_cwd: bool = False,
 ) -> dict[str, object]:
     started = time.monotonic()
     try:
-        cwd = resolve_cwd(request.cwd, workspace_root)
+        cwd = resolve_cwd(request.cwd, workspace_root, allow_outside_workspace=allow_outside_workspace_cwd)
     except BashRuntimeError as exc:
         return BashResult(
             status="error",

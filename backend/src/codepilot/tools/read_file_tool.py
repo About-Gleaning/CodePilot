@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from codepilot.session.attachments import (
@@ -9,7 +10,7 @@ from codepilot.session.attachments import (
     detect_image_mime,
     resolve_stored_attachment_path,
 )
-from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
+from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolPreflightResult, ToolSpec
 from codepilot.tools.file_tool_common import (
     build_tool_failure,
     build_tool_success,
@@ -42,6 +43,21 @@ class ReadFileTool(BaseTool):
             requires_approval=False,
             timeout_seconds=timeout_seconds,
         )
+
+    async def preflight(
+        self,
+        args: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolPreflightResult:
+        try:
+            self._resolve_read_target(str(args.get("file_path", "")), context)
+            return ToolPreflightResult(status="allow")
+        except FileToolError as exc:
+            if exc.error_type != "FilePathForbidden":
+                return ToolPreflightResult(status="allow")
+            if self._is_non_interactive_mode(context):
+                return ToolPreflightResult(status="allow")
+            return ToolPreflightResult(status="requires_approval", reason=exc.message)
 
     async def execute(
         self,
@@ -78,7 +94,28 @@ class ReadFileTool(BaseTool):
             try:
                 return resolve_stored_attachment_path(context.workspace, file_path)
             except AttachmentError:
-                raise exc
+                return self._resolve_outside_workspace_file(file_path, context, exc)
+
+    def _resolve_outside_workspace_file(
+        self,
+        file_path: str,
+        context: ToolExecutionContext,
+        original_error: FileToolError,
+    ) -> Path:
+        if not (context.skip_approval or self._is_non_interactive_mode(context)):
+            raise original_error
+        raw_path = Path(file_path).expanduser()
+        if not raw_path.is_absolute():
+            raise original_error
+        target = raw_path.resolve(strict=False)
+        if not target.exists():
+            raise FileToolError(f"文件不存在：{target}", error_type="FileNotFound")
+        return target
+
+    def _is_non_interactive_mode(self, context: ToolExecutionContext) -> bool:
+        config = getattr(context, "config", None)
+        hitl = getattr(config, "human_in_the_loop", None)
+        return hitl is not None and not bool(getattr(hitl, "enabled", True))
 
     def _read_image_file(self, target: Any) -> dict[str, Any] | None:
         if target.is_dir():

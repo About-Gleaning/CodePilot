@@ -124,10 +124,10 @@ class ContextCompressor:
             token_estimator=self._token_estimator,
         )
         strategies: list[CompressionStrategy] = []
-        if settings.strategies.llm_summary.enabled:
-            strategies.append(LLMSummaryCompressionStrategy())
         if settings.strategies.tool_result_placeholder.enabled:
             strategies.append(ToolResultPlaceholderStrategy())
+        if settings.strategies.llm_summary.enabled:
+            strategies.append(LLMSummaryCompressionStrategy())
 
         compacted_until_message_id: str | None = None
         summary_message_id: str | None = None

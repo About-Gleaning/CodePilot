@@ -4,6 +4,7 @@ from .dispatcher import ToolDispatcher, ToolExecutionBatch, ToolResumeBatch
 from .edit_file_tool import EditFileTool
 from .load_skill_tool import LoadSkillTool
 from .long_memory_tool import LongMemoryWriteTool
+from .markitdown_tool import MarkItDownConvertTool
 from .mcp import McpToolAdapter
 from .question_tool import QuestionTool
 from .read_file_tool import ReadFileTool
@@ -21,6 +22,7 @@ __all__ = [
     "EditFileTool",
     "LoadSkillTool",
     "LongMemoryWriteTool",
+    "MarkItDownConvertTool",
     "McpToolAdapter",
     "QuestionTool",
     "ReadFileTool",

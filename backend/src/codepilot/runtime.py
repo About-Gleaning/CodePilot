@@ -30,6 +30,7 @@ from codepilot.tools import (
     EditFileTool,
     LoadSkillTool,
     LongMemoryWriteTool,
+    MarkItDownConvertTool,
     McpToolAdapter,
     QuestionTool,
     ReadFileTool,
@@ -87,6 +88,7 @@ def build_runtime_bundle(
     tool_registry.register(LongMemoryWriteTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(LoadSkillTool(registry=skill_registry, timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
+    tool_registry.register(MarkItDownConvertTool(timeout_seconds=settings.tools.default_timeout_seconds))
 
     hook_manager = build_hook_manager(settings)
     llm_client = LiteLLMClient(log_requests=settings.llm.log_requests)
