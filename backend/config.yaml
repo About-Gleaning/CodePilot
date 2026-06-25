@@ -66,10 +66,10 @@ agent:
   subagent_max_loop_iterations: 200
   subagent_max_depth: 1
 context:
-  compression_enabled: false
+  compression_enabled: true
   model_thresholds:
     default:
-      trigger_tokens: 120000
+      trigger_tokens: 128000
       trigger_ratio:
       context_window_tokens:
   latest_rounds_to_keep: 3

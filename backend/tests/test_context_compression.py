@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from codepilot.config.settings import AppSettings, ContextModelThresholdSettings
@@ -22,12 +23,14 @@ class FixedTokenEstimator:
 class StubLLMClient:
     def __init__(self) -> None:
         self.summary_calls = 0
+        self.summary_messages: list[dict[str, object]] = []
 
     def build_provider_messages(self, messages: list[Message]) -> list[dict[str, object]]:
         return [{"role": message.info.role, "content": message.text_content()} for message in messages]
 
-    async def complete_text(self, **_kwargs: object) -> str:
+    async def complete_text(self, **kwargs: object) -> str:
         self.summary_calls += 1
+        self.summary_messages = list(kwargs.get("messages") or [])
         return "用户要求实现上下文压缩，并保留最新轮次。"
 
 
@@ -153,6 +156,38 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
         assert [message.info.id for message in session.messages[1:]] == ["user_2", "assistant_2"]
         assert "历史上下文摘要" in session.messages[0].text_content()
         assert session.metadata["context_compression"]["compacted_until_message_id"] == "assistant_1"
+
+    asyncio.run(run_case())
+
+
+def test_tool_result_placeholder_runs_before_summary() -> None:
+    async def run_case() -> None:
+        session = build_session(
+            [
+                user_message("user_1", "第一轮需求"),
+                assistant_message("assistant_1", "第一轮回答", {"status": "ok", "tool_name": "bash_tool", "output": "旧结果"}),
+                user_message("user_2", "第二轮需求"),
+                assistant_message("assistant_2", "第二轮回答", {"status": "ok", "tool_name": "bash_tool", "output": "新结果"}),
+            ]
+        )
+        settings = compression_settings()
+        settings.context.strategies.tool_result_placeholder.keep_latest_tool_results = 1
+        client = StubLLMClient()
+        compressor = ContextCompressor(token_estimator=FixedTokenEstimator(100))
+
+        result = await compressor.compress(
+            session=session,
+            config=settings,
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+            llm_client=client,  # type: ignore[arg-type]
+        )
+
+        assert result.strategies == ["tool_result_placeholder", "llm_summary"]
+        summary_prompt = str(client.summary_messages[0]["content"])
+        summary_source = json.loads(summary_prompt.split("\n\n", maxsplit=1)[1])
+        compacted_tool_output = summary_source["messages_to_compact"][1]["parts"][1]["state"]["output"]
+        assert compacted_tool_output["output"] == TOOL_RESULT_PLACEHOLDER
+        assert "旧结果" not in summary_prompt
 
     asyncio.run(run_case())
 

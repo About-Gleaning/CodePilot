@@ -1,0 +1,15 @@
+把文件转换为 Markdown，适合读取 PDF、Word、PowerPoint、Excel、HTML、CSV、JSON、XML 等文档内容。
+
+使用规则：
+- `file_path` 必须是绝对路径；workspace 外真实路径需要人工审批，或在全自动模式下直接读取。
+- 也支持 `/path/from/workspace/root` 这类以 workspace 根目录为基准的绝对路径写法。
+- 支持 CodePilot 已保存的附件路径。
+- 只转换本地受控文件，不支持直接传入 URL、file URI 或 data URI。
+- 不启用 MarkItDown 插件、Azure 文档服务、音频转录、YouTube 转录或 LLM 图片描述能力。
+- 单个输入文件最大 50MB，避免大文件转换消耗过多内存和 CPU。
+- 可通过 `offset` 和 `limit` 分页返回转换后的 Markdown 行。
+- 工具结果最多保留 50000 个字符，超长内容会被截断。
+- 运行前需要后端环境安装 `markitdown` extra。
+
+失败情况：
+- 文件不存在、未获准读取 workspace 外路径、目标是目录、文件过大、格式不受支持或缺少依赖时，返回结构化错误。

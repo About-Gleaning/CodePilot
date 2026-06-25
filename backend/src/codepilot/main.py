@@ -60,7 +60,11 @@ def create_app() -> FastAPI:
     # 先完成本地工作区初始化，再装配日志、会话与运行时组件，避免后续组件缺少目录依赖。
     workspace = _build_workspace_state(repo_root, settings)
     configure_logging(settings.logging, workspace.logs_dir)
-    runtime = build_runtime_bundle(settings=settings, workspace=workspace)
+    runtime = build_runtime_bundle(
+        settings=settings,
+        workspace=workspace,
+        allow_human_interaction=settings.human_in_the_loop.enabled,
+    )
     schedule_store = ScheduleStore(workspace.workspace_dir)
     schedule_runner = ScheduleRunner(
         store=schedule_store,

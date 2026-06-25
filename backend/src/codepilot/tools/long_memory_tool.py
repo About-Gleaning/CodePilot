@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from codepilot.memory import append_long_memory
+from codepilot.memory import append_long_memory, replace_long_memory
 from codepilot.memory.long_memory import LongMemoryError
 from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
-from codepilot.tools.file_tool_common import FileToolError, build_tool_failure, build_tool_success, load_tool_description
+from codepilot.tools.file_tool_common import (
+    FileToolError,
+    build_tool_failure,
+    build_tool_success,
+    build_unified_diff,
+    load_tool_description,
+)
 
 
 class LongMemoryWriteTool(BaseTool):
@@ -16,9 +22,10 @@ class LongMemoryWriteTool(BaseTool):
             input_schema={
                 "type": "object",
                 "properties": {
-                    "content": {"type": "string", "description": "需要长期记住的精炼内容。"},
+                    "old_string": {"type": "string", "description": "要替换的原始长期记忆文本；为空表示追加。"},
+                    "new_string": {"type": "string", "description": "要追加或替换成的新长期记忆文本。"},
                 },
-                "required": ["content"],
+                "required": ["old_string", "new_string"],
                 "additionalProperties": False,
             },
             can_parallel=False,
@@ -37,15 +44,27 @@ class LongMemoryWriteTool(BaseTool):
             if context.agent.name != "life":
                 raise FileToolError("long_memory_write 只能由 life agent 调用。", error_type="LongMemoryAgentForbidden")
 
-            memory_path, bytes_written = append_long_memory(
-                context.workspace.codepilot_home,
-                str(args.get("content", "")),
-            )
+            old_string = str(args.get("old_string", ""))
+            new_string = str(args.get("new_string", ""))
+            if old_string == "":
+                memory_path, bytes_written = append_long_memory(context.workspace.codepilot_home, new_string)
+                return build_tool_success(
+                    self.spec.name,
+                    memory_path=str(memory_path),
+                    operation="append",
+                    bytes_written=bytes_written,
+                    output=f"长期记忆已保存，共写入 {bytes_written} 字节。",
+                )
+
+            memory_path, before, after = replace_long_memory(context.workspace.codepilot_home, old_string, new_string)
+            diff = build_unified_diff(memory_path, before, after)
             return build_tool_success(
                 self.spec.name,
                 memory_path=str(memory_path),
-                bytes_written=bytes_written,
-                output=f"长期记忆已保存，共写入 {bytes_written} 字节。",
+                operation="replace",
+                replaced_count=1,
+                diff=diff,
+                output=f"长期记忆已更新：{memory_path}，共处理 1 处。",
             )
         except LongMemoryError as exc:
             return build_tool_failure(

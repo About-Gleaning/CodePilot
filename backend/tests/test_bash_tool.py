@@ -12,11 +12,19 @@ from codepilot.session.agents import AgentProfile, build_agent_profiles
 from codepilot.tools import BaseTool, BashTool, ToolDispatcher, ToolExecutionContext, ToolPreflightResult, ToolRegistry, ToolSpec
 
 
-def build_context(tmp_path: Path, *, agent_name: str = "build") -> ToolExecutionContext:
+def build_context(
+    tmp_path: Path,
+    *,
+    agent_name: str = "build",
+    human_in_the_loop: bool = True,
+    skip_approval: bool = False,
+) -> ToolExecutionContext:
     return ToolExecutionContext(
         session=SimpleNamespace(session_id="session_1"),
         workspace=SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot"),
         agent=SimpleNamespace(name=agent_name),
+        config=SimpleNamespace(human_in_the_loop=SimpleNamespace(enabled=human_in_the_loop)),
+        skip_approval=skip_approval,
     )
 
 
@@ -47,6 +55,15 @@ def test_approval_mode_allowlist_allows_matched_and_requires_unmatched(tmp_path:
 def test_approval_mode_none_allows_normal_command(tmp_path: Path) -> None:
     tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
     context = build_context(tmp_path)
+
+    result = asyncio.run(tool.preflight({"command": "pwd"}, context))
+
+    assert result.status == "allow"
+
+
+def test_non_interactive_mode_skips_bash_approval_request(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="all"), timeout_seconds=5)
+    context = build_context(tmp_path, human_in_the_loop=False)
 
     result = asyncio.run(tool.preflight({"command": "pwd"}, context))
 
@@ -128,6 +145,47 @@ def test_cwd_outside_workspace_is_rejected(tmp_path: Path) -> None:
 
     assert result["status"] == "error"
     assert result["error_type"] == "BashCwdForbidden"
+
+
+def test_cwd_outside_workspace_requires_approval(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
+
+    result = asyncio.run(tool.preflight({"command": "pwd", "cwd": str(tmp_path.parent)}, build_context(tmp_path)))
+
+    assert result.status == "requires_approval"
+    assert "cwd 超出工作区范围" in str(result.reason)
+
+
+def test_cwd_outside_workspace_runs_after_approval(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
+    context = build_context(tmp_path, skip_approval=True)
+
+    result = run_tool(tool, {"command": "pwd", "cwd": str(tmp_path.parent)}, context)
+
+    assert result["status"] == "ok"
+    assert result["cwd"] == str(tmp_path.parent.resolve())
+    assert result["stdout"] == f"{tmp_path.parent.resolve()}\n"
+
+
+def test_cwd_outside_workspace_runs_in_non_interactive_mode(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="none"), timeout_seconds=5)
+    context = build_context(tmp_path, human_in_the_loop=False)
+
+    preflight = asyncio.run(tool.preflight({"command": "pwd", "cwd": str(tmp_path.parent)}, context))
+    result = run_tool(tool, {"command": "pwd", "cwd": str(tmp_path.parent)}, context)
+
+    assert preflight.status == "allow"
+    assert result["status"] == "ok"
+    assert result["stdout"] == f"{tmp_path.parent.resolve()}\n"
+
+
+def test_cwd_outside_workspace_does_not_bypass_blacklist(tmp_path: Path) -> None:
+    tool = BashTool(settings=BashToolSettings(approval_mode="none", blacklist=[["rm"]]), timeout_seconds=5)
+    context = build_context(tmp_path, human_in_the_loop=False)
+
+    result = asyncio.run(tool.preflight({"command": "rm -rf something", "cwd": str(tmp_path.parent)}, context))
+
+    assert result.status == "blocked"
 
 
 def test_command_timeout_returns_structured_result(tmp_path: Path) -> None:

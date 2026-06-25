@@ -25,6 +25,7 @@ class ToolExecutionContext:
     config: Any | None = None
     tool_call_id: str | None = None
     stop_event: Any | None = None
+    skip_approval: bool = False
 
 
 @dataclass(slots=True)

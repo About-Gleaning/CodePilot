@@ -12,6 +12,7 @@ from codepilot.skills import SkillRegistry
 from codepilot.tools import (
     EditFileTool,
     LoadSkillTool,
+    MarkItDownConvertTool,
     QuestionTool,
     ReadFileTool,
     TodoReadTool,
@@ -22,6 +23,7 @@ from codepilot.tools import (
     WritePlanTool,
 )
 from codepilot.tools.base import ToolExecutionContext
+from codepilot.tools.markitdown_tool import MAX_INPUT_BYTES
 from codepilot.tools.webfetch_tool import FetchedPage
 
 
@@ -31,11 +33,20 @@ from codepilot.tools.webfetch_tool import FetchedPage
 # 场景3：异常处理 - 拒绝越权路径、非法 URL、内网地址和不可抽取网页。
 
 
-def build_context(workspace_path: Path, workspace_dir: Path, *, agent_name: str = "build") -> ToolExecutionContext:
+def build_context(
+    workspace_path: Path,
+    workspace_dir: Path,
+    *,
+    agent_name: str = "build",
+    human_in_the_loop: bool = True,
+    skip_approval: bool = False,
+) -> ToolExecutionContext:
     return ToolExecutionContext(
         session=SimpleNamespace(session_id="session_1"),
         workspace=SimpleNamespace(workspace_path=workspace_path, workspace_dir=workspace_dir),
         agent=SimpleNamespace(name=agent_name),
+        config=SimpleNamespace(human_in_the_loop=SimpleNamespace(enabled=human_in_the_loop)),
+        skip_approval=skip_approval,
     )
 
 
@@ -77,6 +88,42 @@ def test_read_file_rejects_existing_path_outside_workspace(tmp_path: Path) -> No
     assert result["status"] == "error"
     assert result["error_type"] == "FilePathForbidden"
     assert result.get("output") is None
+
+
+def test_read_file_preflight_requires_approval_for_outside_workspace(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-readable.txt"
+    outside.write_text("secret", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = asyncio.run(ReadFileTool(timeout_seconds=1).preflight({"file_path": str(outside)}, context))
+
+    assert result.status == "requires_approval"
+    assert "路径超出工作区范围" in str(result.reason)
+
+
+def test_read_file_reads_outside_workspace_after_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-approved.txt"
+    outside.write_text("approved", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot", skip_approval=True)
+
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(outside)}, context)
+
+    assert result["status"] == "ok"
+    assert result["file_path"] == str(outside.resolve())
+    assert result["output"] == "approved"
+
+
+def test_read_file_reads_outside_workspace_in_non_interactive_mode(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-auto.txt"
+    outside.write_text("auto", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot", human_in_the_loop=False)
+
+    preflight = asyncio.run(ReadFileTool(timeout_seconds=1).preflight({"file_path": str(outside)}, context))
+    result = run_tool(ReadFileTool(timeout_seconds=1), {"file_path": str(outside)}, context)
+
+    assert preflight.status == "allow"
+    assert result["status"] == "ok"
+    assert result["output"] == "auto"
 
 
 def test_read_file_returns_image_attachment_for_png(tmp_path: Path) -> None:
@@ -142,6 +189,76 @@ def test_read_file_rejects_non_image_binary_file(tmp_path: Path) -> None:
 
     assert result["status"] == "error"
     assert result["error_type"] == "FileEncodingUnsupported"
+
+
+def test_markitdown_convert_reads_workspace_file(tmp_path: Path) -> None:
+    target = tmp_path / "document.html"
+    target.write_text("<h1>标题</h1>\n<p>正文内容</p>\n", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+    tool = MarkItDownConvertTool(timeout_seconds=1)
+    tool._convert_local_file = lambda path: "# 标题\n\n正文内容\n第二段"  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"file_path": str(target), "offset": 2, "limit": 1}, context)
+
+    assert result["status"] == "ok"
+    assert result["file_path"] == str(target)
+    assert result["output"] == "正文内容\n... (1 more lines)"
+    assert result["total_lines"] == 4
+    assert result["truncated"] is True
+
+
+def test_markitdown_convert_rejects_existing_path_outside_workspace(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-document.txt"
+    outside.write_text("secret", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = run_tool(MarkItDownConvertTool(timeout_seconds=1), {"file_path": str(outside)}, context)
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "FilePathForbidden"
+
+
+def test_markitdown_convert_preflight_requires_approval_for_outside_workspace(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-convertible.txt"
+    outside.write_text("secret", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+
+    result = asyncio.run(MarkItDownConvertTool(timeout_seconds=1).preflight({"file_path": str(outside)}, context))
+
+    assert result.status == "requires_approval"
+    assert "路径超出工作区范围" in str(result.reason)
+
+
+def test_markitdown_convert_reads_outside_workspace_after_approval(tmp_path: Path) -> None:
+    outside = tmp_path.parent / "outside-approved.md"
+    outside.write_text("approved", encoding="utf-8")
+    context = build_context(tmp_path, tmp_path / ".codepilot", skip_approval=True)
+    tool = MarkItDownConvertTool(timeout_seconds=1)
+    tool._convert_local_file = lambda path: "approved markdown"  # type: ignore[method-assign]
+
+    result = run_tool(tool, {"file_path": str(outside)}, context)
+
+    assert result["status"] == "ok"
+    assert result["file_path"] == str(outside.resolve())
+    assert result["output"] == "approved markdown"
+
+
+def test_markitdown_convert_rejects_directory_and_oversized_file(tmp_path: Path) -> None:
+    directory = tmp_path / "docs"
+    directory.mkdir()
+    oversized = tmp_path / "large.pdf"
+    with oversized.open("wb") as file:
+        file.truncate(MAX_INPUT_BYTES + 1)
+    context = build_context(tmp_path, tmp_path / ".codepilot")
+    tool = MarkItDownConvertTool(timeout_seconds=1)
+
+    directory_result = run_tool(tool, {"file_path": str(directory)}, context)
+    oversized_result = run_tool(tool, {"file_path": str(oversized)}, context)
+
+    assert directory_result["status"] == "error"
+    assert directory_result["error_type"] == "FilePathIsDirectory"
+    assert oversized_result["status"] == "error"
+    assert oversized_result["error_type"] == "MarkItDownInputTooLarge"
 
 
 def test_write_file_creates_new_file_and_rejects_overwrite(tmp_path: Path) -> None:
@@ -312,15 +429,18 @@ def test_agent_tool_permissions_are_scoped() -> None:
     assert {"bash_tool", "read_file", "write_file", "edit_file"}.issubset(profiles["build"].allowed_tools)
     assert "load_skill" in profiles["build"].allowed_tools
     assert "webfetch" in profiles["build"].allowed_tools
+    assert "markitdown_convert" in profiles["build"].allowed_tools
     assert "write_plan" in profiles["plan"].allowed_tools
     assert "load_skill" in profiles["plan"].allowed_tools
     assert "webfetch" in profiles["plan"].allowed_tools
+    assert "markitdown_convert" in profiles["plan"].allowed_tools
     assert "bash_tool" in profiles["plan"].allowed_tools
     assert "write_file" not in profiles["plan"].allowed_tools
     assert "edit_file" not in profiles["plan"].allowed_tools
+    assert "markitdown_convert" in profiles["life"].allowed_tools
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["build"].allowed_tools)
     assert {"todo_write", "todo_read", "question"}.issubset(profiles["plan"].allowed_tools)
-    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "webfetch"]
+    assert profiles["explore"].allowed_tools == ["bash_tool", "read_file", "load_skill", "webfetch", "markitdown_convert"]
     assert profiles["build"].kind == "agent"
     assert profiles["plan"].kind == "agent"
     assert profiles["explore"].kind == "subagent"
@@ -342,14 +462,16 @@ def test_file_tool_descriptions_are_loaded_into_schema() -> None:
     registry.register(TodoReadTool(timeout_seconds=1))
     registry.register(QuestionTool(timeout_seconds=1))
     registry.register(WebFetchTool(timeout_seconds=1))
+    registry.register(MarkItDownConvertTool(timeout_seconds=1))
 
     schemas = registry.get_llm_tool_schemas()
 
     descriptions = [schema["function"]["description"] for schema in schemas]  # type: ignore[index]
     assert all(isinstance(description, str) and description for description in descriptions)
-    assert any("读取 workspace 内" in description for description in descriptions)
+    assert any("workspace 外真实路径需要人工审批" in description for description in descriptions)
     assert any("写入当前 plan agent 会话" in description for description in descriptions)
     assert any("去除导航栏" in description for description in descriptions)
+    assert any("把文件转换为 Markdown" in description for description in descriptions)
 
 
 def test_webfetch_extracts_core_markdown_from_html() -> None:

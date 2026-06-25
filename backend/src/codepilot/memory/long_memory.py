@@ -64,6 +64,31 @@ def append_long_memory(codepilot_home: Path, content: str) -> tuple[Path, int]:
     return path, bytes_written
 
 
+def replace_long_memory(codepilot_home: Path, old_string: str, new_string: str) -> tuple[Path, str, str]:
+    """用普通字符串替换修改长期记忆文件中的唯一匹配内容。"""
+    normalized_new = _normalize_memory_content(new_string)
+    if old_string == normalized_new:
+        raise LongMemoryError("new_string 必须与 old_string 不同。", error_type="LongMemoryContentUnchanged")
+
+    path = long_memory_path(codepilot_home)
+    if not path.is_file():
+        raise LongMemoryError("长期记忆文件不存在，无法替换 old_string。", error_type="LongMemoryTextNotFound")
+
+    before = path.read_text(encoding="utf-8")
+    matches = before.count(old_string)
+    if matches == 0:
+        raise LongMemoryError("未找到 old_string，请重新读取长期记忆后补充上下文再试。", error_type="LongMemoryTextNotFound")
+    if matches > 1:
+        raise LongMemoryError(
+            "old_string 匹配到多处长期记忆，请补充上下文后重试。",
+            error_type="LongMemoryMatchNotUnique",
+        )
+
+    after = before.replace(old_string, normalized_new, 1)
+    path.write_text(after, encoding="utf-8")
+    return path, before, after
+
+
 def _normalize_memory_content(content: str) -> str:
     normalized = "\n  ".join(line.strip() for line in str(content).splitlines() if line.strip()).strip()
     if not normalized:
