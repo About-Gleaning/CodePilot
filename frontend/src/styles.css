@@ -2116,6 +2116,160 @@ pre {
   color: #c9f4fb;
 }
 
+.diff-review {
+  border-left-color: rgba(139, 153, 146, 0.46);
+}
+
+.diff-review summary {
+  min-height: 30px;
+}
+
+.diff-file-list {
+  display: grid;
+  gap: 10px;
+  max-height: 420px;
+  overflow: auto;
+  padding: 10px;
+  border-top: 1px solid rgba(38, 48, 44, 0.72);
+}
+
+.diff-file {
+  overflow: hidden;
+  min-width: 0;
+  border: 1px solid rgba(60, 74, 67, 0.78);
+  border-radius: 7px;
+  background: #080c0b;
+}
+
+.diff-file-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 9px;
+  border-bottom: 1px solid rgba(38, 48, 44, 0.82);
+  background: rgba(18, 24, 22, 0.92);
+}
+
+.diff-file-header > div {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+}
+
+.diff-file-header svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.diff-file-header strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #edf6ef;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-header span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--quiet);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diff-file-header code {
+  flex: 0 0 auto;
+  color: #9ce8ad;
+  font-size: 11px;
+}
+
+.diff-table {
+  overflow-x: auto;
+  background: #080c0b;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 44px 44px 26px minmax(max-content, 1fr);
+  min-width: 100%;
+  border-bottom: 1px solid rgba(38, 48, 44, 0.38);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.diff-line:last-child {
+  border-bottom: 0;
+}
+
+.diff-line-number,
+.diff-line-marker,
+.diff-line-code {
+  min-height: 22px;
+  padding: 2px 7px;
+}
+
+.diff-line-number {
+  user-select: none;
+  color: rgba(139, 153, 146, 0.62);
+  border-right: 1px solid rgba(38, 48, 44, 0.54);
+  background: rgba(12, 17, 15, 0.78);
+  text-align: right;
+}
+
+.diff-line-marker {
+  user-select: none;
+  color: rgba(139, 153, 146, 0.78);
+  border-right: 1px solid rgba(38, 48, 44, 0.42);
+  text-align: center;
+}
+
+.diff-line-code {
+  color: #dce8e0;
+  white-space: pre;
+}
+
+.diff-line.add {
+  background: rgba(46, 160, 67, 0.16);
+}
+
+.diff-line.add .diff-line-number,
+.diff-line.add .diff-line-marker {
+  color: #9ce8ad;
+  background: rgba(46, 160, 67, 0.18);
+}
+
+.diff-line.delete {
+  background: rgba(248, 81, 73, 0.15);
+}
+
+.diff-line.delete .diff-line-number,
+.diff-line.delete .diff-line-marker {
+  color: #ffb2aa;
+  background: rgba(248, 81, 73, 0.18);
+}
+
+.diff-line.hunk {
+  background: rgba(88, 199, 217, 0.11);
+}
+
+.diff-line.hunk .diff-line-number,
+.diff-line.hunk .diff-line-marker,
+.diff-line.hunk .diff-line-code {
+  color: #9ce9f3;
+  background: rgba(88, 199, 217, 0.08);
+}
+
+.diff-line.meta .diff-line-code {
+  color: var(--quiet);
+}
+
 .todo-tool-card {
   gap: 8px;
 }

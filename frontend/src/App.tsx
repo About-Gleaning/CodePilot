@@ -393,6 +393,23 @@ type TodoItem = {
   priority: 'low' | 'medium' | 'high';
 };
 
+type DiffLineKind = 'context' | 'add' | 'delete' | 'hunk' | 'meta';
+
+type DiffLine = {
+  kind: DiffLineKind;
+  content: string;
+  oldLine: number | null;
+  newLine: number | null;
+};
+
+type DiffFile = {
+  oldPath: string;
+  newPath: string;
+  lines: DiffLine[];
+  additions: number;
+  deletions: number;
+};
+
 type EventTone = 'neutral' | 'running' | 'ok' | 'warn' | 'danger';
 
 type EventViewModel = {
@@ -3354,7 +3371,7 @@ function ToolPartView({ part, index }: { part: MessagePart; index?: number }) {
       {resultText ? <OutputBlock label="结果" value={resultText} /> : null}
       {stdout ? <OutputBlock label="stdout" value={stdout} truncated={boolValue(output.stdout_truncated)} /> : null}
       {stderr ? <OutputBlock label="stderr" value={stderr} tone="warn" truncated={boolValue(output.stderr_truncated)} /> : null}
-      {diff ? <OutputBlock label="diff" value={diff} tone="diff" /> : null}
+      {diff ? <DiffOutputBlock value={diff} /> : null}
     </article>
   );
 }
@@ -3566,6 +3583,78 @@ function OutputBlock({
       </summary>
       <pre>{value}</pre>
     </details>
+  );
+}
+
+function DiffOutputBlock({ value }: { value: string }) {
+  const files = parseUnifiedDiff(value);
+  if (!files.length) {
+    return <OutputBlock label="diff" value={value} tone="diff" />;
+  }
+  const additions = files.reduce((total, file) => total + file.additions, 0);
+  const deletions = files.reduce((total, file) => total + file.deletions, 0);
+  return (
+    <details className="tool-output diff diff-review" open>
+      <summary>
+        <span>
+          <ChevronRight size={12} />
+          diff
+        </span>
+        <code>
+          {files.length} 文件 · +{formatNumber(additions)} -{formatNumber(deletions)}
+        </code>
+        <code>{formatNumber(value.length)} chars</code>
+      </summary>
+      <div className="diff-file-list">
+        {files.map((file, index) => (
+          <DiffFileView file={file} key={`${file.oldPath}-${file.newPath}-${index}`} />
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function DiffFileView({ file }: { file: DiffFile }) {
+  const title = file.newPath || file.oldPath || '变更文件';
+  const subtitle = file.oldPath && file.newPath && file.oldPath !== file.newPath ? `${file.oldPath} -> ${file.newPath}` : '';
+  return (
+    <section className="diff-file" aria-label={`文件变更 ${title}`}>
+      <header className="diff-file-header">
+        <div>
+          <FileText size={13} />
+          <strong title={title}>{title}</strong>
+          {subtitle ? <span title={subtitle}>{subtitle}</span> : null}
+        </div>
+        <code>
+          +{formatNumber(file.additions)} -{formatNumber(file.deletions)}
+        </code>
+      </header>
+      <div className="diff-table" role="table" aria-label={`${title} diff`}>
+        {file.lines.map((line, index) => (
+          <DiffLineView line={line} key={`${line.kind}-${line.oldLine ?? 'x'}-${line.newLine ?? 'x'}-${index}`} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function DiffLineView({ line }: { line: DiffLine }) {
+  const marker = line.kind === 'add' ? '+' : line.kind === 'delete' ? '-' : line.kind === 'hunk' ? '@@' : '';
+  return (
+    <div className={`diff-line ${line.kind}`} role="row">
+      <span className="diff-line-number" role="cell">
+        {line.oldLine ?? ''}
+      </span>
+      <span className="diff-line-number" role="cell">
+        {line.newLine ?? ''}
+      </span>
+      <span className="diff-line-marker" role="cell">
+        {marker}
+      </span>
+      <code className="diff-line-code" role="cell">
+        {line.content || ' '}
+      </code>
+    </div>
   );
 }
 
@@ -3793,6 +3882,91 @@ function stringValue(value: unknown) {
 
 function boolValue(value: unknown) {
   return value === true;
+}
+
+function parseUnifiedDiff(value: string): DiffFile[] {
+  const lines = value.split('\n').map((line) => line.replace(/\r$/, ''));
+  if (lines[lines.length - 1] === '') {
+    lines.pop();
+  }
+  const files: DiffFile[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+  let hasHunk = false;
+
+  const startFile = (oldPath: string, newPath: string) => {
+    files.push({ oldPath: cleanDiffPath(oldPath), newPath: cleanDiffPath(newPath), lines: [], additions: 0, deletions: 0 });
+  };
+  const currentFile = () => files[files.length - 1] || null;
+  const ensureFile = () => {
+    const file = currentFile();
+    if (file) {
+      return file;
+    }
+    startFile('', '');
+    return currentFile();
+  };
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const nextLine = lines[index + 1] || '';
+    // 只把标准 unified diff 的文件头和 hunk 当作结构信号，避免误解析普通输出。
+    if (line.startsWith('--- ') && nextLine.startsWith('+++ ')) {
+      startFile(line.slice(4), nextLine.slice(4));
+      index += 1;
+      continue;
+    }
+
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)$/.exec(line);
+    if (hunk) {
+      const file = ensureFile();
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      hasHunk = true;
+      file?.lines.push({ kind: 'hunk', content: line, oldLine: null, newLine: null });
+      continue;
+    }
+
+    const current = currentFile();
+    if (!current) {
+      continue;
+    }
+
+    if (line.startsWith('\\ ')) {
+      current.lines.push({ kind: 'meta', content: line, oldLine: null, newLine: null });
+      continue;
+    }
+    if (line.startsWith('+')) {
+      current.additions += 1;
+      current.lines.push({ kind: 'add', content: line.slice(1), oldLine: null, newLine });
+      newLine += 1;
+      continue;
+    }
+    if (line.startsWith('-')) {
+      current.deletions += 1;
+      current.lines.push({ kind: 'delete', content: line.slice(1), oldLine, newLine: null });
+      oldLine += 1;
+      continue;
+    }
+
+    const content = line.startsWith(' ') ? line.slice(1) : line;
+    current.lines.push({ kind: 'context', content, oldLine, newLine });
+    oldLine += 1;
+    newLine += 1;
+  }
+
+  return hasHunk ? files.filter((file) => file.lines.length > 0) : [];
+}
+
+function cleanDiffPath(value: string) {
+  const path = value.split('\t')[0]?.trim() || '';
+  if (path === '/dev/null') {
+    return path;
+  }
+  if (path.startsWith('a/') || path.startsWith('b/')) {
+    return path.slice(2);
+  }
+  return path;
 }
 
 async function fileToPendingAttachment(file: File): Promise<PendingAttachment> {
