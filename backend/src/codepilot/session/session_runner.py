@@ -69,6 +69,8 @@ class SessionRunner:
 
     def get_status_snapshot(self) -> dict[str, Any]:
         """返回当前会话的轻量状态快照，供外部轮询查看。"""
+        pending_human_type = self._session.metadata.get("pending_human_type") if self._session else None
+        pending_human_request = self._session.metadata.get("pending_human_request") if self._session else None
         return {
             "workspace_id": self._workspace.workspace_id,
             "workspace_path": str(self._workspace.workspace_path),
@@ -79,6 +81,8 @@ class SessionRunner:
             "model": self._session.model if self._session else None,
             "thinking_enabled": bool(self._session.metadata.get("thinking_enabled")) if self._session else False,
             "thinking_value": self._session.metadata.get("thinking_value") if self._session else None,
+            "pending_human_type": pending_human_type if isinstance(pending_human_type, str) else None,
+            "pending_human_request": pending_human_request if isinstance(pending_human_request, dict) else None,
         }
 
     def current_session_id(self) -> str | None:

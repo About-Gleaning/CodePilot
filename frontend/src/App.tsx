@@ -74,6 +74,8 @@ type StatusResponse = {
   model: string | null;
   thinking_enabled: boolean;
   thinking_value?: string | null;
+  pending_human_type?: string | null;
+  pending_human_request?: Record<string, unknown> | null;
 };
 
 type ReplayResponse = {
@@ -751,6 +753,7 @@ function App() {
       setThinkingValue(statusRes.thinking_value || '');
       setAgentName(statusRes.agent_name || 'build');
       setMessages(statusRes.session_id && getReplaySessionId(replayRes) === statusRes.session_id ? replayRes.messages : []);
+      restorePendingQuestionFromStatus(statusRes);
       setSubagentLiveDeltas({});
       setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
@@ -906,6 +909,7 @@ function App() {
     applyProviderAndModelState(next);
     setThinkingValue(next.thinking_value || '');
     setAgentName(next.agent_name || 'build');
+    restorePendingQuestionFromStatus(next);
   }
 
   async function refreshSessionHistory() {
@@ -1211,6 +1215,7 @@ function App() {
       setActiveQuestionIndex(0);
       setActiveQuestionOptionIndex(0);
       setQuestionError('');
+      restorePendingQuestionFromStatus(nextStatus);
       setLastSeq(0);
       lastSeqRef.current = 0;
       connectStream(0);
@@ -1253,6 +1258,34 @@ function App() {
 
   function initQuestionAnswers(request: QuestionRequest): Record<string, QuestionAnswer> {
     return Object.fromEntries(request.questions.map((question) => [question.id, { values: [], note: '' }]));
+  }
+
+  function restorePendingQuestionFromStatus(nextStatus: StatusResponse) {
+    if (nextStatus.status !== 'WAITING_HUMAN' || nextStatus.pending_human_type !== 'question') {
+      clearQuestionState();
+      return;
+    }
+    const request = parsePendingQuestionRequest(nextStatus.pending_human_request);
+    if (!request) {
+      clearQuestionState();
+      return;
+    }
+    if (questionRequest?.question_id === request.question_id) {
+      return;
+    }
+    setQuestionRequest(request);
+    setQuestionAnswers(initQuestionAnswers(request));
+    setActiveQuestionIndex(0);
+    setActiveQuestionOptionIndex(0);
+    setQuestionError('');
+  }
+
+  function clearQuestionState() {
+    setQuestionRequest(null);
+    setQuestionAnswers({});
+    setActiveQuestionIndex(0);
+    setActiveQuestionOptionIndex(0);
+    setQuestionError('');
   }
 
   function updateQuestionChoice(question: QuestionItem, value: string, checked: boolean) {
@@ -3794,6 +3827,16 @@ function getToolGroupId(part: MessagePart) {
 
 function isTodoTool(tool: string) {
   return tool === 'todo_write' || tool === 'todo_read';
+}
+
+function parsePendingQuestionRequest(source: unknown): QuestionRequest | null {
+  const record = asRecord(source);
+  const questionId = stringValue(record.question_id);
+  const questions = extractQuestionItems(record.questions);
+  if (!questionId || !questions?.length) {
+    return null;
+  }
+  return { question_id: questionId, questions };
 }
 
 function extractQuestionItems(source: unknown): QuestionItem[] | null {
