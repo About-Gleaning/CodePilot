@@ -7,6 +7,7 @@ from pathlib import Path
 from codepilot.config.settings import AppSettings, ContextModelThresholdSettings
 from codepilot.context import ContextCompressor, TOOL_RESULT_PLACEHOLDER
 from codepilot.events import MessageCreatedEvent, SessionCompactedEvent, SessionMetaEvent
+from codepilot.llm import LiteLLMClient
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import LLMState, Message, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
 from codepilot.utils import utc_now_iso
@@ -24,9 +25,10 @@ class StubLLMClient:
     def __init__(self) -> None:
         self.summary_calls = 0
         self.summary_messages: list[dict[str, object]] = []
+        self._message_builder = LiteLLMClient()
 
     def build_provider_messages(self, messages: list[Message]) -> list[dict[str, object]]:
-        return [{"role": message.info.role, "content": message.text_content()} for message in messages]
+        return self._message_builder.build_provider_messages(messages)  # type: ignore[return-value]
 
     async def complete_text(self, **kwargs: object) -> str:
         self.summary_calls += 1
@@ -116,6 +118,13 @@ def assistant_message(
     )
 
 
+def summary_message(message_id: str, text: str) -> Message:
+    message = user_message(message_id, text)
+    message.parts[0].synthetic = True  # type: ignore[attr-defined]
+    message.parts[0].metadata["context_summary"] = True  # type: ignore[attr-defined]
+    return message
+
+
 def compression_settings() -> AppSettings:
     settings = AppSettings()
     return settings.model_copy(
@@ -153,6 +162,11 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
 
         assert result.changed is True
         assert client.summary_calls == 1
+        assert client.summary_messages[0]["role"] == "system"
+        assert "历史对话压缩" in str(client.summary_messages[0]["content"])
+        assert [message["role"] for message in client.summary_messages[1:]] == ["user", "assistant"]
+        assert client.summary_messages[1]["content"] == "第一轮需求"
+        assert client.summary_messages[2]["content"] == "第一轮回答"
         assert [message.info.id for message in session.messages[1:]] == ["user_2", "assistant_2"]
         assert "历史上下文摘要" in session.messages[0].text_content()
         assert session.metadata["context_compression"]["compacted_until_message_id"] == "assistant_1"
@@ -183,11 +197,39 @@ def test_tool_result_placeholder_runs_before_summary() -> None:
         )
 
         assert result.strategies == ["tool_result_placeholder", "llm_summary"]
-        summary_prompt = str(client.summary_messages[0]["content"])
-        summary_source = json.loads(summary_prompt.split("\n\n", maxsplit=1)[1])
-        compacted_tool_output = summary_source["messages_to_compact"][1]["parts"][1]["state"]["output"]
-        assert compacted_tool_output["output"] == TOOL_RESULT_PLACEHOLDER
-        assert "旧结果" not in summary_prompt
+        summary_payload = json.dumps(client.summary_messages, ensure_ascii=False, default=str)
+        assert TOOL_RESULT_PLACEHOLDER in summary_payload
+        assert "旧结果" not in summary_payload
+
+    asyncio.run(run_case())
+
+
+def test_existing_summary_is_sent_as_first_old_message_when_recompressing() -> None:
+    async def run_case() -> None:
+        session = build_session(
+            [
+                summary_message("summary_1", "历史上下文摘要：\n旧摘要"),
+                user_message("user_2", "第二轮需求"),
+                assistant_message("assistant_2", "第二轮回答"),
+                user_message("user_3", "第三轮需求"),
+                assistant_message("assistant_3", "第三轮回答"),
+            ]
+        )
+        client = StubLLMClient()
+        compressor = ContextCompressor(token_estimator=FixedTokenEstimator(100))
+
+        result = await compressor.compress(
+            session=session,
+            config=compression_settings(),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+            llm_client=client,  # type: ignore[arg-type]
+        )
+
+        assert result.changed is True
+        assert [message["role"] for message in client.summary_messages[:4]] == ["system", "user", "user", "assistant"]
+        assert client.summary_messages[1]["content"] == "历史上下文摘要：\n旧摘要"
+        assert client.summary_messages[2]["content"] == "第二轮需求"
+        assert client.summary_messages[3]["content"] == "第二轮回答"
 
     asyncio.run(run_case())
 
