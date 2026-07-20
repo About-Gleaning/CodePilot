@@ -99,12 +99,14 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await runtime.start()
         await app_state.schedule_runner.start()
         try:
             yield
         finally:
             await app_state.schedule_runner.shutdown()
             await app_state.session_runner.shutdown()
+            await runtime.shutdown()
 
     app = FastAPI(title="CodePilot", version="0.1.0", lifespan=lifespan)
     app.add_middleware(

@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
 
 async def run_worker(args: argparse.Namespace) -> None:
     session_id: str | None = None
+    runtime: Any | None = None
     try:
         backend_dir = _resolve_backend_dir()
         load_dotenv(dotenv_path=backend_dir / ".env", override=False)
@@ -51,6 +52,7 @@ async def run_worker(args: argparse.Namespace) -> None:
         )
         configure_logging(settings.logging, workspace.logs_dir)
         runtime = build_runtime_bundle(settings=settings, workspace=workspace, allow_human_interaction=False)
+        await runtime.start()
         _prepare_worker_runtime(runtime)
         prompt = _read_prompt_file(Path(args.prompt_file))
         payload = GatewayInput(
@@ -86,6 +88,10 @@ async def run_worker(args: argparse.Namespace) -> None:
             error=str(exc),
         )
         raise
+    finally:
+        if runtime is not None:
+            await runtime.session_runner.shutdown()
+            await runtime.shutdown()
 
 
 async def report(

@@ -30,8 +30,13 @@ class ToolRegistry:
         agent_name = getattr(agent_profile, "name", None)
         agent_readonly = getattr(agent_profile, "readonly", None)
         for name, tool in self._tools.items():
-            if allowed_tools is not None and name not in allowed_tools:
-                continue
+            mcp_server_name = getattr(tool, "mcp_server_name", None)
+            mcp_permission = f"mcp:{mcp_server_name}" if mcp_server_name else None
+            if allowed_tools is not None:
+                if mcp_server_name and mcp_permission not in allowed_tools:
+                    continue
+                if not mcp_server_name and name not in allowed_tools:
+                    continue
             schemas.append(
                 {
                     "type": "function",

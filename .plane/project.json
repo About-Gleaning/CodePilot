@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "workspace_slug": "project-pilot",
+  "project_id": "1c4b7b35-4761-4ac6-8739-5fbcd222450e",
+  "project_identifier": "CODE",
+  "workflow": {
+    "started_state_id": "9754ee5f-a960-4dd0-9615-8df8c09d7ef8",
+    "review_state_id": "5e3d6e74-541b-4a4e-9584-653836874bcc",
+    "blocked_state_id": "f511351a-029e-430e-bc84-ef2cc28f72da"
+  }
+}

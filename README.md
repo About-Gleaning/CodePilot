@@ -14,6 +14,7 @@ CodePilot 是一个以 Web 为入口、Gateway 为统一协议层、Agent Runtim
 - 支持 Hook 基础设施与 `PromptPluginHook`
 - 支持 human-in-the-loop 状态机
 - 支持 `session.jsonl` 会话恢复与 `events.jsonl` SSE 重放
+- 支持通过官方 MCP Python SDK 接入 stdio 与 Streamable HTTP 工具服务
 
 ## 一期明确不做
 
@@ -24,9 +25,6 @@ CodePilot 是一个以 Web 为入口、Gateway 为统一协议层、Agent Runtim
 - 不实现复杂 dashboard
 - 不实现复杂权限系统
 - 不实现复杂真实工具集
-- 不实现真实 MCP 连接
-
-后续接入 MCP 时，必须使用官方 MCP Python SDK，而不是自己实现协议细节。
 
 ## 项目结构
 
@@ -322,6 +320,48 @@ can_call_subagent: false
 - 调整内置 agent 或 loader 行为时，更新 `backend/tests/test_agents.py` 和相关权限断言；新增 subagent 时，必要时同步更新 `backend/tests/test_task_tool.py` 中的 `task` 工具描述断言。
 - 验证命令：`cd backend && uv run pytest`；若影响前端 agent 下拉或配置返回，再执行 `cd frontend && pnpm build`。
 
+## MCP 工具配置
+
+MCP Server 的连接配置与 Agent 权限相互独立：`backend/config.yaml` 只决定服务是否启用，Agent Markdown 的 `tools` 字段决定该 Agent 是否能看到服务发现出的工具。
+
+```yaml
+mcp:
+  servers:
+    filesystem:
+      enabled: true
+      transport: stdio
+      command: npx
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      cwd: "."
+      env_from_process: {}
+      requires_approval: true
+      timeout_seconds: 120
+      max_output_chars: 50000
+
+    remote:
+      enabled: true
+      transport: streamable_http
+      url: "https://example.com/mcp"
+      headers_from_env:
+        Authorization: MCP_AUTHORIZATION
+      requires_approval: true
+      timeout_seconds: 120
+      max_output_chars: 50000
+```
+
+`env_from_process` 和 `headers_from_env` 的值是后端进程环境变量名，真实密钥不要写入 `config.yaml`。远程服务默认要求 HTTPS，只有回环地址允许 HTTP；stdio 的 `cwd` 必须位于当前 workspace 内。
+
+Agent 按服务授权，例如：
+
+```yaml
+tools:
+  - read_file
+  - mcp:filesystem
+  - mcp:remote
+```
+
+`mcp:filesystem` 会暴露该服务启动时发现的全部工具，实际传给 LLM 的函数名为 `mcp__filesystem__<tool>`，并保留远端参数 schema。首版不支持 `mcp:*`，也不会因为配置了 Server 就自动授权任何 Agent。MCP 调用默认需要人工审批；仅应对可信服务显式设置 `requires_approval: false`，无人值守定时任务无法执行需要审批的 MCP 工具。
+
 ## 当前约束
 
 - 一个后端实例只负责一个 workspace
@@ -331,7 +371,6 @@ can_call_subagent: false
 
 ## 后续扩展方向
 
-- MCP 适配器接入
 - 更多真实工具
 - 更完整的 subagent 编排
 - 持久化存储升级
