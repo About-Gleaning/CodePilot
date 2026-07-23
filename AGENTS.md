@@ -31,7 +31,7 @@ Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要
 
 MCP 连接必须使用官方 Python SDK，主进程和 scheduler worker 都要纳入异步启动与关闭生命周期。密钥只允许通过 `env_from_process` 或 `headers_from_env` 引用进程环境变量；默认要求人工审批，stdio 工作目录不得越出 workspace，工具输出必须截断，图片 base64 不得进入日志或会话 JSONL。
 
-工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，默认禁止访问工作区外路径；`read_file` 读取工作区外文件和 `bash_tool` 使用工作区外 `cwd` 只能在人工审批通过后执行，或在 `human_in_the_loop.enabled=false` 的全自动模式下直接执行；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
+工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，默认禁止访问工作区外路径；`read_file` 读取工作区外文件和 `bash_tool` 使用工作区外 `cwd` 只能在人工审批通过后执行，或在 `human_in_the_loop.enabled=false` 的全自动模式下直接执行；该开关只控制工具审批，不限制网页主会话的 `question` 回答。scheduler worker 与 subagent 没有独立用户回答入口，必须禁止等待 `question`；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
 
 ## Agent & Subagent Runtime Guidelines
 

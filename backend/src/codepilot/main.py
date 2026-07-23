@@ -26,6 +26,7 @@ from codepilot.memory import JsonlEventStore, JsonlSessionMemory
 from codepilot.runtime import build_hook_manager as _build_hook_manager
 from codepilot.runtime import build_runtime_bundle
 from codepilot.scheduler import ScheduleRunner, ScheduleStore
+from codepilot.skills import SkillRegistry
 from codepilot.session import SessionRunner
 from codepilot.tools import ScheduleManageTool, ToolRegistry
 
@@ -41,6 +42,7 @@ class AppContext:
     tool_registry: ToolRegistry
     hook_manager: HookManager
     llm_client: LiteLLMClient
+    skill_registry: SkillRegistry
     agent_profiles: dict[str, object]
     session_runner: SessionRunner
     schedule_store: ScheduleStore
@@ -63,7 +65,8 @@ def create_app() -> FastAPI:
     runtime = build_runtime_bundle(
         settings=settings,
         workspace=workspace,
-        allow_human_interaction=settings.human_in_the_loop.enabled,
+        allow_manual_approval=settings.human_in_the_loop.enabled,
+        allow_question_interaction=True,
     )
     schedule_store = ScheduleStore(workspace.workspace_dir)
     schedule_runner = ScheduleRunner(
@@ -91,6 +94,7 @@ def create_app() -> FastAPI:
         tool_registry=runtime.tool_registry,
         hook_manager=runtime.hook_manager,
         llm_client=runtime.llm_client,
+        skill_registry=runtime.skill_registry,
         agent_profiles=runtime.agent_profiles,
         session_runner=runtime.session_runner,
         schedule_store=schedule_store,

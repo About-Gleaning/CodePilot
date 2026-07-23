@@ -51,7 +51,12 @@ async def run_worker(args: argparse.Namespace) -> None:
             storage_workspace_dir=Path(args.storage_workspace_dir),
         )
         configure_logging(settings.logging, workspace.logs_dir)
-        runtime = build_runtime_bundle(settings=settings, workspace=workspace, allow_human_interaction=False)
+        runtime = build_runtime_bundle(
+            settings=settings,
+            workspace=workspace,
+            allow_manual_approval=False,
+            allow_question_interaction=False,
+        )
         await runtime.start()
         _prepare_worker_runtime(runtime)
         prompt = _read_prompt_file(Path(args.prompt_file))

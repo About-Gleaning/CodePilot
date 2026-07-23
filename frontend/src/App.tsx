@@ -1,9 +1,16 @@
 import { FormEvent, RefObject, useEffect, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import { useAutoScroll } from './hooks/useAutoScroll';
+import { useQuestionInteraction } from './hooks/useQuestionInteraction';
+import { useSessionStream } from './hooks/useSessionStream';
+import { ConfigSelect } from './components/ConfigSelect';
+import { AttachmentPicker, AttachmentTray } from './components/Attachments';
+import { ApprovalPanel, ScrollToBottomButton } from './components/SessionInteractions';
+import { EventItem } from './components/EventItem';
+import { MessageStream } from './components/MessageStream';
+import { ReasoningBlock, TextBlock } from './components/MessageContent';
+import type { ApprovalRequest, MessagePart, MessageRecord, PendingAttachment, QuestionAnswer, QuestionItem, QuestionRequest, SelectOption, StreamEvent, TokenUsage } from './types';
 import {
   AlertTriangle,
-  Bot,
   Brain,
   CalendarClock,
   Check,
@@ -11,12 +18,10 @@ import {
   ChevronLeft,
   ChevronRight,
   CircleDot,
-  Copy,
   Pencil,
   FileText,
   HardDrive,
   History,
-  ImagePlus,
   ListTree,
   MessageSquareText,
   OctagonAlert,
@@ -26,7 +31,6 @@ import {
   Send,
   ShieldCheck,
   SlidersHorizontal,
-  Sparkles,
   Square,
   Terminal,
   Trash2,
@@ -58,10 +62,39 @@ type ConfigResponse = {
   codepilot_home: string;
   activated_providers: ProviderOption[];
   agents: string[];
+  skills: SkillOption[];
   sse: {
     heartbeat_seconds: number;
     replay_on_connect: boolean;
   };
+};
+
+type SkillOption = {
+  name: string;
+  description: string;
+};
+
+type WorkspaceFileOption = {
+  path: string;
+};
+
+type WorkspaceFilesResponse = {
+  files: WorkspaceFileOption[];
+};
+
+type ComposerAutocomplete = {
+  kind: 'skill' | 'file';
+  trigger: '$' | '@';
+  start: number;
+  end: number;
+  query: string;
+  activeIndex: number;
+};
+
+type ComposerOption = {
+  value: string;
+  label: string;
+  description?: string;
 };
 
 type StatusResponse = {
@@ -80,6 +113,7 @@ type ReplayResponse = {
   session: Record<string, unknown> | null;
   messages: MessageRecord[];
   records: Array<Record<string, unknown>>;
+  pending_question?: QuestionRequest | null;
 };
 
 type SessionSummary = {
@@ -170,57 +204,6 @@ type ScheduleFormState = {
   day_of_week: string;
   timezone: string;
   enabled: boolean;
-};
-
-type StreamEvent = {
-  seq: number;
-  event_id: string;
-  event_type: string;
-  session_id: string | null;
-  created_at: string;
-  data: Record<string, unknown>;
-};
-
-type ApprovalRequest = {
-  approval_id: string;
-  reason: string;
-  action?: Record<string, unknown>;
-};
-
-type QuestionOption = {
-  value: string;
-  label: string;
-};
-
-type QuestionItem = {
-  id: string;
-  question: string;
-  multiple?: boolean;
-  options: QuestionOption[];
-};
-
-type QuestionRequest = {
-  question_id: string;
-  questions: QuestionItem[];
-};
-
-type QuestionAnswer = {
-  values: string[];
-  note: string;
-};
-
-type SelectOption = {
-  value: string;
-  label: string;
-};
-
-type PendingAttachment = {
-  id: string;
-  filename: string;
-  mime: string;
-  data_base64: string;
-  previewUrl: string;
-  size: number;
 };
 
 const WEEKDAY_OPTIONS: SelectOption[] = [
@@ -331,47 +314,6 @@ function buildScheduleTrigger(form: ScheduleFormState): ScheduleTrigger {
   return { kind: 'daily', time_of_day: form.time_of_day, timezone: form.timezone || null };
 }
 
-type MessageRecord = {
-  info?: {
-    id?: string;
-    session_id?: string;
-    role?: string;
-    time?: {
-      created?: number;
-      completed?: number;
-    };
-    agent?: string;
-    agent_kind?: string;
-    context_id?: string | null;
-    parent_call_id?: string | null;
-    parent_id?: string;
-    model?: {
-      provider_id?: string;
-      model_id?: string;
-    };
-    tokens?: TokenUsage | null;
-    path?: {
-      cwd?: string;
-      root?: string;
-    };
-  };
-  parts?: MessagePart[];
-};
-
-type MessagePart = Record<string, unknown> & {
-  type?: string;
-};
-
-type TokenUsage = {
-  input?: number | null;
-  output?: number | null;
-  reasoning?: number | null;
-  cache?: {
-    read?: number | null;
-    write?: number | null;
-  } | null;
-};
-
 type TokenSummary = {
   input: number;
   output: number;
@@ -431,81 +373,7 @@ type EventStats = {
 
 type MobileTab = 'messages' | 'events' | 'history' | 'action';
 
-type AutoScrollState = {
-  anchorRef: RefObject<HTMLDivElement>;
-  isAtBottom: boolean;
-  scrollToBottom: () => void;
-};
-
-const AUTO_SCROLL_BOTTOM_THRESHOLD = 96;
 const RADAR_PAGE_SIZE = 14;
-
-function useAutoScroll(signal: string, scrollRootRef?: RefObject<HTMLElement | null>): AutoScrollState {
-  const anchorRef = useRef<HTMLDivElement | null>(null);
-  const shouldFollowRef = useRef(true);
-  const [isAtBottom, setIsAtBottom] = useState(true);
-
-  const getScrollRoot = () => scrollRootRef?.current || anchorRef.current;
-
-  const readIsAtBottom = (root: HTMLElement) => {
-    return root.scrollHeight - root.scrollTop - root.clientHeight <= AUTO_SCROLL_BOTTOM_THRESHOLD;
-  };
-
-  const scrollToBottom = () => {
-    const root = getScrollRoot();
-    if (!root) {
-      return;
-    }
-    shouldFollowRef.current = true;
-    root.scrollTo({ top: root.scrollHeight, behavior: 'smooth' });
-    setIsAtBottom(true);
-  };
-
-  useEffect(() => {
-    const root = getScrollRoot();
-    if (!root) {
-      return;
-    }
-    const handleScroll = () => {
-      const nextIsAtBottom = readIsAtBottom(root);
-      shouldFollowRef.current = nextIsAtBottom;
-      setIsAtBottom(nextIsAtBottom);
-    };
-    handleScroll();
-    root.addEventListener('scroll', handleScroll, { passive: true });
-    return () => root.removeEventListener('scroll', handleScroll);
-  }, [scrollRootRef]);
-
-  useEffect(() => {
-    const root = getScrollRoot();
-    if (!root || !shouldFollowRef.current) {
-      return;
-    }
-    // 流式 token 会高频更新，使用 rAF 合并到浏览器布局周期，减少滚动抖动。
-    window.requestAnimationFrame(() => {
-      root.scrollTo({ top: root.scrollHeight, behavior: 'auto' });
-      setIsAtBottom(true);
-    });
-  }, [signal]);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (!event.altKey || event.key !== 'End') {
-        return;
-      }
-      const target = event.target as HTMLElement | null;
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
-        return;
-      }
-      event.preventDefault();
-      scrollToBottom();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
-  return { anchorRef, isAtBottom, scrollToBottom };
-}
 
 function buildMessageStreamSignal(
   messages: MessageRecord[],
@@ -562,13 +430,19 @@ type MobileConsoleProps = {
   totalTokens: number;
   eventStats: EventStats;
   latestEventView: EventViewModel | null;
+  taskInputRef: React.RefObject<HTMLTextAreaElement>;
+  composerAutocomplete: ComposerAutocomplete | null;
+  composerOptions: ComposerOption[];
+  isFileSuggestionLoading: boolean;
   questionOptionsRef: React.RefObject<HTMLDivElement>;
   questionNoteRef: React.RefObject<HTMLTextAreaElement>;
   onAgentChange: (nextValue: string) => void;
   onProviderChange: (nextValue: string) => void;
   onModelChange: (nextValue: string) => void;
   onThinkingChange: (nextValue: string) => void;
-  onTaskChange: (nextValue: string) => void;
+  onTaskChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  onComposerOptionHover: (index: number) => void;
+  onComposerOptionPick: (option: ComposerOption) => void;
   onAttachmentFiles: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
   onTaskKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => void;
@@ -599,23 +473,17 @@ function App() {
   const [model, setModel] = useState('');
   const [agentName, setAgentName] = useState('build');
   const [task, setTask] = useState('');
+  const [composerAutocomplete, setComposerAutocomplete] = useState<ComposerAutocomplete | null>(null);
+  const [fileSuggestions, setFileSuggestions] = useState<WorkspaceFileOption[]>([]);
+  const [isFileSuggestionLoading, setIsFileSuggestionLoading] = useState(false);
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [formError, setFormError] = useState('');
   const [approvalComment, setApprovalComment] = useState('');
   const [approvalRequest, setApprovalRequest] = useState<ApprovalRequest | null>(null);
-  const [questionRequest, setQuestionRequest] = useState<QuestionRequest | null>(null);
-  const [questionAnswers, setQuestionAnswers] = useState<Record<string, QuestionAnswer>>({});
-  const [activeQuestionIndex, setActiveQuestionIndex] = useState(0);
-  const [activeQuestionOptionIndex, setActiveQuestionOptionIndex] = useState(0);
-  const [questionError, setQuestionError] = useState('');
   const [messages, setMessages] = useState<MessageRecord[]>([]);
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [sessionHistory, setSessionHistory] = useState<SessionSummary[]>([]);
-  const [schedules, setSchedules] = useState<ScheduleTask[]>([]);
-  const [scheduleRuns, setScheduleRuns] = useState<ScheduleRunsResponse>({ active: [], recent: [] });
-  const [isScheduleFormOpen, setIsScheduleFormOpen] = useState(false);
-  const [scheduleForm, setScheduleForm] = useState<ScheduleFormState>(() => createDefaultScheduleForm());
-  const [scheduleError, setScheduleError] = useState('');
+  const scheduleManagement = useScheduleManagement(config, handleLoadSession);
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [loadingSessionId, setLoadingSessionId] = useState<string | null>(null);
   const [liveDelta, setLiveDelta] = useState('');
@@ -626,56 +494,68 @@ function App() {
   const [lastSeq, setLastSeq] = useState(0);
   const lastSeqRef = useRef(0);
   const currentSessionIdRef = useRef<string | null>(null);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const streamReconnectTimerRef = useRef<number | null>(null);
   const questionPanelRef = useRef<HTMLElement | null>(null);
-  const questionOptionsRef = useRef<HTMLDivElement | null>(null);
-  const questionNoteRef = useRef<HTMLTextAreaElement | null>(null);
-  const hasActiveScheduleRuns = scheduleRuns.active.length > 0;
+  const taskInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const {
+    questionRequest,
+    questionAnswers,
+    activeQuestionIndex,
+    activeQuestionOptionIndex,
+    questionError,
+    questionOptionsRef,
+    questionNoteRef,
+    setActiveQuestionIndex,
+    setActiveQuestionOptionIndex,
+    setQuestionError,
+    restorePendingQuestion,
+    clearQuestion,
+    updateQuestionChoice,
+    updateQuestionNote,
+    focusQuestionOptions,
+    moveActiveQuestion,
+    confirmActiveQuestion,
+    handleQuestionOptionsKeyDown,
+    handleQuestionNoteKeyDown,
+    handleQuestionDecline,
+  } = useQuestionInteraction({
+    onSubmit: async (request, answers) => {
+      if (!request.question_id) {
+        setFormError('回答信息仍在恢复，请稍候重试。');
+        return false;
+      }
+      setFormError('');
+      try {
+        await postJson('/api/session/input', { type: 'question_reply', question_id: request.question_id, answers });
+        await refreshStatus();
+        return true;
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : '提交回答失败');
+        return false;
+      }
+    },
+    onDecline: async (request) => {
+      setFormError('');
+      try {
+        await postJson('/api/session/input', { type: 'question_decline', question_id: request.question_id });
+        await refreshStatus();
+        return true;
+      } catch (error) {
+        setFormError(error instanceof Error ? error.message : '退出回答失败');
+        return false;
+      }
+    },
+  });
+  const { connectStream, closeStream } = useSessionStream({
+    eventTypes: Object.keys(EVENT_LABELS),
+    lastSeqRef,
+    onEvent: onStreamEvent,
+  });
   const messageStreamSignal = buildMessageStreamSignal(messages, liveDelta, liveReasoningDelta, subagentLiveDeltas, subagentLiveReasoningDeltas);
   const desktopScroll = useAutoScroll(messageStreamSignal);
 
   useEffect(() => {
     void bootstrap();
-    return () => {
-      clearStreamReconnectTimer();
-      eventSourceRef.current?.close();
-    };
-  }, []);
-
-  useEffect(() => {
-    let stopped = false;
-    let timer: number | null = null;
-
-    const scheduleNextPoll = () => {
-      const delay = hasActiveScheduleRuns ? 3000 : 30000;
-      timer = window.setTimeout(() => {
-        void poll();
-      }, delay);
-    };
-
-    const poll = async () => {
-      await refreshScheduleRuns();
-      if (!stopped) {
-        scheduleNextPoll();
-      }
-    };
-
-    scheduleNextPoll();
-    return () => {
-      stopped = true;
-      if (timer !== null) {
-        window.clearTimeout(timer);
-      }
-    };
-  }, [hasActiveScheduleRuns]);
-
-  useEffect(() => {
-    const handleFocus = () => {
-      void refreshScheduleRuns();
-    };
-    window.addEventListener('focus', handleFocus);
-    return () => window.removeEventListener('focus', handleFocus);
+    return closeStream;
   }, []);
 
   useEffect(() => {
@@ -734,15 +614,42 @@ function App() {
     }
   }, [config, provider, model]);
 
+  useEffect(() => {
+    if (composerAutocomplete?.kind !== 'file') {
+      setFileSuggestions([]);
+      setIsFileSuggestionLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      setIsFileSuggestionLoading(true);
+      try {
+        const params = new URLSearchParams({ q: composerAutocomplete.query, limit: '40' });
+        const response = await fetchJson<WorkspaceFilesResponse>(`/api/workspace/files?${params}`, { signal: controller.signal });
+        setFileSuggestions(response.files);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          setFileSuggestions([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsFileSuggestionLoading(false);
+        }
+      }
+    }, 120);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
+  }, [composerAutocomplete?.kind, composerAutocomplete?.query]);
+
   async function bootstrap() {
     try {
-      const [configRes, statusRes, replayRes, sessionsRes, schedulesRes, scheduleRunsRes] = await Promise.all([
+      const [configRes, statusRes, replayRes, sessionsRes] = await Promise.all([
         fetchJson<ConfigResponse>('/api/config'),
         fetchJson<StatusResponse>('/api/session/status'),
         fetchJson<ReplayResponse>('/api/session/replay'),
         fetchJson<SessionsResponse>('/api/sessions'),
-        fetchJson<SchedulesResponse>('/api/schedules'),
-        fetchJson<ScheduleRunsResponse>('/api/schedule-runs'),
       ]);
       setConfig(configRes);
       setStatus(statusRes);
@@ -750,49 +657,16 @@ function App() {
       applyProviderAndModelState(statusRes);
       setThinkingValue(statusRes.thinking_value || '');
       setAgentName(statusRes.agent_name || 'build');
-      setMessages(statusRes.session_id && getReplaySessionId(replayRes) === statusRes.session_id ? replayRes.messages : []);
+      const replayMessages = statusRes.session_id && getReplaySessionId(replayRes) === statusRes.session_id ? replayRes.messages : [];
+      setMessages(replayMessages);
+      restorePendingQuestion(statusRes.status === 'WAITING_HUMAN' ? replayRes.pending_question : null);
       setSubagentLiveDeltas({});
       setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
-      setSchedules(schedulesRes.schedules);
-      setScheduleRuns(scheduleRunsRes);
-      setScheduleForm((prev) => ({ ...prev, working_dir: prev.working_dir || configRes.workspace_path }));
       connectStream(0);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '初始化失败');
     }
-  }
-
-  function connectStream(afterSeq: number) {
-    clearStreamReconnectTimer();
-    eventSourceRef.current?.close();
-    const source = new EventSource(`/api/session/stream?after_seq=${afterSeq}`);
-    source.onmessage = (event) => {
-      const payload: StreamEvent = JSON.parse(event.data);
-      onStreamEvent(payload);
-    };
-    Object.keys(EVENT_LABELS).forEach((eventType) => {
-      source.addEventListener(eventType, (event) => {
-        const payload: StreamEvent = JSON.parse((event as MessageEvent).data);
-        onStreamEvent(payload);
-      });
-    });
-    source.onerror = () => {
-      if (eventSourceRef.current !== source) {
-        return;
-      }
-      source.close();
-      streamReconnectTimerRef.current = window.setTimeout(() => connectStream(lastSeqRef.current), 1200);
-    };
-    eventSourceRef.current = source;
-  }
-
-  function clearStreamReconnectTimer() {
-    if (streamReconnectTimerRef.current === null) {
-      return;
-    }
-    window.clearTimeout(streamReconnectTimerRef.current);
-    streamReconnectTimerRef.current = null;
   }
 
   function onStreamEvent(event: StreamEvent) {
@@ -873,19 +747,10 @@ function App() {
       setApprovalComment('');
     }
     if (event.event_type === 'human_question_required') {
-      const request = event.data as QuestionRequest;
-      setQuestionRequest(request);
-      setQuestionAnswers(initQuestionAnswers(request));
-      setActiveQuestionIndex(0);
-      setActiveQuestionOptionIndex(0);
-      setQuestionError('');
+      restorePendingQuestion(event.data);
     }
     if (event.event_type === 'human_question_resolved') {
-      setQuestionRequest(null);
-      setQuestionAnswers({});
-      setActiveQuestionIndex(0);
-      setActiveQuestionOptionIndex(0);
-      setQuestionError('');
+      clearQuestion();
     }
     if (
       event.event_type === 'session_started' ||
@@ -913,124 +778,6 @@ function App() {
     setSessionHistory(next.sessions);
   }
 
-  async function refreshSchedules() {
-    const next = await fetchJson<SchedulesResponse>('/api/schedules');
-    setSchedules(next.schedules);
-  }
-
-  async function refreshScheduleRuns() {
-    try {
-      const [runsRes, schedulesRes] = await Promise.all([
-        fetchJson<ScheduleRunsResponse>('/api/schedule-runs'),
-        fetchJson<SchedulesResponse>('/api/schedules'),
-      ]);
-      setScheduleRuns(runsRes);
-      setSchedules(schedulesRes.schedules);
-    } catch (error) {
-      setScheduleError(error instanceof Error ? error.message : '刷新定时任务失败');
-    }
-  }
-
-  async function handleSaveSchedule(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setScheduleError('');
-    if (!scheduleForm.provider) {
-      setScheduleError('请先选择 provider');
-      return;
-    }
-    if (!scheduleForm.model) {
-      setScheduleError('请先选择 model');
-      return;
-    }
-    try {
-      const payload = {
-        name: scheduleForm.name,
-        prompt: scheduleForm.prompt,
-        agent_name: scheduleForm.agent_name,
-        provider: scheduleForm.provider,
-        model: scheduleForm.model,
-        working_dir: scheduleForm.working_dir,
-        enabled: scheduleForm.enabled,
-        trigger: buildScheduleTrigger(scheduleForm),
-      };
-      if (scheduleForm.editing_id) {
-        await requestJson(`/api/schedules/${scheduleForm.editing_id}`, { method: 'PATCH', body: payload });
-      } else {
-        await postJson('/api/schedules', payload);
-      }
-      setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
-      setIsScheduleFormOpen(false);
-      await refreshSchedules();
-      await refreshScheduleRuns();
-    } catch (error) {
-      setScheduleError(error instanceof Error ? error.message : '保存定时任务失败');
-    }
-  }
-
-  function handleEditSchedule(task: ScheduleTask) {
-    setScheduleError('');
-    setScheduleForm(scheduleToForm(task));
-    setIsScheduleFormOpen(true);
-  }
-
-  function handleCancelScheduleEdit() {
-    setScheduleError('');
-    setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
-    setIsScheduleFormOpen(false);
-  }
-
-  async function handleToggleSchedule(task: ScheduleTask) {
-    setScheduleError('');
-    try {
-      await requestJson(`/api/schedules/${task.id}`, { method: 'PATCH', body: { enabled: !task.enabled } });
-      await refreshSchedules();
-      await refreshScheduleRuns();
-    } catch (error) {
-      setScheduleError(error instanceof Error ? error.message : '更新定时任务状态失败');
-    }
-  }
-
-  async function handleDeleteSchedule(task: ScheduleTask) {
-    const confirmed = window.confirm(`删除定时任务「${task.name}」？未启动的等待任务会被取消，正在运行的 worker 不会被终止。`);
-    if (!confirmed) {
-      return;
-    }
-    setScheduleError('');
-    try {
-      await requestJson(`/api/schedules/${task.id}`, { method: 'DELETE' });
-      if (scheduleForm.editing_id === task.id) {
-        setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
-        setIsScheduleFormOpen(false);
-      }
-      await refreshSchedules();
-      await refreshScheduleRuns();
-    } catch (error) {
-      setScheduleError(error instanceof Error ? error.message : '删除定时任务失败');
-    }
-  }
-
-  function updateScheduleForm(patch: Partial<ScheduleFormState>) {
-    setScheduleForm((prev) => {
-      const next = { ...prev, ...patch };
-      if (patch.provider !== undefined) {
-        const providerOption = config?.activated_providers.find((item) => item.provider === patch.provider) || null;
-        if (!providerOption || !providerOption.models.includes(next.model)) {
-          next.model = '';
-        }
-      }
-      return next;
-    });
-  }
-
-  async function handleScheduleRunClick(run: ScheduleRun) {
-    if (!run.session_id) {
-      if (run.error) {
-        setScheduleError(run.error);
-      }
-      return;
-    }
-    await handleLoadSession(run.session_id);
-  }
 
   function applyProviderAndModelState(statusRes: StatusResponse) {
     if (statusRes.provider && statusRes.model) {
@@ -1067,6 +814,57 @@ function App() {
     setThinkingValue(resolveNextThinkingValue(findProviderOption(provider), nextModel, thinkingValue));
   }
 
+  function updateComposerAutocomplete(value: string, caret: number | null) {
+    const next = detectComposerAutocomplete(value, caret ?? value.length);
+    setComposerAutocomplete(next);
+    if (next?.kind !== 'file') {
+      setFileSuggestions([]);
+    }
+  }
+
+  function handleTaskChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
+    setTask(event.target.value);
+    updateComposerAutocomplete(event.target.value, event.target.selectionStart);
+  }
+
+  function currentComposerOptions(): ComposerOption[] {
+    if (!composerAutocomplete) {
+      return [];
+    }
+    if (composerAutocomplete.kind === 'skill') {
+      return buildSkillComposerOptions(config?.skills || [], composerAutocomplete.query);
+    }
+    return fileSuggestions.map((file) => ({ value: file.path, label: file.path }));
+  }
+
+  function moveComposerOption(step: number) {
+    setComposerAutocomplete((prev) => {
+      if (!prev) {
+        return prev;
+      }
+      const optionCount = currentComposerOptions().length;
+      if (optionCount <= 0) {
+        return prev;
+      }
+      return { ...prev, activeIndex: (prev.activeIndex + step + optionCount) % optionCount };
+    });
+  }
+
+  function applyComposerOption(option: ComposerOption) {
+    if (!composerAutocomplete) {
+      return;
+    }
+    const replacement = `${composerAutocomplete.trigger}${option.value} `;
+    const nextTask = `${task.slice(0, composerAutocomplete.start)}${replacement}${task.slice(composerAutocomplete.end)}`;
+    const nextCaret = composerAutocomplete.start + replacement.length;
+    setTask(nextTask);
+    setComposerAutocomplete(null);
+    window.requestAnimationFrame(() => {
+      taskInputRef.current?.focus();
+      taskInputRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
+  }
+
   async function submitTask() {
     setFormError('');
     if (!task.trim()) {
@@ -1084,7 +882,7 @@ function App() {
     try {
       const payload = {
         type: 'user_message',
-        content: task,
+        content: translateSkillShortcuts(task, config?.skills || []),
         agent_name: agentName,
         provider,
         model,
@@ -1149,6 +947,26 @@ function App() {
   }
 
   function handleTaskKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (composerAutocomplete) {
+      const options = currentComposerOptions();
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setComposerAutocomplete(null);
+        return;
+      }
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        moveComposerOption(event.key === 'ArrowDown' ? 1 : -1);
+        return;
+      }
+      if (event.key === 'Enter' || event.key === 'Tab') {
+        event.preventDefault();
+        if (options.length > 0) {
+          applyComposerOption(options[Math.min(composerAutocomplete.activeIndex, options.length - 1)]);
+        }
+        return;
+      }
+    }
     // 输入法组合态下的 Enter 应交给输入法确认候选，不能触发任务发送。
     if (event.nativeEvent.isComposing || event.keyCode === 229) {
       return;
@@ -1161,9 +979,7 @@ function App() {
   }
 
   function handleNewTask() {
-    clearStreamReconnectTimer();
-    eventSourceRef.current?.close();
-    eventSourceRef.current = null;
+    closeStream();
     currentSessionIdRef.current = null;
     setCurrentSessionId(null);
     setStatus((prev) => (prev ? { ...prev, session_id: null, status: 'IDLE' } : prev));
@@ -1176,11 +992,7 @@ function App() {
     setThinkingValue('');
     setApprovalRequest(null);
     setApprovalComment('');
-    setQuestionRequest(null);
-    setQuestionAnswers({});
-    setActiveQuestionIndex(0);
-    setActiveQuestionOptionIndex(0);
-    setQuestionError('');
+    clearQuestion();
     setFormError('');
     clearAttachments();
     setLastSeq(0);
@@ -1206,11 +1018,8 @@ function App() {
       setSubagentLiveReasoningDeltas({});
       setApprovalRequest(null);
       setApprovalComment('');
-      setQuestionRequest(null);
-      setQuestionAnswers({});
-      setActiveQuestionIndex(0);
-      setActiveQuestionOptionIndex(0);
-      setQuestionError('');
+      // 历史会话会被后端取消运行态，不能把旧的待回答表单当成可提交请求恢复。
+      restorePendingQuestion(null);
       setLastSeq(0);
       lastSeqRef.current = 0;
       connectStream(0);
@@ -1251,175 +1060,6 @@ function App() {
     }
   }
 
-  function initQuestionAnswers(request: QuestionRequest): Record<string, QuestionAnswer> {
-    return Object.fromEntries(request.questions.map((question) => [question.id, { values: [], note: '' }]));
-  }
-
-  function updateQuestionChoice(question: QuestionItem, value: string, checked: boolean) {
-    setQuestionAnswers((prev) => {
-      const current = prev[question.id] || { values: [], note: '' };
-      const values = question.multiple
-        ? checked
-          ? Array.from(new Set([...current.values, value]))
-          : current.values.filter((item) => item !== value)
-        : [value];
-      return { ...prev, [question.id]: { ...current, values } };
-    });
-    setQuestionError('');
-  }
-
-  function updateQuestionNote(questionId: string, note: string) {
-    setQuestionAnswers((prev) => {
-      const current = prev[questionId] || { values: [], note: '' };
-      return { ...prev, [questionId]: { ...current, note } };
-    });
-  }
-
-  function focusQuestionOptions() {
-    window.requestAnimationFrame(() => questionOptionsRef.current?.focus());
-  }
-
-  function focusQuestionNote() {
-    window.requestAnimationFrame(() => questionNoteRef.current?.focus());
-  }
-
-  function moveActiveQuestion(step: number) {
-    if (!questionRequest) {
-      return;
-    }
-    setActiveQuestionIndex((prev) => Math.min(Math.max(prev + step, 0), questionRequest.questions.length - 1));
-    setActiveQuestionOptionIndex(0);
-    setQuestionError('');
-    focusQuestionOptions();
-  }
-
-  function handleQuestionOptionsKeyDown(event: React.KeyboardEvent<HTMLDivElement>, question: QuestionItem) {
-    if (question.options.length === 0) {
-      return;
-    }
-    const lastIndex = question.options.length - 1;
-    const chooseIndex = (nextIndex: number, shouldSelect: boolean) => {
-      const boundedIndex = Math.min(Math.max(nextIndex, 0), lastIndex);
-      setActiveQuestionOptionIndex(boundedIndex);
-      const option = question.options[boundedIndex];
-      if (option && shouldSelect) {
-        updateQuestionChoice(question, option.value, true);
-      }
-    };
-
-    if (event.key === 'Tab') {
-      event.preventDefault();
-      focusQuestionNote();
-      return;
-    }
-    if (event.key === 'ArrowDown') {
-      event.preventDefault();
-      chooseIndex(activeQuestionOptionIndex >= lastIndex ? 0 : activeQuestionOptionIndex + 1, !question.multiple);
-      return;
-    }
-    if (event.key === 'ArrowUp') {
-      event.preventDefault();
-      chooseIndex(activeQuestionOptionIndex <= 0 ? lastIndex : activeQuestionOptionIndex - 1, !question.multiple);
-      return;
-    }
-    if (event.key === 'Home') {
-      event.preventDefault();
-      chooseIndex(0, !question.multiple);
-      return;
-    }
-    if (event.key === 'End') {
-      event.preventDefault();
-      chooseIndex(lastIndex, !question.multiple);
-      return;
-    }
-    if (event.key === ' ' || event.key === 'Enter') {
-      event.preventDefault();
-      const option = question.options[activeQuestionOptionIndex];
-      const current = questionAnswers[question.id] || { values: [], note: '' };
-      if (!option) {
-        return;
-      }
-      if (event.key === ' ') {
-        updateQuestionChoice(question, option.value, question.multiple ? !current.values.includes(option.value) : true);
-        return;
-      }
-      if (current.values.length === 0) {
-        updateQuestionChoice(question, option.value, true);
-        return;
-      }
-      void confirmActiveQuestion();
-    }
-  }
-
-  function handleQuestionNoteKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key !== 'Tab') {
-      return;
-    }
-    event.preventDefault();
-    focusQuestionOptions();
-  }
-
-  async function confirmActiveQuestion() {
-    if (!questionRequest) {
-      return;
-    }
-    const question = questionRequest.questions[activeQuestionIndex];
-    if (!question) {
-      return;
-    }
-    const answer = questionAnswers[question.id] || { values: [], note: '' };
-    if (answer.values.length === 0) {
-      setQuestionError('请先选择一个选项。');
-      return;
-    }
-    setQuestionError('');
-    if (activeQuestionIndex < questionRequest.questions.length - 1) {
-      setActiveQuestionIndex((prev) => prev + 1);
-      setActiveQuestionOptionIndex(0);
-      focusQuestionOptions();
-      return;
-    }
-    await handleQuestionReply();
-  }
-
-  async function handleQuestionReply() {
-    if (!questionRequest) {
-      return;
-    }
-    setFormError('');
-    try {
-      await postJson('/api/session/input', {
-        type: 'question_reply',
-        question_id: questionRequest.question_id,
-        answers: questionAnswers,
-      });
-      await refreshStatus();
-    } catch (error) {
-      setFormError(error instanceof Error ? error.message : '提交回答失败');
-    }
-  }
-
-  async function handleQuestionDecline() {
-    if (!questionRequest) {
-      return;
-    }
-    setFormError('');
-    try {
-      await postJson('/api/session/input', {
-        type: 'question_decline',
-        question_id: questionRequest.question_id,
-      });
-      setQuestionRequest(null);
-      setQuestionAnswers({});
-      setActiveQuestionIndex(0);
-      setActiveQuestionOptionIndex(0);
-      setQuestionError('');
-      await refreshStatus();
-    } catch (error) {
-      setFormError(error instanceof Error ? error.message : '退出回答失败');
-    }
-  }
-
   const selectedProvider = findProviderOption(provider);
   const modelOptions = selectedProvider?.models || [];
   const selectedThinking = getThinkingCapability(selectedProvider, model);
@@ -1433,6 +1073,7 @@ function App() {
   const totalTokens = tokenSummary.input + tokenSummary.output + tokenSummary.reasoning;
   const eventStats = summarizeEventStats(events);
   const latestEventView = eventStats.latest ? buildEventViewModel(eventStats.latest) : null;
+  const composerOptions = currentComposerOptions();
   const isMobileEntry = window.location.pathname === '/mobile';
 
   if (isMobileEntry) {
@@ -1473,13 +1114,19 @@ function App() {
         totalTokens={totalTokens}
         eventStats={eventStats}
         latestEventView={latestEventView}
+        taskInputRef={taskInputRef}
+        composerAutocomplete={composerAutocomplete}
+        composerOptions={composerOptions}
+        isFileSuggestionLoading={isFileSuggestionLoading}
         questionOptionsRef={questionOptionsRef}
         questionNoteRef={questionNoteRef}
         onAgentChange={setAgentName}
         onProviderChange={handleProviderChange}
         onModelChange={handleModelChange}
         onThinkingChange={setThinkingValue}
-        onTaskChange={setTask}
+        onTaskChange={handleTaskChange}
+        onComposerOptionHover={(index) => setComposerAutocomplete((prev) => (prev ? { ...prev, activeIndex: index } : prev))}
+        onComposerOptionPick={applyComposerOption}
         onAttachmentFiles={(files) => void handleAttachmentFiles(files)}
         onRemoveAttachment={removeAttachment}
         onTaskKeyDown={handleTaskKeyDown}
@@ -1590,6 +1237,10 @@ function App() {
               liveReasoningDelta={liveReasoningDelta}
               subagentLiveDeltas={subagentLiveDeltas}
               subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
+              renderParts={renderMessageParts}
+              renderStepFinish={(part, key) => <StepFinishView key={key} part={part} />}
+              formatTime={formatTime}
+              formatTokenUsage={formatTokenUsage}
             />
           </section>
           {!desktopScroll.isAtBottom ? (
@@ -1741,13 +1392,23 @@ function App() {
             </section>
           ) : (
             <>
-              <textarea
-                rows={4}
-                placeholder="输入任务。若要触发人工审批，可在文本中加入 [[approve]]。"
-                value={task}
-                onChange={(e) => setTask(e.target.value)}
-                onKeyDown={handleTaskKeyDown}
-              />
+              <div className="composer-input-shell">
+                <textarea
+                  ref={taskInputRef}
+                  rows={4}
+                  placeholder="输入任务。输入 $ 选择 skill，输入 @ 引用文件。"
+                  value={task}
+                  onChange={handleTaskChange}
+                  onKeyDown={handleTaskKeyDown}
+                />
+                <ComposerAutocompletePanel
+                  state={composerAutocomplete}
+                  options={composerOptions}
+                  loading={isFileSuggestionLoading}
+                  onHover={(index) => setComposerAutocomplete((prev) => (prev ? { ...prev, activeIndex: index } : prev))}
+                  onPick={applyComposerOption}
+                />
+              </div>
               <AttachmentTray attachments={attachments} onRemove={removeAttachment} />
             </>
           )}
@@ -1812,24 +1473,20 @@ function App() {
 
       <aside className="rail rail-right">
         <SchedulePanel
-          schedules={schedules}
-          runs={scheduleRuns}
-          form={scheduleForm}
-          error={scheduleError}
-          isFormOpen={isScheduleFormOpen}
+          schedules={scheduleManagement.schedules}
+          runs={scheduleManagement.scheduleRuns}
+          form={scheduleManagement.scheduleForm}
+          error={scheduleManagement.scheduleError}
+          isFormOpen={scheduleManagement.isScheduleFormOpen}
           config={config}
-          onToggleForm={() => {
-            setScheduleError('');
-            setScheduleForm(createDefaultScheduleForm(config?.workspace_path || ''));
-            setIsScheduleFormOpen(true);
-          }}
-          onFormChange={updateScheduleForm}
-          onSubmit={handleSaveSchedule}
-          onCancelForm={handleCancelScheduleEdit}
-          onEdit={handleEditSchedule}
-          onToggleTask={(task) => void handleToggleSchedule(task)}
-          onDelete={(task) => void handleDeleteSchedule(task)}
-          onRunClick={(run) => void handleScheduleRunClick(run)}
+          onToggleForm={scheduleManagement.handleOpenScheduleForm}
+          onFormChange={scheduleManagement.updateScheduleForm}
+          onSubmit={scheduleManagement.handleSaveSchedule}
+          onCancelForm={scheduleManagement.handleCancelScheduleEdit}
+          onEdit={scheduleManagement.handleEditSchedule}
+          onToggleTask={(task) => void scheduleManagement.handleToggleSchedule(task)}
+          onDelete={(task) => void scheduleManagement.handleDeleteSchedule(task)}
+          onRunClick={(run) => void scheduleManagement.handleScheduleRunClick(run)}
         />
 
         <EventRadarPanel events={events} stats={eventStats} latestEvent={latestEventView} />
@@ -1845,6 +1502,51 @@ function App() {
       />
     </div>
   );
+}
+
+function useScheduleManagement(config: ConfigResponse | null, onLoadSession: (sessionId: string) => Promise<void>) {
+  const [schedules, setSchedules] = useState<ScheduleTask[]>([]);
+  const [scheduleRuns, setScheduleRuns] = useState<ScheduleRunsResponse>({ active: [], recent: [] });
+  const [isScheduleFormOpen, setIsScheduleFormOpen] = useState(false);
+  const [scheduleForm, setScheduleForm] = useState<ScheduleFormState>(() => createDefaultScheduleForm());
+  const [scheduleError, setScheduleError] = useState('');
+  const refreshSchedules = async () => setSchedules((await fetchJson<SchedulesResponse>('/api/schedules')).schedules);
+  const refreshScheduleRuns = async () => {
+    try {
+      const [runs, tasks] = await Promise.all([fetchJson<ScheduleRunsResponse>('/api/schedule-runs'), fetchJson<SchedulesResponse>('/api/schedules')]);
+      setScheduleRuns(runs); setSchedules(tasks.schedules);
+    } catch (error) { setScheduleError(error instanceof Error ? error.message : '刷新定时任务失败'); }
+  };
+  useEffect(() => { void refreshScheduleRuns(); }, []);
+  useEffect(() => setScheduleForm((prev) => ({ ...prev, working_dir: prev.working_dir || config?.workspace_path || '' })), [config?.workspace_path]);
+  useEffect(() => {
+    let stopped = false;
+    const poll = async () => { await refreshScheduleRuns(); if (!stopped) timer = window.setTimeout(poll, scheduleRuns.active.length ? 3000 : 30000); };
+    let timer = window.setTimeout(poll, scheduleRuns.active.length ? 3000 : 30000);
+    return () => { stopped = true; window.clearTimeout(timer); };
+  }, [scheduleRuns.active.length]);
+  useEffect(() => { const onFocus = () => void refreshScheduleRuns(); window.addEventListener('focus', onFocus); return () => window.removeEventListener('focus', onFocus); }, []);
+  const reset = () => { setScheduleForm(createDefaultScheduleForm(config?.workspace_path || '')); setIsScheduleFormOpen(false); };
+  const handleSaveSchedule = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault(); setScheduleError('');
+    if (!scheduleForm.provider || !scheduleForm.model) { setScheduleError(`请先选择 ${scheduleForm.provider ? 'model' : 'provider'}`); return; }
+    try {
+      const payload = { name: scheduleForm.name, prompt: scheduleForm.prompt, agent_name: scheduleForm.agent_name, provider: scheduleForm.provider, model: scheduleForm.model, working_dir: scheduleForm.working_dir, enabled: scheduleForm.enabled, trigger: buildScheduleTrigger(scheduleForm) };
+      if (scheduleForm.editing_id) await requestJson(`/api/schedules/${scheduleForm.editing_id}`, { method: 'PATCH', body: payload }); else await postJson('/api/schedules', payload);
+      reset(); await refreshSchedules(); await refreshScheduleRuns();
+    } catch (error) { setScheduleError(error instanceof Error ? error.message : '保存定时任务失败'); }
+  };
+  const updateScheduleForm = (patch: Partial<ScheduleFormState>) => setScheduleForm((prev) => {
+    const next = { ...prev, ...patch };
+    if (patch.provider !== undefined && !config?.activated_providers.find((item) => item.provider === patch.provider)?.models.includes(next.model)) next.model = '';
+    return next;
+  });
+  const handleEditSchedule = (task: ScheduleTask) => { setScheduleError(''); setScheduleForm(scheduleToForm(task)); setIsScheduleFormOpen(true); };
+  const handleOpenScheduleForm = () => { setScheduleError(''); setScheduleForm(createDefaultScheduleForm(config?.workspace_path || '')); setIsScheduleFormOpen(true); };
+  const handleToggleSchedule = async (task: ScheduleTask) => { setScheduleError(''); try { await requestJson(`/api/schedules/${task.id}`, { method: 'PATCH', body: { enabled: !task.enabled } }); await refreshSchedules(); await refreshScheduleRuns(); } catch (error) { setScheduleError(error instanceof Error ? error.message : '更新定时任务状态失败'); } };
+  const handleDeleteSchedule = async (task: ScheduleTask) => { if (!window.confirm(`删除定时任务「${task.name}」？未启动的等待任务会被取消，正在运行的 worker 不会被终止。`)) return; setScheduleError(''); try { await requestJson(`/api/schedules/${task.id}`, { method: 'DELETE' }); if (scheduleForm.editing_id === task.id) reset(); await refreshSchedules(); await refreshScheduleRuns(); } catch (error) { setScheduleError(error instanceof Error ? error.message : '删除定时任务失败'); } };
+  const handleScheduleRunClick = async (run: ScheduleRun) => { if (!run.session_id) { if (run.error) setScheduleError(run.error); return; } await onLoadSession(run.session_id); };
+  return { schedules, scheduleRuns, isScheduleFormOpen, scheduleForm, scheduleError, handleOpenScheduleForm, updateScheduleForm, handleSaveSchedule, handleEditSchedule, handleCancelScheduleEdit: reset, handleToggleSchedule, handleDeleteSchedule, handleScheduleRunClick };
 }
 
 function SchedulePanel({
@@ -2350,13 +2052,24 @@ function MobileConsole(props: MobileConsoleProps) {
             <AttachmentTray attachments={props.attachments} onRemove={props.onRemoveAttachment} compact />
             <div className="mobile-input-row">
               <AttachmentPicker onFiles={props.onAttachmentFiles} compact />
-              <textarea
-                rows={2}
-                placeholder="输入任务..."
-                value={props.task}
-                onChange={(event) => props.onTaskChange(event.target.value)}
-                onKeyDown={props.onTaskKeyDown}
-              />
+              <div className="mobile-input-shell">
+                <textarea
+                  ref={props.taskInputRef}
+                  rows={2}
+                  placeholder="输入任务..."
+                  value={props.task}
+                  onChange={props.onTaskChange}
+                  onKeyDown={props.onTaskKeyDown}
+                />
+                <ComposerAutocompletePanel
+                  state={props.composerAutocomplete}
+                  options={props.composerOptions}
+                  loading={props.isFileSuggestionLoading}
+                  onHover={props.onComposerOptionHover}
+                  onPick={props.onComposerOptionPick}
+                  compact
+                />
+              </div>
               <button type="submit" className="button primary mobile-send-button" title="发送" aria-label="发送">
                 <Send size={15} />
               </button>
@@ -2364,6 +2077,59 @@ function MobileConsole(props: MobileConsoleProps) {
           </>
         )}
       </form>
+    </div>
+  );
+}
+
+function ComposerAutocompletePanel({
+  state,
+  options,
+  loading,
+  onHover,
+  onPick,
+  compact = false,
+}: {
+  state: ComposerAutocomplete | null;
+  options: ComposerOption[];
+  loading: boolean;
+  onHover: (index: number) => void;
+  onPick: (option: ComposerOption) => void;
+  compact?: boolean;
+}) {
+  if (!state) {
+    return null;
+  }
+  const title = state.kind === 'skill' ? 'Skills' : 'Files';
+  return (
+    <div className={`composer-autocomplete ${compact ? 'is-compact' : ''}`} role="listbox" aria-label={`${title} 补全`}>
+      <div className="autocomplete-heading">
+        <span>{state.trigger}</span>
+        <strong>{title}</strong>
+        {state.query ? <code>{state.query}</code> : null}
+      </div>
+      {loading ? <div className="autocomplete-empty">搜索中...</div> : null}
+      {!loading && options.length === 0 ? <div className="autocomplete-empty">无匹配结果</div> : null}
+      {!loading && options.length > 0 ? (
+        <div className="autocomplete-list">
+          {options.slice(0, 10).map((option, index) => (
+            <button
+              type="button"
+              className={`autocomplete-option ${index === state.activeIndex ? 'is-active' : ''}`}
+              key={`${state.kind}:${option.value}`}
+              onMouseEnter={() => onHover(index)}
+              onMouseDown={(event) => {
+                event.preventDefault();
+                onPick(option);
+              }}
+              role="option"
+              aria-selected={index === state.activeIndex}
+            >
+              <span>{option.label}</span>
+              {option.description ? <small>{option.description}</small> : null}
+            </button>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -2391,145 +2157,10 @@ function MobileMessagePanel({
         liveReasoningDelta={liveReasoningDelta}
         subagentLiveDeltas={subagentLiveDeltas}
         subagentLiveReasoningDeltas={subagentLiveReasoningDeltas}
-      />
-    </section>
-  );
-}
-
-function AttachmentPicker({ onFiles, compact = false }: { onFiles: (files: FileList | null) => void; compact?: boolean }) {
-  return (
-    <label className={`attachment-picker ${compact ? 'is-compact' : ''}`} title="上传图片">
-      <ImagePlus size={15} />
-      {!compact ? <span>图片</span> : null}
-      <input
-        type="file"
-        accept="image/png,image/jpeg,image/webp,image/gif"
-        multiple
-        onChange={(event) => {
-          onFiles(event.target.files);
-          event.currentTarget.value = '';
-        }}
-      />
-    </label>
-  );
-}
-
-function AttachmentTray({
-  attachments,
-  onRemove,
-  compact = false,
-}: {
-  attachments: PendingAttachment[];
-  onRemove: (id: string) => void;
-  compact?: boolean;
-}) {
-  if (!attachments.length) {
-    return null;
-  }
-  return (
-    <div className={`attachment-tray ${compact ? 'is-compact' : ''}`} aria-label="待发送图片">
-      {attachments.map((attachment) => (
-        <div className="attachment-chip" key={attachment.id}>
-          <img src={attachment.previewUrl} alt={attachment.filename} />
-          <span title={attachment.filename}>{attachment.filename}</span>
-          <small>{formatBytes(attachment.size)}</small>
-          <button type="button" onClick={() => onRemove(attachment.id)} title="移除图片" aria-label={`移除 ${attachment.filename}`}>
-            <X size={12} />
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function MessageStream({
-  messages,
-  liveDelta,
-  liveReasoningDelta,
-  subagentLiveDeltas,
-  subagentLiveReasoningDeltas,
-}: {
-  messages: MessageRecord[];
-  liveDelta: string;
-  liveReasoningDelta: string;
-  subagentLiveDeltas: Record<string, string>;
-  subagentLiveReasoningDeltas: Record<string, string>;
-}) {
-  return (
-    <>
-      {messages.length === 0 && !liveDelta && !liveReasoningDelta ? (
-        <div className="empty-state">
-          <Sparkles size={20} />
-          <p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p>
-        </div>
-      ) : null}
-
-      {messages.map((message, index) => (
-        <MessageItem key={String(message.info?.id || index)} message={message} index={index} />
-      ))}
-
-      {liveDelta || liveReasoningDelta ? (
-        <article className="message-card assistant streaming-card">
-          <div className="message-meta">
-            <span className="role-badge assistant">
-              <Bot size={13} />
-              assistant
-            </span>
-            <span className="muted-inline">streaming</span>
-          </div>
-          <LiveReasoningBlock text={liveReasoningDelta} />
-          {liveDelta ? <MarkdownContent className="message-live-text" text={liveDelta} /> : null}
-        </article>
-      ) : null}
-
-      {Array.from(new Set([...Object.keys(subagentLiveDeltas), ...Object.keys(subagentLiveReasoningDeltas)])).map((key) => (
-        <article className="message-card assistant streaming-card subagent-card" key={key}>
-          <div className="message-meta">
-            <span className="role-badge assistant">
-              <Bot size={13} />
-              subagent
-            </span>
-            <span className="muted-inline">{key}</span>
-          </div>
-          <LiveReasoningBlock text={subagentLiveReasoningDeltas[key] || ''} />
-          {subagentLiveDeltas[key] ? <MarkdownContent className="message-live-text" text={subagentLiveDeltas[key]} /> : null}
-        </article>
-      ))}
-    </>
-  );
-}
-
-function ScrollToBottomButton({ className, onClick }: { className: string; onClick: () => void }) {
-  return (
-    <button type="button" className={className} onClick={onClick} title="滚动到底部 (Alt+End)" aria-label="滚动到底部">
-      <ChevronDown size={17} />
-    </button>
-  );
-}
-
-function ApprovalPanel({
-  approvalRequest,
-  approvalComment,
-  onApprovalCommentChange,
-}: {
-  approvalRequest: ApprovalRequest;
-  approvalComment: string;
-  onApprovalCommentChange: (nextValue: string) => void;
-}) {
-  return (
-    <section className="composer-approval mobile-approval" aria-label="人工审批">
-      <div className="approval-heading">
-        <ShieldCheck size={16} />
-        <strong>人工审批</strong>
-        <code>{approvalRequest.approval_id}</code>
-      </div>
-      <p className="approval-reason">{approvalRequest.reason}</p>
-      <pre className="code-block">{JSON.stringify(approvalRequest.action || {}, null, 2)}</pre>
-      <textarea
-        rows={3}
-        placeholder="审批备注"
-        value={approvalComment}
-        onChange={(event) => onApprovalCommentChange(event.target.value)}
+        renderParts={renderMessageParts}
+        renderStepFinish={(part, key) => <StepFinishView key={key} part={part} />}
+        formatTime={formatTime}
+        formatTokenUsage={formatTokenUsage}
       />
     </section>
   );
@@ -2746,86 +2377,6 @@ function HistoryModal({
   );
 }
 
-// 原生 select 的弹层在部分浏览器中无法稳定套用暗色主题，这里只为配置区保留轻量自绘下拉。
-function ConfigSelect({
-  value,
-  options,
-  onChange,
-  disabled = false,
-}: {
-  value: string;
-  options: SelectOption[];
-  onChange: (nextValue: string) => void;
-  disabled?: boolean;
-}) {
-  const [isOpen, setIsOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const selected = options.find((item) => item.value === value) || options[0];
-
-  useEffect(() => {
-    if (!isOpen) {
-      return;
-    }
-    function handlePointerDown(event: MouseEvent) {
-      if (rootRef.current && !rootRef.current.contains(event.target as Node)) {
-        setIsOpen(false);
-      }
-    }
-    function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === 'Escape') {
-        setIsOpen(false);
-      }
-    }
-    document.addEventListener('mousedown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('mousedown', handlePointerDown);
-      document.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [isOpen]);
-
-  function handleChoose(nextValue: string) {
-    onChange(nextValue);
-    setIsOpen(false);
-  }
-
-  return (
-    <div className={`select-shell ${isOpen ? 'is-open' : ''} ${disabled ? 'is-disabled' : ''}`} ref={rootRef}>
-      <button
-        type="button"
-        className="select-trigger"
-        disabled={disabled}
-        aria-haspopup="listbox"
-        aria-expanded={isOpen}
-        onClick={() => setIsOpen((prev) => !prev)}
-      >
-        <span>{selected?.label || '-'}</span>
-        <ChevronDown size={15} aria-hidden="true" />
-      </button>
-      {isOpen ? (
-        <div className="select-menu" role="listbox">
-          {options.map((item) => {
-            const isSelected = item.value === value;
-            return (
-              <button
-                key={item.value || '__empty__'}
-                type="button"
-                className={`select-option ${isSelected ? 'is-selected' : ''}`}
-                role="option"
-                aria-selected={isSelected}
-                onClick={() => handleChoose(item.value)}
-              >
-                <span>{item.label}</span>
-                {isSelected ? <Check size={13} aria-hidden="true" /> : null}
-              </button>
-            );
-          })}
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
   return (
     <div className="metric">
@@ -2904,7 +2455,7 @@ function EventRadarPanel({
             {events.length === 0 ? (
               <p className="quiet-copy">等待关键事件。</p>
             ) : (
-              visibleEvents.map((event) => <EventItem key={event.seq} event={event} />)
+              visibleEvents.map((event) => <EventItem key={event.seq} event={event} buildView={buildEventViewModel} />)
             )}
           </div>
           {totalPages > 1 ? (
@@ -3010,136 +2561,6 @@ function TokenMeter({ summary, total }: { summary: TokenSummary; total: number }
         </span>
       </div>
     </section>
-  );
-}
-
-function MessageItem({ message, index }: { message: MessageRecord; index: number }) {
-  const [copyState, setCopyState] = useState<'idle' | 'copied' | 'failed'>('idle');
-  const role = String(message.info?.role || 'unknown');
-  const isAssistant = role === 'assistant';
-  const agentKind = String(message.info?.agent_kind || 'agent');
-  const agentName = String(message.info?.agent || '');
-  const parts = message.parts || [];
-  const stepFinishParts = parts.filter((part) => part.type === 'step-finish');
-  const bodyParts = stepFinishParts.length ? parts.filter((part) => part.type !== 'step-finish') : parts;
-  const shouldRenderCard = bodyParts.length > 0 || stepFinishParts.length === 0;
-  const copyText = buildMessageCopyText(parts);
-  const canCopy = copyText.length > 0;
-
-  async function handleCopyMessage() {
-    if (!canCopy) {
-      return;
-    }
-    const ok = await copyPlainText(copyText);
-    setCopyState(ok ? 'copied' : 'failed');
-    window.setTimeout(() => setCopyState('idle'), 1400);
-  }
-
-  return (
-    <>
-      {shouldRenderCard ? (
-        <article className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
-          <div className="message-meta">
-            <span className={`role-badge ${isAssistant ? 'assistant' : 'user'}`}>
-              {isAssistant ? <Bot size={13} /> : <Terminal size={13} />}
-              {agentKind === 'subagent' ? 'subagent' : role}
-            </span>
-            {agentName ? <span className="muted-inline">{agentName}</span> : null}
-            <span className="muted-inline">#{index + 1}</span>
-            {message.info?.parent_call_id ? <span className="muted-inline">task {message.info.parent_call_id}</span> : null}
-            {message.info?.time?.created ? (
-              <span className="muted-inline">{formatTime(message.info.time.created)}</span>
-            ) : null}
-            {isAssistant && message.info?.tokens ? (
-              <span className="muted-inline">{formatTokenUsage(message.info.tokens)}</span>
-            ) : null}
-            {canCopy ? (
-              <button
-                type="button"
-                className={`message-copy-button ${copyState === 'copied' ? 'is-copied' : ''} ${
-                  copyState === 'failed' ? 'is-failed' : ''
-                }`}
-                onClick={() => void handleCopyMessage()}
-                title={copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制消息'}
-                aria-label={copyState === 'copied' ? '已复制' : copyState === 'failed' ? '复制失败' : '复制消息'}
-              >
-                {copyState === 'copied' ? <Check size={13} /> : <Copy size={13} />}
-              </button>
-            ) : null}
-          </div>
-          <div className="message-body">{renderMessageParts(bodyParts, isAssistant)}</div>
-        </article>
-      ) : null}
-      {stepFinishParts.map((part, partIndex) => (
-        <StepFinishView key={`step-finish-${String(message.info?.id || index)}-${partIndex}`} part={part} />
-      ))}
-    </>
-  );
-}
-
-function buildMessageCopyText(parts: MessagePart[]) {
-  return parts
-    .filter((part) => part.type === 'text')
-    .map((part) => stringValue(part.text).trim())
-    .filter(Boolean)
-    .join('\n\n');
-}
-
-async function copyPlainText(text: string) {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // 部分浏览器或非安全上下文会拒绝 Clipboard API，继续走 textarea 兜底。
-  }
-  return copyPlainTextWithFallback(text);
-}
-
-function copyPlainTextWithFallback(text: string) {
-  const textarea = document.createElement('textarea');
-  textarea.value = text;
-  textarea.setAttribute('readonly', 'true');
-  textarea.style.position = 'fixed';
-  textarea.style.top = '-1000px';
-  textarea.style.opacity = '0';
-  document.body.appendChild(textarea);
-  textarea.select();
-  try {
-    return document.execCommand('copy');
-  } finally {
-    document.body.removeChild(textarea);
-  }
-}
-
-function EventItem({ event }: { event: StreamEvent }) {
-  const view = buildEventViewModel(event);
-
-  return (
-    <details className={`event-item tone-${view.tone}`}>
-      <summary>
-        <span className="event-rail">
-          <ChevronRight size={13} />
-          <span className="event-icon">{view.icon}</span>
-        </span>
-        <span className="event-main">
-          <span className="event-name">{view.title}</span>
-          <span className="event-summary" title={view.summary}>
-            {view.summary}
-          </span>
-        </span>
-        <span className="event-meta">
-          {view.chips.map((chip) => (
-            <span key={chip} title={chip}>
-              {chip}
-            </span>
-          ))}
-          <time>{view.time}</time>
-        </span>
-      </summary>
-      <pre>{JSON.stringify(event.data, null, 2)}</pre>
-    </details>
   );
 }
 
@@ -3252,57 +2673,6 @@ function ToolGroupView({ parts }: { parts: MessagePart[] }) {
         ))}
       </div>
     </section>
-  );
-}
-
-function TextBlock({ text }: { text: string }) {
-  if (!text) {
-    return <p className="empty-message">（空文本）</p>;
-  }
-  return <MarkdownContent className="message-text" text={text} />;
-}
-
-function MarkdownContent({ text, className }: { text: string; className: string }) {
-  return (
-    <div className={`markdown-body ${className}`}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-    </div>
-  );
-}
-
-function ReasoningBlock({ text }: { text: string }) {
-  if (!text) {
-    return null;
-  }
-  return (
-    <details className="reasoning-block">
-      <summary>
-        <span>
-          <CircleDot size={12} />
-          推理摘要
-        </span>
-        <small>{text.length} chars</small>
-      </summary>
-      <pre>{text}</pre>
-    </details>
-  );
-}
-
-function LiveReasoningBlock({ text }: { text: string }) {
-  if (!text) {
-    return null;
-  }
-  return (
-    <details className="reasoning-block live-reasoning-block" open>
-      <summary>
-        <span>
-          <CircleDot size={12} />
-          实时推理
-        </span>
-        <small>{text.length} chars</small>
-      </summary>
-      <pre>{text}</pre>
-    </details>
   );
 }
 
@@ -4588,8 +3958,58 @@ function getReplaySessionId(replay: ReplayResponse) {
   return typeof sessionId === 'string' ? sessionId : null;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+function detectComposerAutocomplete(value: string, caret: number): ComposerAutocomplete | null {
+  const beforeCaret = value.slice(0, caret);
+  const match = /(^|\s)([$@])([^\s$@]*)$/.exec(beforeCaret);
+  if (!match) {
+    return null;
+  }
+  const prefix = match[1] || '';
+  const trigger = match[2] as '$' | '@';
+  const query = match[3] || '';
+  const start = caret - query.length - 1;
+  if (start > 0 && !/\s/.test(prefix)) {
+    return null;
+  }
+  return {
+    kind: trigger === '$' ? 'skill' : 'file',
+    trigger,
+    start,
+    end: caret,
+    query,
+    activeIndex: 0,
+  };
+}
+
+function buildSkillComposerOptions(skills: SkillOption[], query: string): ComposerOption[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  return skills
+    .filter((skill) => {
+      if (!normalizedQuery) {
+        return true;
+      }
+      return skill.name.toLowerCase().includes(normalizedQuery) || skill.description.toLowerCase().includes(normalizedQuery);
+    })
+    .slice(0, 20)
+    .map((skill) => ({ value: skill.name, label: skill.name, description: skill.description }));
+}
+
+function translateSkillShortcuts(value: string, skills: SkillOption[]) {
+  if (!skills.length) {
+    return value;
+  }
+  const skillNames = new Map(skills.map((skill) => [skill.name.toLowerCase(), skill.name]));
+  return value.replace(/(^|\s)\$([A-Za-z0-9_.-]+)/g, (raw, prefix: string, name: string) => {
+    const skillName = skillNames.get(name.toLowerCase());
+    if (!skillName) {
+      return raw;
+    }
+    return `${prefix}使用 ${skillName} skill`;
+  });
+}
+
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
   if (!response.ok) {
     throw new Error(`请求失败: ${url}`);
   }

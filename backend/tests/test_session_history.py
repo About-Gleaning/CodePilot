@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from codepilot.events import EventBus, HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
+from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.llm.client import LiteLLMClient
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
@@ -321,6 +322,53 @@ def test_human_interaction_question_resolved_completes_pending_tool_on_replay(tm
         assert tool_part["state"]["output"]["answers"]["target"]["values"] == ["backend"]
         assert replayed_message["parts"][1]["reason"] == "tool_completed"
         assert replayed_message["info"]["finish"] == "tool_completed"
+
+    asyncio.run(run_case())
+
+
+def test_pending_question_replay_uses_human_interaction_request(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        session = build_session("session_1", status=SessionStatus.WAITING_HUMAN)
+        await persist_session(memory, session, [build_question_message(session.session_id, "msg_question_1")])
+        pending = HumanInteractionEvent(
+            session_id=session.session_id,
+            interaction_id="question_1",
+            created_at="2026-05-29T10:03:00Z",
+            data={
+                "kind": "question",
+                "status": "pending",
+                "interaction_id": "question_1",
+                "request": {
+                    "question_id": "question_1",
+                    "questions": [{"id": "target", "question": "目标是什么？"}],
+                    "created_at": "2026-05-29T10:03:00Z",
+                },
+            },
+        )
+        await memory.handle_domain_event(pending)
+
+        replay = await memory.replay(session.session_id)
+
+        assert replay["pending_question"] == pending.data["request"]
+
+        await memory.handle_domain_event(
+            HumanInteractionEvent(
+                session_id=session.session_id,
+                interaction_id="question_1",
+                created_at="2026-05-29T10:04:00Z",
+                data={
+                    "kind": "question",
+                    "status": "resolved",
+                    "interaction_id": "question_1",
+                    "message_id": "msg_question_1",
+                    "call_id": "call_question_1",
+                    "result": {"question_id": "question_1", "answers": {}},
+                },
+            )
+        )
+
+        assert (await memory.replay(session.session_id))["pending_question"] is None
 
     asyncio.run(run_case())
 
@@ -672,4 +720,28 @@ def test_session_runner_rejects_load_when_current_session_is_running() -> None:
                 "messages": [],
                 "records": [],
             },
+        )
+
+
+def test_session_runner_rejects_stale_question_reply_id() -> None:
+    runner = SessionRunner(
+        workspace=SimpleNamespace(workspace_id="ws_1", workspace_path="/tmp/codepilot"),
+        config=SimpleNamespace(agent=SimpleNamespace(default_agent_name="build")),
+        event_bus=SimpleNamespace(),
+        hook_manager=SimpleNamespace(),
+        agent_loop=SimpleNamespace(),
+        agent_profiles={},
+    )
+    runner._session = build_session("session_1", status=SessionStatus.WAITING_HUMAN)
+    runner._session.metadata.update({"pending_human_type": "question", "pending_question_id": "question_current"})
+
+    with pytest.raises(ValueError, match="question_id 与当前等待的问题不一致"):
+        asyncio.run(
+            runner.handle_input(
+                GatewayInput(
+                    type=GatewayInputType.QUESTION_REPLY,
+                    question_id="question_stale",
+                    answers={},
+                )
+            )
         )

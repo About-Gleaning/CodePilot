@@ -930,7 +930,7 @@ def test_non_interactive_session_blocks_tool_spec_approval() -> None:
         dispatcher.execute_tool_calls(
             session=session,
             workspace=workspace,
-            agent=AgentState(name="build"),
+            agent=AgentState(name="build", allowed_tools=["approval_tool"]),
             tool_calls=[{"tool_call_id": "call_1", "tool_name": "approval_tool", "arguments": {}}],
             runtime=runtime,
             config=settings,
@@ -960,7 +960,7 @@ def test_non_interactive_session_blocks_tool_preflight_approval() -> None:
         dispatcher.execute_tool_calls(
             session=session,
             workspace=workspace,
-            agent=AgentState(name="build"),
+            agent=AgentState(name="build", allowed_tools=["preflight_approval_tool"]),
             tool_calls=[{"tool_call_id": "call_1", "tool_name": "preflight_approval_tool", "arguments": {}}],
             runtime=runtime,
             config=settings,
@@ -973,6 +973,31 @@ def test_non_interactive_session_blocks_tool_preflight_approval() -> None:
     assert batch.pending_approval.resume_item is not None
     assert batch.pending_approval.resume_item["tool_call_id"] == "call_1"
     assert batch.tool_parts == []
+
+
+def test_manual_approval_disabled_auto_executes_preflight_approval() -> None:
+    settings = build_settings()
+    settings.human_in_the_loop.enabled = False
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"), workspace_dir=Path("/tmp/codepilot"))
+    runtime = RuntimeHandles(event_bus=EventBus())
+    tool_registry = ToolRegistry()
+    tool_registry.register(PreflightApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, HookManager())
+
+    batch = asyncio.run(
+        dispatcher.execute_tool_calls(
+            session=session,
+            workspace=workspace,
+            agent=AgentState(name="build", allowed_tools=["preflight_approval_tool"]),
+            tool_calls=[{"tool_call_id": "call_1", "tool_name": "preflight_approval_tool", "arguments": {}}],
+            runtime=runtime,
+            config=settings,
+        )
+    )
+
+    assert batch.pending_approval is None
+    assert batch.tool_parts[0].state.status == "completed"
 
 
 class NoIdToolCallLiteLLMClient(StubLiteLLMClient):
@@ -1325,7 +1350,7 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
             loop.run(
                 session=session,
                 workspace=workspace,
-                agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["approval_tool"], max_iterations=3),
                 runtime=runtime,
                 config=settings,
                 approval_event=approval_event,
@@ -1364,7 +1389,7 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
     assert interactions[1].data["call_id"] == "call_1"
 
 
-def test_non_interactive_agent_loop_fails_before_tool_approval_wait() -> None:
+def test_agent_loop_auto_approves_tool_when_manual_approval_disabled() -> None:
     settings = build_settings()
     session = build_session()
     workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
@@ -1387,20 +1412,19 @@ def test_non_interactive_agent_loop_fails_before_tool_approval_wait() -> None:
         loop.run(
             session=session,
             workspace=workspace,
-            agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+            agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["approval_tool"], max_iterations=3),
             runtime=runtime,
             config=settings,
             approval_event=asyncio.Event(),
             approval_result_holder={"result": None},
             stop_event=asyncio.Event(),
-            allow_human_interaction=False,
+            allow_manual_approval=False,
         )
     )
 
-    assert result.status == SessionStatus.FAILED
-    assert result.metadata["non_interactive_error"] == "定时任务为无人值守运行，不能请求人工输入。"
+    assert result.status == SessionStatus.COMPLETED
     assert "human_approval_required" not in [event.event_type for event in stream_events]
-    assert any(event.event_type == "error" for event in stream_events)
+    assert "error" not in [event.event_type for event in stream_events]
 
 
 def test_agent_loop_fast_approval_reply_does_not_lose_wakeup() -> None:
@@ -1442,7 +1466,7 @@ def test_agent_loop_fast_approval_reply_does_not_lose_wakeup() -> None:
             loop.run(
                 session=session,
                 workspace=workspace,
-                agent_profile=AgentProfile(name="build", system_prompt="test", max_iterations=3),
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["approval_tool"], max_iterations=3),
                 runtime=runtime,
                 config=settings,
                 approval_event=approval_event,
@@ -1494,6 +1518,7 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
                 stop_event=asyncio.Event(),
                 question_event=question_event,
                 question_result_holder=question_result_holder,
+                allow_manual_approval=False,
             )
         )
         while not any(event.event_type == "human_question_required" for event in stream_events):
@@ -1533,6 +1558,8 @@ def test_agent_loop_question_reply_completes_tool_and_continues() -> None:
     assert completed_event.data["context_id"] == "main"
     assert completed_event.data["parent_call_id"] is None
     question_message = result.messages[-2]
+    question_part = next(part for part in question_message.parts if isinstance(part, ToolPart) and part.tool == "question")
+    assert question_part.state.input["question_id"].startswith("question_")
     question_part = question_message.tool_parts()[0]
     assert question_part.tool == "question"
     assert question_part.state.status == "completed"
@@ -1563,6 +1590,7 @@ def test_non_interactive_agent_loop_fails_before_question_wait() -> None:
     )
     stream_events: list[Any] = []
     event_bus.subscribe_stream(stream_events.append)
+    session.metadata["source"] = "schedule"
 
     result = asyncio.run(
         loop.run(
@@ -1576,19 +1604,20 @@ def test_non_interactive_agent_loop_fails_before_question_wait() -> None:
             stop_event=asyncio.Event(),
             question_event=asyncio.Event(),
             question_result_holder={"result": None},
-            allow_human_interaction=False,
+            allow_question_interaction=False,
         )
     )
 
     assert result.status == SessionStatus.FAILED
+    assert result.metadata["non_interactive_error"] == "定时任务为无人值守运行，不能请求人工输入。"
     assert "human_question_required" not in [event.event_type for event in stream_events]
     assert any(event.event_type == "error" for event in stream_events)
 
 
-def test_subagent_inherits_non_interactive_policy_from_parent_session() -> None:
+def test_subagent_rejects_question_without_user_answer_panel() -> None:
     settings = build_settings()
     parent_session = build_session()
-    parent_session.metadata["allow_human_interaction"] = False
+    parent_session.metadata["allow_question_interaction"] = True
     workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
     event_bus = EventBus()
     runtime = RuntimeHandles(event_bus=event_bus)
@@ -1625,7 +1654,7 @@ def test_subagent_inherits_non_interactive_policy_from_parent_session() -> None:
     )
 
     assert result.status == SessionStatus.FAILED
-    assert result.metadata["non_interactive_error"] == "定时任务为无人值守运行，不能请求人工输入。"
+    assert result.metadata["subagent_error"] == "subagent 不支持向用户提问，请由父 Agent 收集所需信息。"
     assert "human_question_required" not in [event.event_type for event in stream_events]
     assert any(event.event_type == "error" for event in stream_events)
 

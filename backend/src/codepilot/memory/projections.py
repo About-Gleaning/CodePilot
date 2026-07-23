@@ -13,6 +13,7 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not records:
         return {"session": None, "messages": [], "records": []}
     messages: list[dict[str, Any]] = []
+    pending_question: dict[str, Any] | None = None
     session_meta = require_session_meta(records)
     session_data: dict[str, Any] = {
         "session_id": session_meta["session_id"],
@@ -34,6 +35,7 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             messages.append(record["data"])
         if record["record_type"] == "human_interaction":
             apply_human_interaction(messages, record)
+            pending_question = apply_pending_question(pending_question, record)
         if record["record_type"] == "session_compacted":
             data = record.get("data") if isinstance(record.get("data"), dict) else {}
             if data.get("scope") == "context":
@@ -43,7 +45,38 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         if record["record_type"] in SESSION_LIFECYCLE_RECORD_TYPES:
             session_data = {**session_data, **(record.get("data") or {})}
             session_snapshot = {**record, "data": session_data}
-    return {"session": session_snapshot, "messages": messages, "records": records}
+    return {
+        "session": session_snapshot,
+        "messages": messages,
+        "records": records,
+        "pending_question": pending_question,
+    }
+
+
+def apply_pending_question(
+    pending_question: dict[str, Any] | None,
+    record: dict[str, Any],
+) -> dict[str, Any] | None:
+    """从追加式人工交互事件恢复仍待回答的问题，避免依赖可变的消息快照。"""
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    if data.get("kind") != "question":
+        return pending_question
+    interaction_id = str(data.get("interaction_id") or record.get("interaction_id") or "")
+    if data.get("status") == "pending":
+        request = data.get("request") if isinstance(data.get("request"), dict) else {}
+        question_id = str(request.get("question_id") or interaction_id)
+        questions = request.get("questions")
+        if question_id and isinstance(questions, list):
+            return {
+                "question_id": question_id,
+                "questions": questions,
+                "created_at": request.get("created_at"),
+            }
+        return pending_question
+    if data.get("status") in {"resolved", "declined"} and pending_question:
+        if interaction_id == str(pending_question.get("question_id") or ""):
+            return None
+    return pending_question
 
 
 def build_session_summary(records: list[dict[str, Any]]) -> dict[str, Any] | None:

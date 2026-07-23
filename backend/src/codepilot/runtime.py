@@ -55,6 +55,7 @@ class RuntimeBundle:
     tool_registry: ToolRegistry
     hook_manager: HookManager
     llm_client: LiteLLMClient
+    skill_registry: SkillRegistry
     agent_profiles: dict[str, Any]
     session_runner: SessionRunner
     mcp_manager: McpClientManager
@@ -72,7 +73,8 @@ def build_runtime_bundle(
     settings: AppSettings,
     workspace: WorkspaceState,
     *,
-    allow_human_interaction: bool = True,
+    allow_manual_approval: bool = True,
+    allow_question_interaction: bool = True,
 ) -> RuntimeBundle:
     """按指定 workspace 构建一套独立的 Agent 会话运行时。"""
     event_bus = EventBus()
@@ -131,7 +133,8 @@ def build_runtime_bundle(
         agent_loop=agent_loop,
         agent_profiles=agent_profiles,
         title_service=build_title_service(settings),
-        allow_human_interaction=allow_human_interaction,
+        allow_manual_approval=allow_manual_approval,
+        allow_question_interaction=allow_question_interaction,
     )
     return RuntimeBundle(
         event_bus=event_bus,
@@ -140,6 +143,7 @@ def build_runtime_bundle(
         tool_registry=tool_registry,
         hook_manager=hook_manager,
         llm_client=llm_client,
+        skill_registry=skill_registry,
         agent_profiles=agent_profiles,
         session_runner=session_runner,
         mcp_manager=mcp_manager,
