@@ -107,6 +107,8 @@ type StatusResponse = {
   model: string | null;
   thinking_enabled: boolean;
   thinking_value?: string | null;
+  pending_human_type?: string | null;
+  pending_human_request?: Record<string, unknown> | null;
 };
 
 type ReplayResponse = {
@@ -659,7 +661,11 @@ function App() {
       setAgentName(statusRes.agent_name || 'build');
       const replayMessages = statusRes.session_id && getReplaySessionId(replayRes) === statusRes.session_id ? replayRes.messages : [];
       setMessages(replayMessages);
-      restorePendingQuestion(statusRes.status === 'WAITING_HUMAN' ? replayRes.pending_question : null);
+      restorePendingQuestion(
+        statusRes.status === 'WAITING_HUMAN' && statusRes.pending_human_type === 'question'
+          ? statusRes.pending_human_request
+          : null,
+      );
       setSubagentLiveDeltas({});
       setSubagentLiveReasoningDeltas({});
       setSessionHistory(sessionsRes.sessions);
@@ -771,6 +777,11 @@ function App() {
     applyProviderAndModelState(next);
     setThinkingValue(next.thinking_value || '');
     setAgentName(next.agent_name || 'build');
+    restorePendingQuestion(
+      next.status === 'WAITING_HUMAN' && next.pending_human_type === 'question'
+        ? next.pending_human_request
+        : null,
+    );
   }
 
   async function refreshSessionHistory() {

@@ -123,7 +123,7 @@ def test_system_prompt_does_not_include_dynamic_time_context(tmp_path: Path) -> 
     assert "current_time:" not in prompt
 
 
-def test_runtime_context_prompt_formats_current_time_and_environment(tmp_path: Path) -> None:
+def test_runtime_context_prompt_formats_only_current_time(tmp_path: Path) -> None:
     now = datetime(2026, 6, 5, 17, 11, 32, tzinfo=timezone(timedelta(hours=8), "CST"))
 
     prompt = build_runtime_context_prompt(
@@ -136,12 +136,12 @@ def test_runtime_context_prompt_formats_current_time_and_environment(tmp_path: P
 
     assert "<runtime_context>" in prompt
     assert "current_time: 2026-06-05 星期五 17:11:32" in prompt
-    assert "timezone: CST" in prompt
-    assert "utc_offset: UTC+08:00" in prompt
-    assert f"workspace: {tmp_path}" in prompt
-    assert "agent: build" in prompt
-    assert "model: openai/gpt-5.3-codex" in prompt
-    assert "session_id: session_1" in prompt
+    assert "timezone:" not in prompt
+    assert "utc_offset:" not in prompt
+    assert "workspace:" not in prompt
+    assert "agent:" not in prompt
+    assert "model:" not in prompt
+    assert "session_id:" not in prompt
 
 
 def build_session(workspace_path: Path) -> SessionState:

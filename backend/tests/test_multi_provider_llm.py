@@ -16,6 +16,7 @@ from codepilot.config.settings import LLMProviderSettings, LLMSettings
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, build_user_message_info
+from codepilot.session.interactions import _mark_human_wait_finished
 from codepilot.session.message import FilePart
 
 
@@ -212,6 +213,70 @@ def test_session_runner_status_snapshot_has_no_default_llm() -> None:
 
     assert snapshot["provider"] is None
     assert snapshot["model"] is None
+
+
+def test_session_runner_status_snapshot_exposes_pending_question() -> None:
+    settings = build_settings({"OPENAI_API_KEY": "sk-openai"})
+    runner = build_session_runner(settings)
+    request = {
+        "question_id": "question_1",
+        "questions": [
+            {
+                "id": "target",
+                "question": "选择目标？",
+                "multiple": False,
+                "options": [{"value": "backend", "label": "后端"}],
+            }
+        ],
+        "created_at": "2026-04-30T00:00:00Z",
+    }
+    runner._session = SessionState(
+        session_id="session_1",
+        workspace_id="ws_1",
+        workspace_path="/tmp/codepilot",
+        agent_name="plan",
+        provider="openai",
+        model="gpt-4.1",
+        status=SessionStatus.WAITING_HUMAN,
+        created_at="2026-04-30T00:00:00Z",
+        updated_at="2026-04-30T00:00:00Z",
+        metadata={
+            "pending_human_type": "question",
+            "pending_human_interaction_id": "question_1",
+            "pending_human_request": request,
+        },
+    )
+
+    snapshot = runner.get_status_snapshot()
+
+    assert snapshot["pending_human_type"] == "question"
+    assert snapshot["pending_human_request"] == request
+
+
+def test_mark_human_wait_finished_clears_pending_request() -> None:
+    session = SessionState(
+        session_id="session_1",
+        workspace_id="ws_1",
+        workspace_path="/tmp/codepilot",
+        agent_name="plan",
+        provider="openai",
+        model="gpt-4.1",
+        status=SessionStatus.WAITING_HUMAN,
+        created_at="2026-04-30T00:00:00Z",
+        updated_at="2026-04-30T00:00:00Z",
+        metadata={
+            "pending_human_type": "question",
+            "pending_human_interaction_id": "question_1",
+            "pending_human_request": {"question_id": "question_1", "questions": []},
+        },
+    )
+
+    _mark_human_wait_finished(session, SessionStatus.RUNNING)
+
+    assert session.status == SessionStatus.RUNNING
+    assert "pending_human_type" not in session.metadata
+    assert "pending_human_interaction_id" not in session.metadata
+    assert "pending_human_request" not in session.metadata
 
 
 def test_config_route_returns_models_without_default_fields() -> None:

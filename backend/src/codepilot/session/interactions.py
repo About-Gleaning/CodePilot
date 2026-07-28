@@ -268,6 +268,8 @@ async def _publish_waiting_human(
     if kind == "question":
         # 回复必须绑定当前等待请求，拒绝陈旧页面或手工构造的错误交互 ID。
         session.metadata["pending_question_id"] = interaction_id
+    session.metadata["pending_human_interaction_id"] = interaction_id
+    session.metadata["pending_human_request"] = request
     session.updated_at = utc_now_iso()
     await runtime.event_bus.publish_domain_event(
         HumanInteractionEvent(
@@ -306,5 +308,7 @@ def _mark_human_wait_finished(session: SessionState, status: SessionStatus) -> N
     """清理人工等待标记，并切换到调用方指定的后续状态。"""
     session.metadata.pop("pending_human_type", None)
     session.metadata.pop("pending_question_id", None)
+    session.metadata.pop("pending_human_interaction_id", None)
+    session.metadata.pop("pending_human_request", None)
     session.status = status
     session.updated_at = utc_now_iso()

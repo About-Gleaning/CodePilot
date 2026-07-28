@@ -47,19 +47,10 @@ def build_runtime_context_prompt(
     now: datetime | None = None,
 ) -> str:
     """构造每轮动态上下文，放入最新用户消息尾部以避免破坏稳定 system 前缀。"""
-    workspace_path = Path(workspace.workspace_path)
     local_now = now.astimezone() if now is not None else datetime.now().astimezone()
-    utc_offset = _format_utc_offset(local_now)
-    timezone_name = local_now.tzname() or "本地时区"
     lines = [
         "<runtime_context>",
         f"current_time: {local_now:%Y-%m-%d} {_WEEKDAYS[local_now.weekday()]} {local_now:%H:%M:%S}",
-        f"timezone: {timezone_name}",
-        f"utc_offset: UTC{utc_offset}",
-        f"workspace: {workspace_path}",
-        f"agent: {agent_state.name}",
-        f"model: {llm_state.provider}/{llm_state.model}",
-        f"session_id: {session.session_id}",
         "</runtime_context>",
     ]
     return "\n".join(lines)
@@ -130,10 +121,3 @@ def _build_runtime_context(
         "- 用户偏好：预留，尚未接入用户偏好存储。",
     ]
     return "\n".join(lines)
-
-
-def _format_utc_offset(value: datetime) -> str:
-    offset = value.strftime("%z")
-    if not offset:
-        return "+00:00"
-    return f"{offset[:3]}:{offset[3:]}"

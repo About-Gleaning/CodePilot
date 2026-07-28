@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 from litellm import token_counter
@@ -17,6 +18,7 @@ from codepilot.utils import new_message_id, utc_now_iso, utc_now_millis
 TOOL_RESULT_PLACEHOLDER = "[Old tool result content cleared]"
 SUMMARY_METADATA_KEY = "context_summary"
 COMPRESSION_METADATA_KEY = "context_compression"
+SUMMARY_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "llm_summary.md"
 
 
 class ContextCompressionError(RuntimeError):
@@ -80,6 +82,10 @@ class TokenEstimator:
     def _resolve_model_name(self, llm_state: LLMState) -> str:
         prefix = llm_state.metadata.get("litellm_model_prefix", "")
         return f"{prefix}{llm_state.model}"
+
+
+def _load_summary_system_prompt() -> str:
+    return SUMMARY_PROMPT_PATH.read_text(encoding="utf-8").strip()
 
 
 class ContextCompressor:
@@ -252,24 +258,14 @@ class LLMSummaryCompressionStrategy:
         existing_summary: Message | None,
         candidate_messages: list[Message],
     ) -> str:
-        source = {
-            "existing_summary": existing_summary.text_content() if existing_summary else "",
-            "messages_to_compact": [
-                {"role": message.info.role, "content": message.text_content(), "parts": [part.model_dump() for part in message.parts]}
-                for message in candidate_messages
-            ],
-        }
-        prompt = (
-            "请把以下历史对话压缩为一份可供后续 Agent 推理使用的中文上下文摘要。"
-            "保留用户目标、关键约束、重要决策、工具调用结论、未完成事项和风险。"
-            "不要编造未出现的信息。\n\n"
-            f"{json.dumps(source, ensure_ascii=False, default=str)}"
-        )
+        messages_to_summarize = [existing_summary, *candidate_messages] if existing_summary else candidate_messages
+        old_messages = ctx.llm_client.build_provider_messages(messages_to_summarize)
+        provider_messages = [{"role": "system", "content": _load_summary_system_prompt()}, *old_messages]
         max_tokens = ctx.config.context.strategies.llm_summary.summary_max_tokens
         try:
             summary = await ctx.llm_client.complete_text(
                 llm_state=ctx.llm_state,
-                messages=[{"role": "user", "content": prompt}],
+                messages=provider_messages,
                 max_tokens=max_tokens,
             )
         except Exception as exc:  # noqa: BLE001
