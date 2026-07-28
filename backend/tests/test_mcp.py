@@ -77,6 +77,15 @@ def _context(tmp_path: Any, *, allowed_tools: list[str]) -> ToolExecutionContext
     )
 
 
+def _context_with_tool_call_id(tmp_path: Any, *, tool_call_id: str) -> ToolExecutionContext:
+    return ToolExecutionContext(
+        session=SimpleNamespace(session_id="session-1"),
+        workspace=SimpleNamespace(workspace_dir=tmp_path, workspace_path=tmp_path),
+        agent=SimpleNamespace(name="build", allowed_tools=["mcp:github"]),
+        tool_call_id=tool_call_id,
+    )
+
+
 @pytest.mark.asyncio
 async def test_mcp_discovery_exposes_namespaced_tool_by_server_permission(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
     session = FakeSession()
@@ -178,6 +187,37 @@ async def test_mcp_error_and_image_are_normalized_without_base64_persistence(
         attachment = result["attachments"][0]
         assert image_data not in str(result)
         assert tmp_path.joinpath("attachments", "session-1", "call-1", attachment["filename"]).exists()
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_mcp_image_attachment_path_stays_inside_attachment_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    image_data = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode()
+
+    @asynccontextmanager
+    async def fake_open_session(config: Any, workspace_path: Any) -> AsyncIterator[FakeSession]:
+        yield FakeSession(image_data=image_data)
+
+    monkeypatch.setattr("codepilot.tools.mcp._open_session", fake_open_session)
+    registry = ToolRegistry()
+    manager = McpClientManager(_settings(), SimpleNamespace(workspace_path=tmp_path), registry)
+    await manager.start()
+    try:
+        tool = registry.get(build_mcp_tool_name("github", "create.issue"))
+        assert tool is not None
+        result = await tool.execute(
+            {"title": "图片"},
+            context=_context_with_tool_call_id(tmp_path, tool_call_id="../../outside"),
+        )
+        attachment = result["attachments"][0]
+        target = Path(attachment["source_path"]).resolve()
+        attachment_root = tmp_path.joinpath("attachments").resolve()
+        assert target.is_relative_to(attachment_root)
+        assert not tmp_path.joinpath("outside", attachment["filename"]).exists()
     finally:
         await manager.shutdown()
 

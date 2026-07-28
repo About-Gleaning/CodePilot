@@ -18,7 +18,7 @@ from mcp.client.streamable_http import streamable_http_client
 
 from codepilot.config.settings import McpServerSettings, McpSettings, McpStdioServerSettings
 from codepilot.logging import get_logger
-from codepilot.session.attachments import AttachmentError, decode_image_attachment
+from codepilot.session.attachments import AttachmentError, attachment_message_dir, decode_image_attachment
 from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
 
 
@@ -377,11 +377,11 @@ def _persist_image_block(block: Any, *, index: int, context: ToolExecutionContex
 
     extension = mimetypes.guess_extension(validated_mime) or ".bin"
     filename = f"mcp-{index + 1}{extension}"
-    target_dir = (
-        Path(context.workspace.workspace_dir)
-        / "attachments"
-        / str(context.session.session_id)
-        / str(context.tool_call_id)
+    # MCP 返回的调用 ID 来自外部协议，必须与用户附件共用受控路径分段，防止路径穿越。
+    target_dir = attachment_message_dir(
+        context.workspace,
+        str(context.session.session_id),
+        str(context.tool_call_id),
     )
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / filename
