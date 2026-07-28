@@ -37,6 +37,7 @@ class AgentState(BaseModel):
     name: str
     role: str = "agent"
     kind: Literal["agent", "subagent"] = "agent"
+    allowed_tools: list[str] = Field(default_factory=list)
     readonly: bool = False
     context_id: str | None = "main"
     parent_call_id: str | None = None

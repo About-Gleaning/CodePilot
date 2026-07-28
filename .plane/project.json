@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "workspace_slug": "project-pilot",
+  "project_id": "1c4b7b35-4761-4ac6-8739-5fbcd222450e",
+  "project_identifier": "CODE",
+  "governance": {
+    "profile": "standard-v1",
+    "mode": "canonical"
+  },
+  "workflow": {
+    "backlog_state_id": "180e6dbc-59a2-4bf3-8cda-aef4f06b1b57",
+    "unstarted_state_id": "6658698c-49c0-4c3b-8dce-cef62fea3972",
+    "started_state_id": "9754ee5f-a960-4dd0-9615-8df8c09d7ef8",
+    "blocked_state_id": "f511351a-029e-430e-bc84-ef2cc28f72da",
+    "review_state_id": "5e3d6e74-541b-4a4e-9584-653836874bcc",
+    "completed_state_id": "9147ee8f-08f6-460a-af89-8b8f35415d57",
+    "cancelled_state_id": "abd5f95b-12ad-4058-94ce-bd8aaf295b87"
+  }
+}

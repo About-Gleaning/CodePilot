@@ -27,7 +27,11 @@ Python 使用 4 空格缩进、类型标注和清晰的模块边界；文件、�
 
 Agent 专属工具必须做双重约束：除 `allowed_tools` 限制外，还要在 `execute()` 内通过 `context.agent.name` 做运行时校验，避免模型历史、手工构造请求或后续编排绕过 Agent 权限。可参考 `write_plan` 的 plan agent 限制方式。
 
-工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，默认禁止访问工作区外路径；`read_file` 读取工作区外文件和 `bash_tool` 使用工作区外 `cwd` 只能在人工审批通过后执行，或在 `human_in_the_loop.enabled=false` 的全自动模式下直接执行；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
+动态 MCP 工具使用服务级权限标记：`backend/config.yaml` 中的 `mcp.servers` 只控制连接，不授予 Agent 权限；Agent Markdown 必须在 `tools` 中显式声明 `mcp:<server_name>`，运行时才允许暴露该服务发现出的 `mcp__<server_name>__<tool_name>` schema。首版禁止 `mcp:*`。MCP 权限必须同时由 `ToolRegistry` 过滤和 `McpToolAdapter.execute()` 运行时校验，不能通过硬编码 Agent 名称或启动时篡改 `allowed_tools` 绕过文件式配置。
+
+MCP 连接必须使用官方 Python SDK，主进程和 scheduler worker 都要纳入异步启动与关闭生命周期。密钥只允许通过 `env_from_process` 或 `headers_from_env` 引用进程环境变量；默认要求人工审批，stdio 工作目录不得越出 workspace，工具输出必须截断，图片 base64 不得进入日志或会话 JSONL。
+
+工具安全与性能默认从严：文件类工具必须复用 workspace 路径校验，默认禁止访问工作区外路径；`read_file` 读取工作区外文件和 `bash_tool` 使用工作区外 `cwd` 只能在人工审批通过后执行，或在 `human_in_the_loop.enabled=false` 的全自动模式下直接执行；该开关只控制工具审批，不限制网页主会话的 `question` 回答。scheduler worker 与 subagent 没有独立用户回答入口，必须禁止等待 `question`；写入、删除、外部命令、网络调用等高风险工具默认应开启审批或使用白名单参数；只有只读、无副作用、互不影响的工具才允许 `can_parallel=True`；工具输出必须截断或分页，避免大结果撑爆 LLM 上下文。
 
 ## Agent & Subagent Runtime Guidelines
 

@@ -163,7 +163,7 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
         assert result.changed is True
         assert client.summary_calls == 1
         assert client.summary_messages[0]["role"] == "system"
-        assert "历史对话压缩" in str(client.summary_messages[0]["content"])
+        assert "create a detailed summary" in str(client.summary_messages[0]["content"])
         assert [message["role"] for message in client.summary_messages[1:]] == ["user", "assistant"]
         assert client.summary_messages[1]["content"] == "第一轮需求"
         assert client.summary_messages[2]["content"] == "第一轮回答"

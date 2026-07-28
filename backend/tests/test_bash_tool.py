@@ -288,7 +288,7 @@ def test_dispatcher_pauses_and_resumes_approved_bash_command(tmp_path: Path) -> 
         dispatcher = ToolDispatcher(registry, HookManager())
         session = SimpleNamespace(session_id="session_1", messages=[])
         workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
-        agent = SimpleNamespace(name="build")
+        agent = SimpleNamespace(name="build", allowed_tools=["bash_tool"])
         runtime = RuntimeHandles(event_bus=EventBus())
         item = {"tool_call_id": "call_1", "tool_name": "bash_tool", "arguments": {"command": "echo approved"}}
 
@@ -352,7 +352,7 @@ def test_dispatcher_resumes_remaining_tools_after_approval(tmp_path: Path) -> No
         dispatcher = ToolDispatcher(registry, HookManager())
         session = SimpleNamespace(session_id="session_1", messages=[])
         workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
-        agent = SimpleNamespace(name="build")
+        agent = SimpleNamespace(name="build", allowed_tools=["record_tool"])
         runtime = RuntimeHandles(event_bus=EventBus())
 
         pending = await dispatcher.execute_tool_calls(
@@ -395,7 +395,7 @@ def test_dispatcher_does_not_skip_approval_for_remaining_tools(tmp_path: Path) -
         dispatcher = ToolDispatcher(registry, HookManager())
         session = SimpleNamespace(session_id="session_1", messages=[])
         workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
-        agent = SimpleNamespace(name="build")
+        agent = SimpleNamespace(name="build", allowed_tools=["record_tool"])
         runtime = RuntimeHandles(event_bus=EventBus())
 
         pending = await dispatcher.execute_tool_calls(
@@ -437,7 +437,7 @@ def test_dispatcher_returns_blocked_preflight_result(tmp_path: Path) -> None:
         dispatcher = ToolDispatcher(registry, HookManager())
         session = SimpleNamespace(session_id="session_1", messages=[])
         workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
-        agent = SimpleNamespace(name="build")
+        agent = SimpleNamespace(name="build", allowed_tools=["bash_tool"])
         runtime = RuntimeHandles(event_bus=EventBus())
 
         return await dispatcher.execute_tool_calls(
@@ -470,7 +470,7 @@ def test_dispatcher_returns_preflight_parse_error_and_emits_failed_event(tmp_pat
         dispatcher = ToolDispatcher(registry, HookManager())
         session = SimpleNamespace(session_id="session_1", messages=[])
         workspace = SimpleNamespace(workspace_path=tmp_path, workspace_dir=tmp_path / ".codepilot")
-        agent = SimpleNamespace(name="build")
+        agent = SimpleNamespace(name="build", allowed_tools=["bash_tool"])
         event_bus = EventBus()
         stream_events: list[Any] = []
         event_bus.subscribe_stream(stream_events.append)

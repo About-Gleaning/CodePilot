@@ -31,7 +31,7 @@ from codepilot.tools import (
     LoadSkillTool,
     LongMemoryWriteTool,
     MarkItDownConvertTool,
-    McpToolAdapter,
+    McpClientManager,
     QuestionTool,
     ReadFileTool,
     TaskTool,
@@ -55,15 +55,26 @@ class RuntimeBundle:
     tool_registry: ToolRegistry
     hook_manager: HookManager
     llm_client: LiteLLMClient
+    skill_registry: SkillRegistry
     agent_profiles: dict[str, Any]
     session_runner: SessionRunner
+    mcp_manager: McpClientManager
+
+    async def start(self) -> None:
+        """启动需要异步生命周期的外部运行时。"""
+        await self.mcp_manager.start()
+
+    async def shutdown(self) -> None:
+        """关闭外部连接；调用方应先停止正在运行的会话。"""
+        await self.mcp_manager.shutdown()
 
 
 def build_runtime_bundle(
     settings: AppSettings,
     workspace: WorkspaceState,
     *,
-    allow_human_interaction: bool = True,
+    allow_manual_approval: bool = True,
+    allow_question_interaction: bool = True,
 ) -> RuntimeBundle:
     """按指定 workspace 构建一套独立的 Agent 会话运行时。"""
     event_bus = EventBus()
@@ -90,6 +101,8 @@ def build_runtime_bundle(
     tool_registry.register(WebFetchTool(timeout_seconds=settings.tools.default_timeout_seconds))
     tool_registry.register(MarkItDownConvertTool(timeout_seconds=settings.tools.default_timeout_seconds))
 
+    mcp_manager = McpClientManager(settings=settings.mcp, workspace=workspace, tool_registry=tool_registry)
+
     hook_manager = build_hook_manager(settings)
     llm_client = LiteLLMClient(log_requests=settings.llm.log_requests)
     tool_dispatcher = ToolDispatcher(tool_registry, hook_manager)
@@ -112,8 +125,6 @@ def build_runtime_bundle(
             timeout_seconds=settings.tools.default_timeout_seconds,
         )
     )
-    tool_registry.register(McpToolAdapter(name="mcp_placeholder_tool"))
-
     session_runner = SessionRunner(
         workspace=workspace,
         config=settings,
@@ -122,7 +133,8 @@ def build_runtime_bundle(
         agent_loop=agent_loop,
         agent_profiles=agent_profiles,
         title_service=build_title_service(settings),
-        allow_human_interaction=allow_human_interaction,
+        allow_manual_approval=allow_manual_approval,
+        allow_question_interaction=allow_question_interaction,
     )
     return RuntimeBundle(
         event_bus=event_bus,
@@ -131,8 +143,10 @@ def build_runtime_bundle(
         tool_registry=tool_registry,
         hook_manager=hook_manager,
         llm_client=llm_client,
+        skill_registry=skill_registry,
         agent_profiles=agent_profiles,
         session_runner=session_runner,
+        mcp_manager=mcp_manager,
     )
 
 

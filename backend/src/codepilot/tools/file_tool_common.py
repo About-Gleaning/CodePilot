@@ -4,6 +4,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
+from codepilot.session.attachments import AttachmentError, resolve_stored_attachment_path
 from codepilot.tools.base import ToolExecutionContext
 
 
@@ -68,6 +69,34 @@ def resolve_workspace_file_path(
     if not allow_missing and not target.exists():
         raise FileToolError(f"文件不存在：{target}", error_type="FileNotFound")
     return target
+
+
+def resolve_readable_file_path(file_path: str, context: ToolExecutionContext | None) -> Path:
+    """解析可读文件：工作区优先，其次附件，工作区外路径必须已获批准。"""
+
+    try:
+        return resolve_workspace_file_path(file_path, context, allow_missing=False)
+    except FileToolError as exc:
+        if exc.error_type != "FilePathForbidden" or context is None:
+            raise
+        try:
+            return resolve_stored_attachment_path(context.workspace, file_path)
+        except AttachmentError:
+            if not (context.skip_approval or is_non_interactive_mode(context)):
+                raise exc
+            raw_path = Path(file_path).expanduser()
+            if not raw_path.is_absolute():
+                raise exc
+            target = raw_path.resolve(strict=False)
+            if not target.exists():
+                raise FileToolError(f"文件不存在：{target}", error_type="FileNotFound")
+            return target
+
+
+def is_non_interactive_mode(context: ToolExecutionContext) -> bool:
+    config = getattr(context, "config", None)
+    hitl = getattr(config, "human_in_the_loop", None)
+    return hitl is not None and not bool(getattr(hitl, "enabled", True))
 
 
 def read_utf8_text_file(target: Path, *, tool_name: str) -> str:

@@ -242,14 +242,15 @@ class ToolDispatcher:
         tool_args = item.get("arguments", {})
         tool_call_id = item.get("tool_call_id") or f"call_{utc_now_iso()}"
         item["tool_call_id"] = tool_call_id
-
         if tool is None:
             return self._result_builder.completed_part(
                 tool_call_id,
                 tool_name,
                 self._result_builder.missing_tool_result(tool_name),
             ), None, None
-
+        forbidden_part = self._forbidden_tool_part(tool, agent, tool_call_id, tool_name, tool_args)
+        if forbidden_part is not None:
+            return forbidden_part, None, None
         tool_context = ToolExecutionContext(
             session=session,
             workspace=workspace,
@@ -260,63 +261,22 @@ class ToolDispatcher:
             stop_event=stop_event,
             skip_approval=skip_approval,
         )
-        if not skip_approval:
-            try:
-                preflight = await tool.preflight(tool_args, tool_context)
-            except Exception as exc:  # noqa: BLE001
-                self._logger.exception("tool preflight failed", tool_name=tool_name, error=str(exc))
-                result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
-                await self._publish_preflight_error(
-                    session=session,
-                    runtime=runtime,
-                    agent=agent,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    result=result,
-                )
-                return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
-            if preflight.status == "blocked" and preflight.result is not None:
-                if preflight.result.get("status") == "error":
-                    await self._publish_preflight_error(
-                        session=session,
-                        runtime=runtime,
-                        agent=agent,
-                        tool_name=tool_name,
-                        tool_call_id=tool_call_id,
-                        result=preflight.result,
-                    )
-                return self._result_builder.completed_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None, None
-            if preflight.status == "requires_approval":
-                approval = ApprovalRequest(
-                    approval_id=f"approval_tool_{tool_call_id}",
-                    reason=preflight.reason or "该工具调用需要人工确认后才能执行",
-                    action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
-                    created_at=utc_now_iso(),
-                )
-                return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), approval, None
-
-        if tool.spec.requires_approval and not skip_approval:
-            approval = ApprovalRequest(
-                approval_id=f"approval_tool_{tool_call_id}",
-                reason="该工具需要人工确认后才能执行",
-                action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
-                created_at=utc_now_iso(),
-            )
+        preflight_part, preflight_approval = await self._run_preflight(
+            session, runtime, agent, tool, tool_context, tool_name, tool_args, tool_call_id, skip_approval
+        )
+        if preflight_part is not None:
+            return preflight_part, None, None
+        if preflight_approval is not None:
+            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), preflight_approval, None
+        approval = self._spec_approval(tool, tool_name, tool_args, tool_call_id, skip_approval, config)
+        if approval is not None:
             return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), approval, None
 
-        ctx = HookContext(
-            hook_type=HookType.TOOL_BEFORE.value,
-            session=session,
-            workspace=workspace,
-            agent=agent,
-            messages=session.messages,
-            tool_call={"tool_name": tool_name, "args": tool_args, "tool_call_id": tool_call_id},
-            config=config,
-            runtime=runtime,
+        hook_approval = await self._run_before_hook(
+            session, workspace, agent, runtime, config, tool_name, tool_args, tool_call_id, skip_approval
         )
-        hook_result = await self._hook_manager.run(HookType.TOOL_BEFORE, ctx)
-        if hook_result.requires_human_input and hook_result.human_request:
-            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), hook_result.human_request, None
+        if hook_approval is not None:
+            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), hook_approval, None
 
         await self._event_publisher.publish_started(
             session=session,
@@ -338,15 +298,27 @@ class ToolDispatcher:
             self._logger.exception("tool failed", tool_name=tool_name, error=str(exc))
             result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
 
-        if result.get("status") == "question_required":
-            question = QuestionRequest(
-                question_id=str(result.get("question_id") or f"question_tool_{tool_call_id}"),
-                questions=[question for question in result.get("questions", []) if isinstance(question, dict)],
-                created_at=utc_now_iso(),
-            )
-            return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), None, question
+        question_args, question = self._question_request(session, item, tool_call_id, tool_args, result)
+        if question is not None:
+            return self._result_builder.pending_part(tool_call_id, tool_name, question_args), None, question
 
-        after_ctx = HookContext(
+        return await self._complete_tool_execution(
+            session, workspace, agent, runtime, config, tool_name, tool_args, tool_call_id, result
+        ), None, None
+
+    async def _complete_tool_execution(
+        self,
+        session: SessionState,
+        workspace: Any,
+        agent: AgentState,
+        runtime: RuntimeHandles,
+        config: Any,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        result: dict[str, Any],
+    ) -> ToolPart:
+        context = HookContext(
             hook_type=HookType.TOOL_AFTER.value,
             session=session,
             workspace=workspace,
@@ -357,7 +329,7 @@ class ToolDispatcher:
             config=config,
             runtime=runtime,
         )
-        await self._hook_manager.run(HookType.TOOL_AFTER, after_ctx)
+        await self._hook_manager.run(HookType.TOOL_AFTER, context)
 
         await self._event_publisher.publish_finished(
             session=session,
@@ -367,7 +339,153 @@ class ToolDispatcher:
             tool_call_id=tool_call_id,
             result=result,
         )
-        return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None, None
+        return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args)
+
+    def _forbidden_tool_part(
+        self,
+        tool: BaseTool,
+        agent: AgentState,
+        tool_call_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> ToolPart | None:
+        """在执行层重复校验权限，阻止重放或手工调用绕过 Agent 配置。"""
+        required_permission = f"mcp:{tool.mcp_server_name}" if getattr(tool, "mcp_server_name", None) else tool_name
+        allowed_tools = getattr(agent, "allowed_tools", []) or []
+        if required_permission in allowed_tools:
+            return None
+        result = self._result_builder.error_result(
+            tool_name,
+            "ToolAgentForbidden",
+            f"当前 Agent 不允许调用工具：{tool_name}",
+        )
+        return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args)
+
+    async def _run_preflight(
+        self,
+        session: SessionState,
+        runtime: RuntimeHandles,
+        agent: AgentState,
+        tool: BaseTool,
+        tool_context: ToolExecutionContext,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        skip_approval: bool,
+    ) -> tuple[ToolPart | None, ApprovalRequest | None]:
+        if skip_approval:
+            return None, None
+        try:
+            preflight = await tool.preflight(tool_args, tool_context)
+        except Exception as exc:  # noqa: BLE001
+            self._logger.exception("tool preflight failed", tool_name=tool_name, error=str(exc))
+            result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
+            await self._publish_preflight_error(
+                session=session,
+                runtime=runtime,
+                agent=agent,
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                result=result,
+            )
+            return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args), None
+        if preflight.status == "blocked" and preflight.result is not None:
+            if preflight.result.get("status") == "error":
+                await self._publish_preflight_error(
+                    session=session,
+                    runtime=runtime,
+                    agent=agent,
+                    tool_name=tool_name,
+                    tool_call_id=tool_call_id,
+                    result=preflight.result,
+                )
+            return self._result_builder.completed_part(tool_call_id, tool_name, preflight.result, tool_args=tool_args), None
+        if preflight.status != "requires_approval":
+            return None, None
+        if is_manual_approval_disabled(tool_context.config):
+            # 预检仍已执行；仅把“可审批”结论自动放行，不绕过 blocked 或其他安全校验。
+            tool_context.skip_approval = True
+            return None, None
+        return None, ApprovalRequest(
+            approval_id=f"approval_tool_{tool_call_id}",
+            reason=preflight.reason or "该工具调用需要人工确认后才能执行",
+            action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
+            created_at=utc_now_iso(),
+        )
+
+    def _spec_approval(
+        self,
+        tool: BaseTool,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        skip_approval: bool,
+        config: Any,
+    ) -> ApprovalRequest | None:
+        if not tool.spec.requires_approval or skip_approval or is_manual_approval_disabled(config):
+            return None
+        return ApprovalRequest(
+            approval_id=f"approval_tool_{tool_call_id}",
+            reason="该工具需要人工确认后才能执行",
+            action={"type": "tool_call", "tool_name": tool_name, "args": tool_args},
+            created_at=utc_now_iso(),
+        )
+
+    async def _run_before_hook(
+        self,
+        session: SessionState,
+        workspace: Any,
+        agent: AgentState,
+        runtime: RuntimeHandles,
+        config: Any,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        tool_call_id: str,
+        skip_approval: bool,
+    ) -> ApprovalRequest | None:
+        context = HookContext(
+            hook_type=HookType.TOOL_BEFORE.value,
+            session=session,
+            workspace=workspace,
+            agent=agent,
+            messages=session.messages,
+            tool_call={"tool_name": tool_name, "args": tool_args, "tool_call_id": tool_call_id},
+            config=config,
+            runtime=runtime,
+        )
+        result = await self._hook_manager.run(HookType.TOOL_BEFORE, context)
+        if result.requires_human_input and result.human_request and not (skip_approval or is_manual_approval_disabled(config)):
+            return result.human_request
+        return None
+
+    def _question_request(
+        self,
+        session: SessionState,
+        item: dict[str, Any],
+        tool_call_id: str,
+        tool_args: dict[str, Any],
+        result: dict[str, Any],
+    ) -> tuple[dict[str, Any], QuestionRequest | None]:
+        if result.get("status") != "question_required":
+            return tool_args, None
+        # question_id 是恢复人机交互的唯一标识；随 pending ToolPart 持久化，供页面回放后继续提交答案。
+        question_id = str(result.get("question_id") or f"question_tool_{tool_call_id}")
+        question_args = {**tool_args, "question_id": question_id}
+        item["arguments"] = question_args
+        self._persist_question_id(session, tool_call_id, question_id)
+        return question_args, QuestionRequest(
+            question_id=question_id,
+            questions=[question for question in result.get("questions", []) if isinstance(question, dict)],
+            created_at=utc_now_iso(),
+        )
+
+    def _persist_question_id(self, session: SessionState, tool_call_id: str, question_id: str) -> None:
+        """把交互 ID 写回已落盘前的 pending ToolPart，支持刷新后的 question 回放。"""
+        for message in reversed(session.messages):
+            for part in message.parts:
+                if isinstance(part, ToolPart) and part.call_id == tool_call_id:
+                    part.state.input = {**part.state.input, "question_id": question_id}
+                    return
 
     async def _publish_preflight_error(
         self,
@@ -388,3 +506,9 @@ class ToolDispatcher:
             tool_call_id=tool_call_id,
             result=result,
         )
+
+
+def is_manual_approval_disabled(config: Any) -> bool:
+    """仅判断审批开关；question 是否可等待由会话运行策略单独决定。"""
+    hitl = getattr(config, "human_in_the_loop", None)
+    return hitl is not None and not bool(getattr(hitl, "enabled", True))

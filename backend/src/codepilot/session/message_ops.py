@@ -54,7 +54,7 @@ def merge_question_result(session: SessionState, question: PendingQuestion, resu
                 tool=part.tool,
                 state=ToolPartState(
                     status="completed",
-                    input=part.state.input,
+                    input={**part.state.input, "question_id": result.question_id},
                     output=output,
                     time=part.state.time,
                 ),

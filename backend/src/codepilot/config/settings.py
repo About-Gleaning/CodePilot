@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Annotated, Any, Literal, Mapping
+from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -183,6 +185,57 @@ class ToolSettings(BaseModel):
     bash: BashToolSettings = Field(default_factory=BashToolSettings)
 
 
+class McpServerBaseSettings(BaseModel):
+    enabled: bool = True
+    requires_approval: bool = True
+    timeout_seconds: int = Field(default=120, gt=0)
+    max_output_chars: int = Field(default=50_000, gt=0)
+
+
+class McpStdioServerSettings(McpServerBaseSettings):
+    transport: Literal["stdio"]
+    command: str = Field(min_length=1)
+    args: list[str] = Field(default_factory=list)
+    cwd: str | None = None
+    env_from_process: dict[str, str] = Field(default_factory=dict)
+
+
+class McpStreamableHttpServerSettings(McpServerBaseSettings):
+    transport: Literal["streamable_http"]
+    url: str = Field(min_length=1)
+    headers_from_env: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("MCP Streamable HTTP URL 必须是有效的 HTTP(S) 地址")
+        if parsed.username or parsed.password:
+            raise ValueError("MCP URL 禁止内嵌认证信息，请使用 headers_from_env")
+        if parsed.scheme == "http" and parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("MCP Streamable HTTP 仅允许 HTTPS，回环地址除外")
+        return value
+
+
+McpServerSettings = Annotated[
+    McpStdioServerSettings | McpStreamableHttpServerSettings,
+    Field(discriminator="transport"),
+]
+
+
+class McpSettings(BaseModel):
+    servers: dict[str, McpServerSettings] = Field(default_factory=dict)
+
+    @field_validator("servers")
+    @classmethod
+    def validate_server_names(cls, value: dict[str, McpServerSettings]) -> dict[str, McpServerSettings]:
+        invalid = [name for name in value if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", name)]
+        if invalid:
+            raise ValueError(f"MCP server 名称非法：{', '.join(invalid)}")
+        return value
+
+
 class HookPluginPromptConfig(BaseModel):
     role: str = "system"
     content: str
@@ -230,6 +283,7 @@ class AppSettings(BaseModel):
     agent: AgentSettings = Field(default_factory=AgentSettings)
     context: ContextSettings = Field(default_factory=ContextSettings)
     tools: ToolSettings = Field(default_factory=ToolSettings)
+    mcp: McpSettings = Field(default_factory=McpSettings)
     hooks: HooksSettings = Field(default_factory=HooksSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     sse: SSESettings = Field(default_factory=SSESettings)

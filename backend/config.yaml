@@ -104,6 +104,8 @@ tools:
       - ["git", "log"]
       - ["git", "show"]
     max_output_chars: 50000
+mcp:
+  servers: {}
 hooks:
   enabled: true
   default_timeout_seconds: 30

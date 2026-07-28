@@ -36,7 +36,8 @@ class SessionRunner:
         agent_loop: AgentLoop,
         agent_profiles: dict[str, AgentProfile],
         title_service: SessionTitleService | None = None,
-        allow_human_interaction: bool = True,
+        allow_manual_approval: bool = True,
+        allow_question_interaction: bool = True,
     ) -> None:
         self._workspace = workspace
         self._config = config
@@ -44,7 +45,8 @@ class SessionRunner:
         self._hook_manager = hook_manager
         self._agent_loop = agent_loop
         self._agent_profiles = agent_profiles
-        self._allow_human_interaction = allow_human_interaction
+        self._allow_manual_approval = allow_manual_approval
+        self._allow_question_interaction = allow_question_interaction
         self._session: SessionState | None = None
         self._task: asyncio.Task[SessionState] | None = None
         self._title_service = title_service or SessionTitleService()
@@ -259,7 +261,8 @@ class SessionRunner:
                 question_event=self._question_event,
                 question_result_holder=self._question_result_holder,
                 stop_event=self._stop_event,
-                allow_human_interaction=self._allow_human_interaction,
+                allow_manual_approval=self._allow_manual_approval,
+                allow_question_interaction=self._allow_question_interaction,
             )
         except Exception as exc:  # noqa: BLE001
             # 运行异常时显式写入失败状态并发出错误事件，便于前端与日志系统感知失败原因。
@@ -349,6 +352,8 @@ class SessionRunner:
             raise ValueError("当前没有等待用户回答的 session")
         if self._session.metadata.get("pending_human_type") != "question":
             raise ValueError("当前 session 等待的不是用户回答")
+        if gateway_input.question_id != self._session.metadata.get("pending_question_id"):
+            raise ValueError("question_id 与当前等待的问题不一致")
         self._question_result_holder["result"] = QuestionResult(
             question_id=gateway_input.question_id or "",
             answers=gateway_input.answers or {},
@@ -364,6 +369,8 @@ class SessionRunner:
             raise ValueError("当前没有等待用户回答的 session")
         if self._session.metadata.get("pending_human_type") != "question":
             raise ValueError("当前 session 等待的不是用户回答")
+        if gateway_input.question_id != self._session.metadata.get("pending_question_id"):
+            raise ValueError("question_id 与当前等待的问题不一致")
         self._question_result_holder["result"] = QuestionResult(
             question_id=gateway_input.question_id or "",
             answers={},
@@ -411,7 +418,8 @@ class SessionRunner:
         metadata = {
             "thinking_enabled": thinking_value is not None,
             "thinking_value": thinking_value,
-            "allow_human_interaction": self._allow_human_interaction,
+            "allow_manual_approval": self._allow_manual_approval,
+            "allow_question_interaction": self._allow_question_interaction,
         }
         if gateway_input.metadata.get("source") == "schedule":
             for key in ("source", "schedule_task_id", "schedule_run_id", "schedule_task_name"):

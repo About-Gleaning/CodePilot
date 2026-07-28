@@ -7,7 +7,6 @@ from typing import Any
 
 from codepilot.events import EventBus
 from codepilot.hooks import HookManager, RuntimeHandles
-from codepilot.session import AgentState
 from codepilot.tools import BaseTool, ToolDispatcher, ToolExecutionContext, ToolRegistry, ToolSpec
 
 
@@ -26,7 +25,7 @@ class DummyTool(BaseTool):
         return {"status": "ok", "tool_name": self.spec.name, "output": str(args.get("value", ""))}
 
 
-def run_dispatcher(tmp_path: Path, tool_calls: list[dict[str, Any]]):
+def run_dispatcher(tmp_path: Path, tool_calls: list[dict[str, Any]], *, allowed_tools: list[str] | None = None):
     async def _run():
         registry = ToolRegistry()
         registry.register(DummyTool("parallel_a", can_parallel=True))
@@ -36,7 +35,7 @@ def run_dispatcher(tmp_path: Path, tool_calls: list[dict[str, Any]]):
         return await dispatcher.execute_tool_calls(
             session=SimpleNamespace(session_id="session_1", messages=[]),
             workspace=SimpleNamespace(workspace_path=tmp_path),
-            agent=AgentState(name="build"),
+            agent=SimpleNamespace(name="build", allowed_tools=allowed_tools or []),
             tool_calls=tool_calls,
             runtime=RuntimeHandles(event_bus=EventBus()),
             config=SimpleNamespace(),
@@ -72,3 +71,25 @@ def test_serial_tool_does_not_write_execution_group_metadata(tmp_path: Path) -> 
     )
 
     assert [part.metadata.get("execution_group") for part in batch.tool_parts] == [None, None, None]
+
+
+def test_dispatcher_rejects_tool_not_authorized_for_agent(tmp_path: Path) -> None:
+    batch = run_dispatcher(
+        tmp_path,
+        [{"tool_name": "serial", "arguments": {"value": "forbidden"}}],
+    )
+
+    result = batch.tool_parts[0].state.output
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "ToolAgentForbidden"
+
+
+def test_dispatcher_executes_tool_authorized_for_agent(tmp_path: Path) -> None:
+    batch = run_dispatcher(
+        tmp_path,
+        [{"tool_name": "serial", "arguments": {"value": "allowed"}}],
+        allowed_tools=["serial"],
+    )
+
+    assert batch.tool_parts[0].state.output["output"] == "allowed"
