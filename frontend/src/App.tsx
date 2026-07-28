@@ -2107,6 +2107,24 @@ function ComposerAutocompletePanel({
   onPick: (option: ComposerOption) => void;
   compact?: boolean;
 }) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const activeOptionRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const list = listRef.current;
+    const activeOption = activeOptionRef.current;
+    if (!list || !activeOption) {
+      return;
+    }
+    const listBounds = list.getBoundingClientRect();
+    const optionBounds = activeOption.getBoundingClientRect();
+    if (optionBounds.top < listBounds.top) {
+      list.scrollTop -= listBounds.top - optionBounds.top;
+    } else if (optionBounds.bottom > listBounds.bottom) {
+      list.scrollTop += optionBounds.bottom - listBounds.bottom;
+    }
+  }, [state?.activeIndex]);
+
   if (!state) {
     return null;
   }
@@ -2121,12 +2139,13 @@ function ComposerAutocompletePanel({
       {loading ? <div className="autocomplete-empty">搜索中...</div> : null}
       {!loading && options.length === 0 ? <div className="autocomplete-empty">无匹配结果</div> : null}
       {!loading && options.length > 0 ? (
-        <div className="autocomplete-list">
-          {options.slice(0, 10).map((option, index) => (
+        <div className="autocomplete-list" ref={listRef}>
+          {options.map((option, index) => (
             <button
               type="button"
               className={`autocomplete-option ${index === state.activeIndex ? 'is-active' : ''}`}
               key={`${state.kind}:${option.value}`}
+              ref={index === state.activeIndex ? activeOptionRef : null}
               onMouseEnter={() => onHover(index)}
               onMouseDown={(event) => {
                 event.preventDefault();
@@ -4015,7 +4034,7 @@ function translateSkillShortcuts(value: string, skills: SkillOption[]) {
     if (!skillName) {
       return raw;
     }
-    return `${prefix}使用 ${skillName} skill`;
+    return `${prefix}${skillName} skill`;
   });
 }
 
