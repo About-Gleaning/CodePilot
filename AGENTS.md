@@ -67,6 +67,10 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 ## Commit & Pull Request Guidelines
 
+## Agent 平台设计文档
+
+涉及 Agent 配置、运行时拓扑、会话/Run 生命周期、并发、Tool/MCP 权限或验证结论的改动，设计与验证证据必须写入 `docs/agent-platform/`，并更新该目录的 `README.md`。不得只在聊天、Plane 评论或日志中保存架构结论；结果文件不得包含绝对用户目录、密钥、Prompt 正文或附件 base64。
+
 当前历史只有初始提交，后续请使用中文、祈使式提交信息，例如 `修复会话恢复的事件重放顺序`。PR 应说明变更目的、主要实现、验证命令和潜在风险；涉及 UI 时附截图或录屏；涉及配置时说明新增环境变量或迁移步骤。不要在 PR 中混入无关格式化或顺手重构。
 
 ## Security & Configuration Tips

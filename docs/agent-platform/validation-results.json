@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "scope": "CODE-47 合成原型；不包含真实 LLM、MCP、网络或生产 SessionRunner。",
+  "samples": 20,
+  "metrics_ms": {
+    "in_process_run_complete": {"p50": 6.403, "p95": 9.561},
+    "worker_ready": {"p50": 76.46, "p95": 114.029}
+  },
+  "hard_gate_results": {
+    "parallel_event_isolation": "passed",
+    "workspace_write_lease": "passed",
+    "interaction_routing": "passed",
+    "bounded_subscriber": "passed",
+    "worker_process_boundary": "passed"
+  },
+  "limitations": [
+    "worker 原型仅验证进程边界和控制协议，不承载真实 SessionRunner。",
+    "RSS、MCP broker、真实 LLM 流与重连回放将在 CODE-51 正式实现前补充实测。"
+  ]
+}
