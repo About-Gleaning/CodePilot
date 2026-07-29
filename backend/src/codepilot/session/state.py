@@ -18,6 +18,58 @@ class SessionStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+class AgentLifecycleState(str, Enum):
+    """Agent 进程内生命周期；与单次会话运行状态分离。"""
+
+    STOPPED = "STOPPED"
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    STOPPING = "STOPPING"
+    ERROR = "ERROR"
+
+
+class RunStatus(str, Enum):
+    """一次用户消息触发的执行状态。"""
+
+    STARTING = "STARTING"
+    RUNNING = "RUNNING"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    CANCELLING = "CANCELLING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class RunRef(BaseModel):
+    """所有运行时控制操作必须携带的完整资源归属。"""
+
+    agent_id: str
+    session_id: str
+    run_id: str
+    revision_id: str = ""
+
+
+class RunState(BaseModel):
+    ref: RunRef
+    client_request_id: str
+    status: RunStatus = RunStatus.STARTING
+    run_seq: int = 0
+    created_at: str
+    started_at: str | None = None
+    ended_at: str | None = None
+    error_code: str | None = None
+
+
+class AgentRuntimeState(BaseModel):
+    agent_id: str
+    desired_state: AgentLifecycleState = AgentLifecycleState.STOPPED
+    lifecycle_state: AgentLifecycleState = AgentLifecycleState.STOPPED
+    recent_session_id: str | None = None
+    active_run_count: int = 0
+    waiting_human_count: int = 0
+    error_code: str | None = None
+
+
 class SessionState(BaseModel):
     session_id: str
     title: str | None = None

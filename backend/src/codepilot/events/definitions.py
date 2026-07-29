@@ -22,7 +22,11 @@ class StreamEvent(BaseModel):
     seq: int = 0
     event_id: str = Field(default_factory=lambda: f"evt_{uuid4().hex}")
     event_type: str
+    # 新运行时按 Agent/Session/Run 归属；旧事件和旧 JSONL 仍允许缺少这些字段。
+    agent_id: str | None = None
     session_id: str | None = None
+    run_id: str | None = None
+    run_seq: int = 0
     created_at: str
     data: dict[str, Any] = Field(default_factory=dict)
 

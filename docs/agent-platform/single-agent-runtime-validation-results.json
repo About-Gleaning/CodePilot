@@ -1,0 +1,8 @@
+{
+  "node": "CODE-49",
+  "scenarios": [
+    {"id": "backend-regression", "command": "cd backend && uv run pytest -q", "result": "273 passed, 1 skipped"},
+    {"id": "resource-runtime-contract", "result": "implemented"}
+  ],
+  "sensitive_data": "redacted"
+}

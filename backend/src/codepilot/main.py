@@ -28,6 +28,7 @@ from codepilot.runtime import build_runtime_bundle
 from codepilot.scheduler import ScheduleRunner, ScheduleStore
 from codepilot.skills import SkillRegistry
 from codepilot.session import SessionRunner
+from codepilot.session.agent_runtime import InProcessAgentRuntimeBackend
 from codepilot.session.agent_config import AgentConfigService
 from codepilot.tools import ScheduleManageTool, ToolRegistry
 
@@ -46,6 +47,7 @@ class AppContext:
     skill_registry: SkillRegistry
     agent_profiles: dict[str, object]
     session_runner: SessionRunner
+    agent_runtime: InProcessAgentRuntimeBackend
     schedule_store: ScheduleStore
     schedule_runner: ScheduleRunner
     agent_config_service: AgentConfigService
@@ -106,6 +108,7 @@ def create_app() -> FastAPI:
         skill_registry=runtime.skill_registry,
         agent_profiles=runtime.agent_profiles,
         session_runner=runtime.session_runner,
+        agent_runtime=runtime.agent_runtime,
         schedule_store=schedule_store,
         schedule_runner=schedule_runner,
         agent_config_service=agent_config_service,
@@ -114,11 +117,13 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         await runtime.start()
+        await app_state.agent_runtime.recover()
         await app_state.schedule_runner.start()
         try:
             yield
         finally:
             await app_state.schedule_runner.shutdown()
+            await app_state.agent_runtime.shutdown()
             await app_state.session_runner.shutdown()
             await runtime.shutdown()
 

@@ -55,10 +55,8 @@ class GatewayInput(BaseModel):
                 raise ValueError("user_message 必须提供 content")
             if not self.agent_name:
                 raise ValueError("user_message 必须提供 agent_name")
-            if not self.provider:
-                raise ValueError("user_message 必须提供 provider")
-            if not self.model:
-                raise ValueError("user_message 必须提供 model")
+            if bool(self.provider) != bool(self.model):
+                raise ValueError("provider 与 model 必须同时提供")
             if len(self.attachments) > MAX_IMAGE_ATTACHMENTS_PER_MESSAGE:
                 raise ValueError(f"单条消息最多上传 {MAX_IMAGE_ATTACHMENTS_PER_MESSAGE} 张图片")
             for attachment in self.attachments:

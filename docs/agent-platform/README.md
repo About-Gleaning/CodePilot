@@ -9,5 +9,7 @@
 - `adr-runtime-topology.md`：拓扑决策记录；当前状态为 Proposed。
 - `agent-config-center.md`：CODE-48 的 Agent 配置、revision、归档和能力目录契约。
 - `agent-config-validation-results.json`：CODE-48 的脱敏验证结果。
+- `single-agent-runtime.md`：CODE-49 的资源化运行时与兼容边界。
+- `single-agent-runtime-validation-results.json`：CODE-49 的脱敏验证结果。
 
 后续 CODE-48 至 CODE-53 进入待验收前，必须增加或更新对应设计、验证结果，并在本文件登记链接。

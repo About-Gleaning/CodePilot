@@ -27,12 +27,14 @@ class EventBus:
         self._emitter = AsyncIOEventEmitter()
         self._logger = get_logger("codepilot.events")
         self._stream_subscribers: set[asyncio.Queue[StreamEvent]] = set()
+        self._stream_persist_subscribers: list[StreamSubscriber] = []
         self._domain_subscribers: list[DomainSubscriber] = []
         self._seq = 0
 
     def subscribe_stream(self, subscriber: StreamSubscriber) -> None:
         """注册流式事件订阅者。"""
-        self._emitter.on("stream", self._safe_wrapper(subscriber, "stream"))
+        # 持久化订阅者必须在 SSE 可见之前完成，避免客户端拿到未落盘事件。
+        self._stream_persist_subscribers.append(subscriber)
 
     def subscribe_domain(self, subscriber: DomainSubscriber) -> None:
         """注册领域事件订阅者。"""
@@ -44,11 +46,16 @@ class EventBus:
         self._seq += 1
         event.seq = self._seq
 
+        for subscriber in list(self._stream_persist_subscribers):
+            await self._run_subscriber(subscriber, event, "stream")
+
         # 发布期间订阅关系可能变化，因此基于快照遍历，避免集合迭代失效。
         for queue in list(self._stream_subscribers):
-            await queue.put(event)
-
-        self._emitter.emit("stream", event)
+            # 慢消费者不能反压 Agent 执行；溢出后由 SSE 连接主动重连并回放。
+            if queue.full():
+                self._stream_subscribers.discard(queue)
+                continue
+            queue.put_nowait(event)
         return event
 
     async def publish_domain_event(self, event: DomainEvent) -> DomainEvent:
@@ -59,7 +66,7 @@ class EventBus:
 
     def create_stream_queue(self) -> asyncio.Queue[StreamEvent]:
         """创建并登记一个独立的流式事件消费队列。"""
-        queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
+        queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=1000)
         self._stream_subscribers.add(queue)
         return queue
 

@@ -23,6 +23,7 @@ from codepilot.hooks import (
 from codepilot.llm import LiteLLMClient
 from codepilot.memory import JsonlEventStore, JsonlSessionMemory
 from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
+from codepilot.session.agent_runtime import InProcessAgentRuntimeBackend, SessionRunnerFactory
 from codepilot.session.title import SessionTitleService
 from codepilot.skills import SkillRegistry
 from codepilot.tools import (
@@ -58,6 +59,7 @@ class RuntimeBundle:
     skill_registry: SkillRegistry
     agent_profiles: dict[str, Any]
     session_runner: SessionRunner
+    agent_runtime: InProcessAgentRuntimeBackend
     mcp_manager: McpClientManager
 
     async def start(self) -> None:
@@ -125,16 +127,28 @@ def build_runtime_bundle(
             timeout_seconds=settings.tools.default_timeout_seconds,
         )
     )
-    session_runner = SessionRunner(
+    def create_session_runner() -> SessionRunner:
+        return SessionRunner(
+            workspace=workspace,
+            config=settings,
+            event_bus=event_bus,
+            hook_manager=hook_manager,
+            agent_loop=agent_loop,
+            agent_profiles=agent_profiles,
+            title_service=build_title_service(settings),
+            allow_manual_approval=allow_manual_approval,
+            allow_question_interaction=allow_question_interaction,
+        )
+
+    # 保留一个旧 Runner 给兼容接口；新资源化 API 始终经由独立 RunnerFactory。
+    session_runner = create_session_runner()
+    agent_runtime = InProcessAgentRuntimeBackend(
         workspace=workspace,
         config=settings,
         event_bus=event_bus,
-        hook_manager=hook_manager,
-        agent_loop=agent_loop,
+        session_memory=session_memory,
         agent_profiles=agent_profiles,
-        title_service=build_title_service(settings),
-        allow_manual_approval=allow_manual_approval,
-        allow_question_interaction=allow_question_interaction,
+        runner_factory=SessionRunnerFactory(create_session_runner),
     )
     return RuntimeBundle(
         event_bus=event_bus,
@@ -146,6 +160,7 @@ def build_runtime_bundle(
         skill_registry=skill_registry,
         agent_profiles=agent_profiles,
         session_runner=session_runner,
+        agent_runtime=agent_runtime,
         mcp_manager=mcp_manager,
     )
 
