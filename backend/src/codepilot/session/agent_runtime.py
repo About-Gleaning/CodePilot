@@ -84,8 +84,20 @@ class RunExecutionHandle:
     runner: SessionRunner
     event_scope: RunEventScope
 
-    async def wait(self) -> Any:
-        return await self.runner.wait_current_run()
+
+
+@dataclass(frozen=True, slots=True)
+class RunExecutionResult:
+    status: RunStatus
+    error_code: str | None = None
+    external_effect_uncertain: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CancellationResult:
+    confirmed: bool
+    external_effect_uncertain: bool = False
+    error_code: str | None = None
 
 
 class AgentRuntimeBackend(Protocol):
@@ -110,7 +122,13 @@ class AgentRuntimeBackend(Protocol):
         event_scope: RunEventScope,
     ) -> RunExecutionHandle: ...
 
-    async def cancel_run(self, session_handle: SessionExecutionHandle, run_ref: RunRef) -> bool: ...
+    def get_session_snapshot(self, session_handle: SessionExecutionHandle) -> dict[str, Any]: ...
+
+    async def wait_run(self, run_handle: RunExecutionHandle) -> RunExecutionResult: ...
+
+    async def cancel_run(
+        self, session_handle: SessionExecutionHandle, run_ref: RunRef
+    ) -> CancellationResult: ...
 
     async def reply_interaction(
         self,
@@ -171,13 +189,39 @@ class InProcessAgentRuntimeBackend:
         )
         return RunExecutionHandle(run_ref=run_ref, runner=session_handle.runner, event_scope=event_scope)
 
-    async def cancel_run(self, session_handle: SessionExecutionHandle, run_ref: RunRef) -> bool:
+    def get_session_snapshot(self, session_handle: SessionExecutionHandle) -> dict[str, Any]:
+        return session_handle.runner.get_status_snapshot()
+
+    async def wait_run(self, run_handle: RunExecutionHandle) -> RunExecutionResult:
+        session = await run_handle.runner.wait_current_run()
+        status = RunStatus.COMPLETED
+        if session and session.status == SessionStatus.FAILED:
+            status = RunStatus.FAILED
+        elif session and session.status == SessionStatus.CANCELLED:
+            status = RunStatus.CANCELLED
+        uncertain = bool(session and session.metadata.get("external_effect_uncertain"))
+        return RunExecutionResult(
+            status=status,
+            error_code="cancellation_uncertain" if uncertain else None,
+            external_effect_uncertain=uncertain,
+        )
+
+    async def cancel_run(
+        self, session_handle: SessionExecutionHandle, run_ref: RunRef
+    ) -> CancellationResult:
         await session_handle.runner.handle_input(GatewayInput(type=GatewayInputType.STOP))
         try:
             await asyncio.wait_for(session_handle.runner.wait_current_run(), timeout=1)
         except TimeoutError:
-            await asyncio.wait_for(session_handle.runner.force_cancel_current_run(), timeout=9)
-        return True
+            try:
+                await asyncio.wait_for(session_handle.runner.force_cancel_current_run(), timeout=9)
+            except Exception:
+                return CancellationResult(
+                    confirmed=False,
+                    external_effect_uncertain=True,
+                    error_code="cancellation_uncertain",
+                )
+        return CancellationResult(confirmed=True)
 
     async def reply_interaction(
         self,
@@ -201,6 +245,12 @@ class SessionRuntimeHandle:
     profile_revision_id: str
     active_run_id: str | None = None
     last_accessed_at: str = ""
+
+
+@dataclass(slots=True)
+class _RequestReservation:
+    fingerprint: str
+    future: asyncio.Future[tuple[RunState | None, BaseException | None]]
 
 
 class AgentRuntimeManager:
@@ -229,10 +279,18 @@ class AgentRuntimeManager:
         self._sessions: dict[tuple[str, str], SessionRuntimeHandle] = {}
         self._runs: dict[tuple[str, str, str], RunState] = {}
         self._idempotency: dict[str, tuple[str, tuple[str, str, str]]] = {}
+        self._request_reservations: dict[str, _RequestReservation] = {}
+        self._active_sessions: dict[tuple[str, str], str] = {}
+        self._active_run_total = 0
         self._executions: dict[tuple[str, str, str], RunExecutionHandle] = {}
+        self._run_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
+        self._terminal_events: dict[tuple[str, str, str], asyncio.Event] = {}
         self._interactions: dict[tuple[str, str, str, str], HumanInteractionState] = {}
         self._watchers: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
+        self._state_persist_lock = asyncio.Lock()
+        self._state_generation = 0
+        self._persisted_state_generation = 0
         self._state_store = RuntimeStateStore(workspace.workspace_dir)
         self._run_store = JsonlRunStore(workspace.workspace_dir)
         self._control_store = RuntimeControlEventStore(workspace.workspace_dir)
@@ -250,6 +308,11 @@ class AgentRuntimeManager:
             self._recovery_error = "runtime_recovery_incomplete"
             return
         self._runs, self._idempotency = recovered
+        self._run_locks = {key: asyncio.Lock() for key in self._runs}
+        self._terminal_events = {key: asyncio.Event() for key in self._runs}
+        for key, run in self._runs.items():
+            if run.status in _TERMINAL_RUN_STATUSES:
+                self._terminal_events[key].set()
         for run in list(self._runs.values()):
             if run.status in _ACTIVE_RUN_STATUSES:
                 await self._transition_terminal(run, RunStatus.CANCELLED, error_code="service_restarted")
@@ -378,14 +441,65 @@ class AgentRuntimeManager:
         if target_session:
             _validate_resource_id(target_session, "session_id")
         fingerprint = _request_fingerprint(agent_id, target_session, request)
-        async with self._lock:
-            existing = self._idempotency.get(client_request_id)
-            if existing:
-                old_fingerprint, key = existing
-                if old_fingerprint != fingerprint:
-                    raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
-                return self._runs[key]
 
+        leader = False
+        async with self._lock:
+            reservation = self._request_reservations.get(client_request_id)
+            if reservation is not None:
+                if reservation.fingerprint != fingerprint:
+                    raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
+                future = reservation.future
+            else:
+                existing = self._idempotency.get(client_request_id)
+                if existing:
+                    old_fingerprint, key = existing
+                    if old_fingerprint != fingerprint:
+                        raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
+                    return self._runs[key]
+                future = asyncio.get_running_loop().create_future()
+                self._request_reservations[client_request_id] = _RequestReservation(
+                    fingerprint=fingerprint,
+                    future=future,
+                )
+                leader = True
+
+        if not leader:
+            run, error = await asyncio.shield(future)
+            if error is not None:
+                raise error
+            assert run is not None
+            return run
+
+        try:
+            run = await self._start_run_reserved(
+                agent_id=agent_id,
+                request=request,
+                target_session=target_session,
+                client_request_id=client_request_id,
+                fingerprint=fingerprint,
+            )
+        except BaseException as exc:
+            async with self._lock:
+                self._request_reservations.pop(client_request_id, None)
+                if not future.done():
+                    future.set_result((None, exc))
+            raise
+        async with self._lock:
+            self._request_reservations.pop(client_request_id, None)
+            if not future.done():
+                future.set_result((run, None))
+        return run
+
+    async def _start_run_reserved(
+        self,
+        *,
+        agent_id: str,
+        request: GatewayInput,
+        target_session: str | None,
+        client_request_id: str,
+        fingerprint: str,
+    ) -> RunState:
+        """执行首个幂等请求；调用方已持有 workspace 级请求预留。"""
         profile = self._active_profile(agent_id)
         state = self._runtimes.get(agent_id)
         if state is None or state.lifecycle_state != AgentLifecycleState.RUNNING:
@@ -413,20 +527,36 @@ class AgentRuntimeManager:
         )
         key = (*key_base, run_id)
         async with self._lock:
-            if self._active_run_count() >= self._max_active_runs:
+            # stop 与容量/Session 预留共享同一线性化点，STOPPING 后不会漏启动 Run。
+            state = self._runtimes.get(agent_id)
+            if (
+                state is None
+                or state.desired_state != AgentLifecycleState.RUNNING
+                or state.lifecycle_state != AgentLifecycleState.RUNNING
+            ):
+                raise RuntimeConflict("agent_not_running", "Agent 尚未启动或正在关闭")
+            if self._active_run_total >= self._max_active_runs:
                 raise RuntimeConflict("run_capacity_exceeded", "活动 Run 容量已满", retry_after=1)
-            session_handle = self._sessions.get(key_base)
-            if session_handle and session_handle.active_run_id:
+            if key_base in self._active_sessions:
                 raise RuntimeConflict("session_run_conflict", "目标 Session 已有活动 Run")
             self._runs[key] = run
+            self._run_locks[key] = asyncio.Lock()
+            self._terminal_events[key] = asyncio.Event()
             self._idempotency[client_request_id] = (fingerprint, key)
+            self._active_sessions[key_base] = run_id
+            self._active_run_total += 1
             state.active_run_count += 1
+            session_handle = self._sessions.get(key_base)
         try:
             await self._run_store.append(run)
         except Exception:
             async with self._lock:
                 self._runs.pop(key, None)
+                self._run_locks.pop(key, None)
+                self._terminal_events.pop(key, None)
                 self._idempotency.pop(client_request_id, None)
+                self._active_sessions.pop(key_base, None)
+                self._active_run_total = max(0, self._active_run_total - 1)
                 state.active_run_count = max(0, state.active_run_count - 1)
             raise
 
@@ -480,6 +610,8 @@ class AgentRuntimeManager:
                 run.ended_at = utc_now_iso()
                 state.active_run_count = max(0, state.active_run_count - 1)
                 session_handle.active_run_id = None
+                self._active_sessions.pop(key_base, None)
+                self._active_run_total = max(0, self._active_run_total - 1)
                 state.lifecycle_state = AgentLifecycleState.ERROR
                 state.error_code = "runtime_state_persist_failed"
                 self._recovery_error = "runtime_recovery_incomplete"
@@ -490,27 +622,44 @@ class AgentRuntimeManager:
         return run
 
     async def cancel_run(self, ref: RunRef) -> RunState:
-        async with self._lock:
-            run = self._require_run(ref)
+        run = self._require_run(ref)
+        key = _run_key(ref)
+        run_lock = self._run_locks.setdefault(key, asyncio.Lock())
+        terminal_event = self._terminal_events.setdefault(key, asyncio.Event())
+        async with run_lock:
             if run.status in _TERMINAL_RUN_STATUSES:
                 return run
-            run.status = RunStatus.CANCELLING
-            await self._run_store.append(run)
-            handle = self._sessions.get((ref.agent_id, ref.session_id))
-            if handle is not None:
-                interaction_id = handle.execution.runner.get_status_snapshot().get("pending_human_interaction_id")
-                if isinstance(interaction_id, str) and interaction_id:
-                    interaction = self._interactions.get((*_run_key(ref), interaction_id))
-                    if interaction and interaction.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}:
+            if run.status == RunStatus.CANCELLING:
+                wait_for_terminal = True
+            else:
+                wait_for_terminal = False
+                run.status = RunStatus.CANCELLING
+                await self._run_store.append(run)
+            async with self._lock:
+                handle = self._sessions.get((ref.agent_id, ref.session_id))
+                for interaction in self._interactions.values():
+                    if (
+                        interaction.ref.agent_id == ref.agent_id
+                        and interaction.ref.session_id == ref.session_id
+                        and interaction.ref.run_id == ref.run_id
+                        and interaction.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}
+                    ):
                         interaction.status = InteractionStatus.CANCELLED
                         interaction.ended_at = utc_now_iso()
+        if wait_for_terminal:
+            await terminal_event.wait()
+            return run
         if handle is None:
             return await self._transition_terminal(run, RunStatus.FAILED, error_code="cancellation_uncertain")
         try:
-            confirmed = await asyncio.wait_for(self._backend.cancel_run(handle.execution, run.ref), timeout=10)
+            result = await asyncio.wait_for(self._backend.cancel_run(handle.execution, run.ref), timeout=10)
         except Exception:
-            confirmed = False
-        if not confirmed:
+            result = CancellationResult(
+                confirmed=False,
+                external_effect_uncertain=True,
+                error_code="cancellation_uncertain",
+            )
+        if not result.confirmed:
             state = self._runtimes.get(ref.agent_id)
             if state:
                 state.lifecycle_state = AgentLifecycleState.ERROR
@@ -535,8 +684,7 @@ class AgentRuntimeManager:
                 if interaction.result_fingerprint == result_fingerprint:
                     return run
                 raise RuntimeConflict("interaction_result_conflict", "interaction 已提交不同结果")
-            snapshot = handle.execution.runner.get_status_snapshot()
-            if interaction is None or snapshot.get("pending_human_interaction_id") != interaction_id:
+            if interaction is None:
                 raise RuntimeConflict("interaction_result_conflict", "interaction 已过期或归属不匹配")
             if interaction.status != InteractionStatus.PENDING:
                 raise RuntimeConflict("interaction_result_conflict", "interaction 正在处理或已经失效")
@@ -573,6 +721,7 @@ class AgentRuntimeManager:
         if kind not in {"approval", "question"}:
             return
         key = (event.agent_id, event.session_id, event.run_id, event.interaction_id)
+        changed_run: RunState | None = None
         async with self._lock:
             if event.data.get("status") == "pending":
                 self._interactions[key] = HumanInteractionState(
@@ -592,6 +741,7 @@ class AgentRuntimeManager:
                 run = self._runs.get((event.agent_id, event.session_id, event.run_id))
                 if run and run.status in {RunStatus.RUNNING, RunStatus.STARTING}:
                     run.status = RunStatus.WAITING_HUMAN
+                    changed_run = run
             else:
                 interaction = self._interactions.get(key)
                 if interaction and interaction.status != InteractionStatus.CANCELLED:
@@ -603,6 +753,9 @@ class AgentRuntimeManager:
                 run = self._runs.get((event.agent_id, event.session_id, event.run_id))
                 if run and run.status == RunStatus.WAITING_HUMAN:
                     run.status = RunStatus.RUNNING
+                    changed_run = run
+        if changed_run is not None:
+            await self._run_store.append(changed_run)
 
     async def load_session(self, agent_id: str, session_id: str) -> SessionExecutionHandle:
         _validate_resource_id(session_id, "session_id")
@@ -619,7 +772,16 @@ class AgentRuntimeManager:
             profile_revision_id=profile.revision_id,
             last_accessed_at=utc_now_iso(),
         )
+        await self._evict_idle_sessions()
         return execution
+
+    async def validate_session_owner(self, agent_id: str, session_id: str) -> dict[str, Any]:
+        """只校验历史 Session 归属，不创建执行 Runner。"""
+        _validate_resource_id(session_id, "session_id")
+        profile = self._record_profile(agent_id)
+        replay = await self._session_memory.replay(session_id)
+        self._assert_session_owner(replay, agent_id, profile)
+        return replay
 
     def get_agent_state(self, agent_id: str) -> AgentRuntimeState:
         self._record(agent_id)
@@ -651,7 +813,7 @@ class AgentRuntimeManager:
         handle = self._sessions.get((agent_id, session_id))
         if handle is None:
             raise KeyError("Session 未加载")
-        return handle.execution.runner.get_status_snapshot()
+        return self._backend.get_session_snapshot(handle.execution)
 
     async def replay_runtime_events(self, cursor: str | None) -> list[tuple[int, str, StreamEvent]]:
         try:
@@ -673,18 +835,22 @@ class AgentRuntimeManager:
 
     async def _watch_run(self, run: RunState, execution: RunExecutionHandle) -> None:
         try:
-            session = await execution.wait()
-            status = RunStatus.COMPLETED
-            if session and session.status == SessionStatus.FAILED:
-                status = RunStatus.FAILED
-            elif session and session.status == SessionStatus.CANCELLED:
-                status = RunStatus.CANCELLED
+            result = await self._backend.wait_run(execution)
+            status = result.status
+            error_code = result.error_code
+            if result.external_effect_uncertain:
+                state = self._runtimes.get(run.ref.agent_id)
+                if state:
+                    state.lifecycle_state = AgentLifecycleState.ERROR
+                    state.error_code = "cancellation_uncertain"
         except asyncio.CancelledError:
             status = RunStatus.CANCELLED
+            error_code = None
         except Exception:
             status = RunStatus.FAILED
+            error_code = "backend_wait_failed"
         run.run_seq = execution.event_scope.run_seq
-        await self._transition_terminal(run, status)
+        await self._transition_terminal(run, status, error_code=error_code)
 
     async def _transition_terminal(
         self,
@@ -693,19 +859,29 @@ class AgentRuntimeManager:
         *,
         error_code: str | None = None,
     ) -> RunState:
-        async with self._lock:
-            if run.status in _TERMINAL_RUN_STATUSES:
-                return run
-            run.status = status
-            run.error_code = error_code
-            run.ended_at = utc_now_iso()
-            state = self._runtimes.get(run.ref.agent_id)
-            if state:
-                state.active_run_count = max(0, state.active_run_count - 1)
-            handle = self._sessions.get((run.ref.agent_id, run.ref.session_id))
-            if handle and handle.active_run_id == run.ref.run_id:
-                handle.active_run_id = None
-            self._executions.pop((run.ref.agent_id, run.ref.session_id, run.ref.run_id), None)
+        key = _run_key(run.ref)
+        run_lock = self._run_locks.setdefault(key, asyncio.Lock())
+        terminal_event = self._terminal_events.setdefault(key, asyncio.Event())
+        async with run_lock:
+            async with self._lock:
+                if run.status in _TERMINAL_RUN_STATUSES:
+                    return run
+                if run.status == RunStatus.CANCELLING and status == RunStatus.COMPLETED:
+                    status = RunStatus.CANCELLED
+                run.status = status
+                run.error_code = error_code
+                run.ended_at = utc_now_iso()
+                state = self._runtimes.get(run.ref.agent_id)
+                if state:
+                    state.active_run_count = max(0, state.active_run_count - 1)
+                session_key = (run.ref.agent_id, run.ref.session_id)
+                handle = self._sessions.get(session_key)
+                if handle and handle.active_run_id == run.ref.run_id:
+                    handle.active_run_id = None
+                if self._active_sessions.get(session_key) == run.ref.run_id:
+                    self._active_sessions.pop(session_key, None)
+                    self._active_run_total = max(0, self._active_run_total - 1)
+                self._executions.pop(key, None)
             try:
                 await self._run_store.append(run)
                 await self._publish_control(f"run_{status.value.lower()}", run=run)
@@ -714,7 +890,27 @@ class AgentRuntimeManager:
                     state.lifecycle_state = AgentLifecycleState.ERROR
                     state.error_code = "runtime_state_persist_failed"
                 self._recovery_error = "runtime_recovery_incomplete"
-            return run
+            finally:
+                terminal_event.set()
+        await self._evict_idle_sessions()
+        return run
+
+    async def _evict_idle_sessions(self) -> None:
+        async with self._lock:
+            idle = [
+                (key, handle)
+                for key, handle in self._sessions.items()
+                if key not in self._active_sessions
+            ]
+            excess = max(0, len(idle) - 20)
+            targets = sorted(idle, key=lambda item: item[1].last_accessed_at)[:excess]
+            for key, _ in targets:
+                self._sessions.pop(key, None)
+        if targets:
+            await asyncio.gather(
+                *(self._backend.close_session(handle.execution) for _, handle in targets),
+                return_exceptions=True,
+            )
 
     async def _publish_control(
         self,
@@ -736,8 +932,10 @@ class AgentRuntimeManager:
         )
 
     async def _persist_states(self) -> None:
-        await self._state_store.write(
-            {
+        async with self._lock:
+            self._state_generation += 1
+            generation = self._state_generation
+            payload = {
                 "schema_version": 1,
                 "agents": {
                     agent_id: {
@@ -748,7 +946,11 @@ class AgentRuntimeManager:
                     for agent_id, state in self._runtimes.items()
                 },
             }
-        )
+        async with self._state_persist_lock:
+            if generation <= self._persisted_state_generation:
+                return
+            await self._state_store.write(payload)
+            self._persisted_state_generation = generation
 
     def _active_profile(self, agent_id: str) -> AgentProfile:
         try:
@@ -834,7 +1036,7 @@ class AgentRuntimeManager:
         return activated.provider, selected, thinking
 
     def _active_run_count(self) -> int:
-        return sum(run.status in _ACTIVE_RUN_STATUSES for run in self._runs.values())
+        return self._active_run_total
 
     def _started_count(self) -> int:
         return sum(

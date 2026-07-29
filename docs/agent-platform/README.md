@@ -13,5 +13,7 @@
 - `single-agent-runtime-validation-results.json`：CODE-49 的脱敏验证结果。
 - `multi-agent-control-plane.md`：CODE-50 的 Manager/Backend、隔离路由、恢复与兼容契约。
 - `multi-agent-control-plane-validation-results.json`：CODE-50 的脱敏容量与性能结果。
+- `parallel-agent-runtime.md`：CODE-51 的 5 Run 并发、写入租约、背压和取消治理。
+- `parallel-agent-runtime-validation-results.json`：CODE-51 的脱敏并发与性能结果。
 
 后续 CODE-48 至 CODE-53 进入待验收前，必须增加或更新对应设计、验证结果，并在本文件登记链接。

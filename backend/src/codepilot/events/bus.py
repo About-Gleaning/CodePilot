@@ -36,21 +36,25 @@ class RunEventScope:
         self._parent_bus = parent_bus
         self.run_ref = run_ref
         self.run_seq = initial_run_seq
+        self._lock = asyncio.Lock()
 
     async def publish_stream_event(self, event: StreamEvent) -> StreamEvent:
-        self.run_seq += 1
-        event.agent_id = self.run_ref.agent_id
-        event.session_id = self.run_ref.session_id
-        event.run_id = self.run_ref.run_id
-        event.run_seq = self.run_seq
-        return await self._parent_bus.publish_stream_event(event)
+        # 同一 Run 的序号分配、持久化和投递必须保持一个严格有序临界区。
+        async with self._lock:
+            self.run_seq += 1
+            event.agent_id = self.run_ref.agent_id
+            event.session_id = self.run_ref.session_id
+            event.run_id = self.run_ref.run_id
+            event.run_seq = self.run_seq
+            return await self._parent_bus.publish_stream_event(event)
 
     async def publish_domain_event(self, event: DomainEvent) -> DomainEvent:
-        event.agent_id = self.run_ref.agent_id
-        event.session_id = self.run_ref.session_id
-        event.run_id = self.run_ref.run_id
-        event.revision_id = self.run_ref.revision_id
-        return await self._parent_bus.publish_domain_event(event)
+        async with self._lock:
+            event.agent_id = self.run_ref.agent_id
+            event.session_id = self.run_ref.session_id
+            event.run_id = self.run_ref.run_id
+            event.revision_id = self.run_ref.revision_id
+            return await self._parent_bus.publish_domain_event(event)
 
 
 class EventBus:

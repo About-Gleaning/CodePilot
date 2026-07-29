@@ -70,11 +70,12 @@ async def run_bash_command(
         stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except TimeoutError:
         timed_out = True
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            process.kill()
+        await _terminate_process_group(process)
         stdout_bytes, stderr_bytes = await process.communicate()
+    except asyncio.CancelledError:
+        await _terminate_process_group(process)
+        await process.communicate()
+        raise
 
     stdout, stdout_truncated = _decode_and_truncate(stdout_bytes, settings.max_output_chars)
     stderr, stderr_truncated = _decode_and_truncate(stderr_bytes, settings.max_output_chars)
@@ -101,3 +102,20 @@ def _decode_and_truncate(data: bytes, max_chars: int) -> tuple[str, bool]:
     if len(text) <= max_chars:
         return text, False
     return text[:max_chars], True
+
+
+async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=0.5)
+    except TimeoutError:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        await process.wait()

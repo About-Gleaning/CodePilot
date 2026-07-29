@@ -10,6 +10,8 @@ Tool 需声明副作用范围：`read_only`、`workspace_mutation`、`runtime_mu
 
 worker 使用受限双向消息协议：stdout 仅承载协议、日志走 stderr、命令行只传资源标识、不传 Prompt/附件/密钥。worker 事件由控制面单写入持久化；MCP 凭证留在控制面。
 
-CODE-50 起，HTTP API 只依赖 `AgentRuntimeManager`。Manager 通过配置服务获取不可变 Profile 快照，并把 SessionRunner 私有 Task、Event 和人工交互 holder 封装在 `AgentRuntimeBackend` 句柄内。主进程最多保持 5 个已启动 Agent；活动 Run 容量由可替换策略控制，CODE-50 为 1，CODE-51 提升为 5。
+CODE-50 起，HTTP API 只依赖 `AgentRuntimeManager`。Manager 通过配置服务获取不可变 Profile 快照，并把 SessionRunner 私有 Task、Event 和人工交互 holder 封装在 `AgentRuntimeBackend` 句柄内。主进程最多保持 5 个已启动 Agent；CODE-51 起交互式活动 Run 上限为 5，同一 Session 仍只能有一个活动 Run。
 
 Run 状态使用 compare-and-set 写入唯一终态；服务重启、取消、Agent 关闭和 watcher 不得重复发布终态或重复释放容量。最后一条不完整 JSONL 可归档证据后恢复完整前缀，中间损坏必须 fail closed。
+
+workspace 变更 Tool 必须以 RunRef 获取非阻塞跨进程写入租约，并持有到执行终态；subagent 继承父 Run 租约。MCP 每服务最多 5 个并发调用、20 个 pending，请求发出后失败不得自动重放。

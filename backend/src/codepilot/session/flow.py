@@ -401,6 +401,14 @@ class TurnExecutor:
         )
         await self.message_appender.append(session, assistant_message, runtime)
         await self.publish_assistant_message_completed(session, assistant_message, runtime)
+        if any(
+            part.state.output.get("error_type") == "McpOutcomeUncertain"
+            for part in tool_batch.tool_parts
+        ):
+            # 已发出的外部变更结果不确定时必须 fail closed，禁止当前 Run 继续调用工具。
+            session.metadata["external_effect_uncertain"] = True
+            session.status = SessionStatus.FAILED
+            return TurnResult(status="failed")
         if tool_batch.pending_approval:
             return TurnResult(
                 status="needs_approval",

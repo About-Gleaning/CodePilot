@@ -27,14 +27,15 @@ class _CallRequest:
     tool_name: str
     arguments: dict[str, Any]
     future: asyncio.Future[Any]
-    retries: int = 0
 
 
 @dataclass(slots=True)
 class _ServerRuntime:
     name: str
     config: McpServerSettings
-    queue: asyncio.Queue[_CallRequest | None] = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[_CallRequest | None] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=20)
+    )
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
     error: str | None = None
@@ -69,7 +70,8 @@ class McpClientManager:
         if not self._started:
             return
         for runtime in self._servers.values():
-            await runtime.queue.put(None)
+            for _ in range(5):
+                await runtime.queue.put(None)
         tasks = [runtime.task for runtime in self._servers.values() if runtime.task is not None]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -94,81 +96,67 @@ class McpClientManager:
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
         runtime = self._servers.get(server_name)
         if runtime is None or runtime.error is not None or runtime.task is None or runtime.task.done():
-            detail = runtime.error if runtime else "server 未启用"
-            raise RuntimeError(f"MCP server `{server_name}` 不可用：{detail}")
+            raise RuntimeError("McpServerUnavailable")
         future = asyncio.get_running_loop().create_future()
-        await runtime.queue.put(_CallRequest(tool_name=tool_name, arguments=arguments, future=future))
-        return await future
+        try:
+            runtime.queue.put_nowait(_CallRequest(tool_name=tool_name, arguments=arguments, future=future))
+        except asyncio.QueueFull as exc:
+            raise RuntimeError("McpCapacityExceeded") from exc
+        try:
+            return await future
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
 
     async def _run_server(self, runtime: _ServerRuntime) -> None:
-        pending: _CallRequest | None = None
-        first_connection = True
         try:
-            while True:
-                try:
-                    async with AsyncExitStack() as stack:
-                        async with asyncio.timeout(runtime.config.timeout_seconds):
-                            session = await stack.enter_async_context(
-                                _open_session(runtime.config, self._workspace.workspace_path)
-                            )
-                            await session.initialize()
-                            tools = (await session.list_tools()).tools
-                        if first_connection:
-                            self._register_tools(runtime, tools)
-                            first_connection = False
-                            runtime.ready.set()
-                        runtime.error = None
-
-                        while True:
-                            request = pending or await runtime.queue.get()
-                            pending = None
-                            if request is None:
-                                return
-                            try:
-                                async with asyncio.timeout(runtime.config.timeout_seconds):
-                                    result = await session.call_tool(request.tool_name, arguments=request.arguments)
-                            except Exception as exc:  # noqa: BLE001
-                                if request.retries == 0:
-                                    request.retries = 1
-                                    pending = request
-                                    self._logger.warning(
-                                        "mcp call failed, reconnecting",
-                                        server=runtime.name,
-                                        tool=request.tool_name,
-                                        error_type=exc.__class__.__name__,
-                                    )
-                                    break
-                                _set_future_exception(request.future, exc)
-                                pending = None
-                                break
-                            _set_future_result(request.future, result)
-                except Exception as exc:  # noqa: BLE001
-                    runtime.error = f"{exc.__class__.__name__}: {exc}"
-                    if first_connection:
-                        runtime.ready.set()
-                        self._logger.error(
-                            "mcp server startup failed",
-                            server=runtime.name,
-                            error_type=exc.__class__.__name__,
-                        )
-                        return
-                    if pending is not None:
-                        _set_future_exception(pending.future, exc)
-                        pending = None
-                    self._logger.error(
-                        "mcp server reconnect failed",
-                        server=runtime.name,
-                        error_type=exc.__class__.__name__,
+            async with AsyncExitStack() as stack:
+                async with asyncio.timeout(runtime.config.timeout_seconds):
+                    session = await stack.enter_async_context(
+                        _open_session(runtime.config, self._workspace.workspace_path)
                     )
-                    return
+                    await session.initialize()
+                    tools = (await session.list_tools()).tools
+                self._register_tools(runtime, tools)
+                runtime.error = None
+                runtime.ready.set()
+                workers = [
+                    asyncio.create_task(
+                        self._consume_calls(runtime, session),
+                        name=f"mcp-{runtime.name}-call-{index}",
+                    )
+                    for index in range(5)
+                ]
+                await asyncio.gather(*workers)
+        except Exception as exc:  # noqa: BLE001
+            # 连接错误不包含底层地址或凭证；已经发出的调用绝不自动重放。
+            runtime.error = exc.__class__.__name__
+            self._logger.error(
+                "mcp server stopped",
+                server=runtime.name,
+                error_type=exc.__class__.__name__,
+            )
         finally:
             runtime.ready.set()
-            if pending is not None:
-                _set_future_exception(pending.future, RuntimeError("MCP server 已关闭"))
             while not runtime.queue.empty():
                 queued = runtime.queue.get_nowait()
                 if queued is not None:
-                    _set_future_exception(queued.future, RuntimeError("MCP server 已关闭"))
+                    _set_future_exception(queued.future, RuntimeError("McpServerUnavailable"))
+
+    async def _consume_calls(self, runtime: _ServerRuntime, session: ClientSession) -> None:
+        while True:
+            request = await runtime.queue.get()
+            if request is None:
+                return
+            if request.future.cancelled():
+                continue
+            try:
+                async with asyncio.timeout(runtime.config.timeout_seconds):
+                    result = await session.call_tool(request.tool_name, arguments=request.arguments)
+            except Exception:
+                _set_future_exception(request.future, RuntimeError("McpOutcomeUncertain"))
+            else:
+                _set_future_result(request.future, result)
 
     def _register_tools(self, runtime: _ServerRuntime, tools: list[Any]) -> None:
         used_names: set[str] = set()
@@ -250,12 +238,15 @@ class McpToolAdapter(BaseTool):
                 max_output_chars=self.max_output_chars,
             )
         except Exception as exc:  # noqa: BLE001
+            code = str(exc)
+            if code not in {"McpCapacityExceeded", "McpOutcomeUncertain", "McpServerUnavailable"}:
+                code = "McpConnectionError"
             return {
                 "status": "error",
                 "tool_name": self.spec.name,
-                "error_type": "McpConnectionError",
-                "error_message": str(exc),
-                "recoverable": True,
+                "error_type": code,
+                "error_message": "MCP 调用未完成",
+                "recoverable": code == "McpCapacityExceeded",
             }
 
 

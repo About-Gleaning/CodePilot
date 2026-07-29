@@ -4,7 +4,7 @@
 
 CODE-50 将 HTTP API 的唯一运行时依赖收敛为 `AgentRuntimeManager`。Manager 管理 Agent、Session、Run、interaction、容量和幂等索引；`InProcessAgentRuntimeBackend` 只持有不透明的 SessionRunner 执行句柄。Scheduler worker 仅构建 Execution Bundle，不创建 Manager，也不读写 `agent-runtimes.json`。
 
-本阶段允许最多 5 个 Agent 保持期望启动状态，但通过 `max_active_runs=1` 明确限制交互式活动 Run 为 1。CODE-51 只需替换容量策略并增加 workspace 写入租约，不需要修改资源化 API、RunRef 或 Runner 内部模型。
+本阶段最初通过 `max_active_runs=1` 限制交互式活动 Run；CODE-51 已在不修改资源化 API 和 RunRef 的前提下把容量提升为 5，并增加 Session 预留与 workspace 写入租约。
 
 ## 配置线性化与资源归属
 

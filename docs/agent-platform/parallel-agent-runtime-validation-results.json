@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "work_item": "CODE-51",
+  "environment": "deterministic-local",
+  "iterations": {
+    "warmup": 3,
+    "measured": 20,
+    "events_per_run": 100
+  },
+  "scenarios": {
+    "event_ordering": {
+      "passed": true,
+      "zero_cross_run_routing": true,
+      "run_seq_contiguous": true
+    },
+    "workspace_write_lease": {
+      "passed": true,
+      "second_writer_rejected": true,
+      "lock_file_mode": "0600"
+    },
+    "bounded_resources": {
+      "passed": true,
+      "session_sse_queue_limit": 1000,
+      "mcp_pending_queue_limit": 20,
+      "mcp_concurrency_per_server": 5,
+      "idle_session_handle_limit": 20
+    }
+  },
+  "metrics_ms": {
+    "event_persist_route_per_event": {
+      "p50": 0.008,
+      "p95": 0.008
+    },
+    "workspace_lease_acquire": {
+      "p50": 0.125,
+      "p95": 0.206
+    },
+    "workspace_lease_reject": {
+      "p50": 0.035,
+      "p95": 0.081
+    }
+  },
+  "verification": {
+    "backend_pytest": {
+      "passed": true,
+      "passed_count": 289,
+      "skipped_count": 1
+    },
+    "frontend_build": {
+      "passed": true
+    },
+    "real_llm_network": "not_measured",
+    "real_mcp_network": "not_measured"
+  },
+  "sensitive_data_scan": {
+    "prompt_body": false,
+    "attachment_base64": false,
+    "authorization": false,
+    "secret": false,
+    "absolute_user_path": false
+  }
+}

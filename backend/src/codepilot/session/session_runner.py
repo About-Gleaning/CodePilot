@@ -21,6 +21,7 @@ from codepilot.session.message import FilePart, FileSource, Message, MessagePart
 from codepilot.session.session import AgentLoop
 from codepilot.session.state import ApprovalResult, QuestionResult, RunRef, SessionState, SessionStatus
 from codepilot.session.title import SessionTitleService
+from codepilot.tools.workspace_lease import get_workspace_write_lease_manager
 from codepilot.utils import new_message_id, new_session_id, utc_now_iso, utc_now_millis
 
 
@@ -364,6 +365,9 @@ class SessionRunner:
                 )
             )
             raise
+        finally:
+            if runtime.run_ref is not None:
+                await get_workspace_write_lease_manager(self._workspace.workspace_dir).release(runtime.run_ref)
         return session
 
     async def _handle_stop(self) -> SessionState | None:

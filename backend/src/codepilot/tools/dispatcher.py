@@ -12,6 +12,7 @@ from codepilot.session.message import ToolPart
 from codepilot.tools.base import BaseTool, ToolExecutionContext
 from codepilot.tools.registry import ToolRegistry
 from codepilot.tools.results import ToolEventPublisher, ToolResultBuilder
+from codepilot.tools.workspace_lease import WorkspaceWriteBusy, get_workspace_write_lease_manager
 from codepilot.utils import utc_now_iso
 
 
@@ -279,6 +280,20 @@ class ToolDispatcher:
         if hook_approval is not None:
             return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), hook_approval, None
 
+        if tool.spec.side_effect == "workspace_mutation" and runtime.run_ref is not None:
+            try:
+                await get_workspace_write_lease_manager(workspace.workspace_dir).acquire(runtime.run_ref)
+            except WorkspaceWriteBusy:
+                result = self._result_builder.error_result(
+                    tool_name,
+                    "WorkspaceWriteBusy",
+                    "workspace 正被其他 Run 修改；租约释放后请重新读取相关文件再重试",
+                )
+                result["recoverable"] = True
+                return self._result_builder.completed_part(
+                    tool_call_id, tool_name, result, tool_args=tool_args
+                ), None, None
+
         await self._event_publisher.publish_started(
             session=session,
             runtime=runtime,
@@ -288,6 +303,12 @@ class ToolDispatcher:
             tool_args=tool_args,
         )
 
+        runtime.active_tools[tool_call_id] = {
+            "tool_name": tool_name,
+            "side_effect": tool.spec.side_effect,
+            "started_at": utc_now_iso(),
+            "executing": True,
+        }
         try:
             result = await asyncio.wait_for(
                 tool.execute(tool_args, context=tool_context),
@@ -298,6 +319,8 @@ class ToolDispatcher:
         except Exception as exc:  # noqa: BLE001
             self._logger.exception("tool failed", tool_name=tool_name, error=str(exc))
             result = self._result_builder.error_result(tool_name, exc.__class__.__name__, str(exc))
+        finally:
+            runtime.active_tools.pop(tool_call_id, None)
 
         question_args, question = self._question_request(session, item, tool_call_id, tool_args, result)
         if question is not None:

@@ -57,46 +57,51 @@ class LiteLLMClient:
 
         tokens: AssistantMessageTokens | None = None
         agent_event_data = self._agent_event_data(session)
-        async for chunk in stream:
-            payload = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-            if payload.get("usage"):
-                tokens = self._extract_tokens(payload["usage"])
-            choices = payload.get("choices") or []
-            if not choices:
-                continue
-            delta = choices[0].get("delta") or {}
-            if delta.get("content"):
-                content = delta["content"]
-                content_parts.append(content)
-                await event_bus.publish_stream_event(
-                    StreamEvent(
-                        event_type="llm_delta",
-                        session_id=session.session_id,
-                        created_at=utc_now_iso(),
-                        data={**agent_event_data, "text": content},
+        try:
+            async for chunk in stream:
+                payload = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+                if payload.get("usage"):
+                    tokens = self._extract_tokens(payload["usage"])
+                choices = payload.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                if delta.get("content"):
+                    content = delta["content"]
+                    content_parts.append(content)
+                    await event_bus.publish_stream_event(
+                        StreamEvent(
+                            event_type="llm_delta",
+                            session_id=session.session_id,
+                            created_at=utc_now_iso(),
+                            data={**agent_event_data, "text": content},
+                        )
                     )
-                )
-            reasoning_text = delta.get("reasoning") or delta.get("reasoning_content")
-            if reasoning_text:
-                reasoning_parts.append(reasoning_text)
-                await event_bus.publish_stream_event(
-                    StreamEvent(
-                        event_type="llm_reasoning_delta",
-                        session_id=session.session_id,
-                        created_at=utc_now_iso(),
-                        data={**agent_event_data, "text": reasoning_text},
+                reasoning_text = delta.get("reasoning") or delta.get("reasoning_content")
+                if reasoning_text:
+                    reasoning_parts.append(reasoning_text)
+                    await event_bus.publish_stream_event(
+                        StreamEvent(
+                            event_type="llm_reasoning_delta",
+                            session_id=session.session_id,
+                            created_at=utc_now_iso(),
+                            data={**agent_event_data, "text": reasoning_text},
+                        )
                     )
-                )
-            for tool_call in delta.get("tool_calls") or []:
-                index = tool_call.get("index", 0)
-                existing = tool_call_map[index]
-                if tool_call.get("id"):
-                    existing["id"] = tool_call["id"]
-                function = tool_call.get("function") or {}
-                if function.get("name"):
-                    existing["function"]["name"] += function["name"]
-                if function.get("arguments"):
-                    existing["function"]["arguments"] += function["arguments"]
+                for tool_call in delta.get("tool_calls") or []:
+                    index = tool_call.get("index", 0)
+                    existing = tool_call_map[index]
+                    if tool_call.get("id"):
+                        existing["id"] = tool_call["id"]
+                    function = tool_call.get("function") or {}
+                    if function.get("name"):
+                        existing["function"]["name"] += function["name"]
+                    if function.get("arguments"):
+                        existing["function"]["arguments"] += function["arguments"]
+        finally:
+            close = getattr(stream, "aclose", None)
+            if callable(close):
+                await close()
 
         tool_calls: list[dict[str, Any]] = []
         for item in tool_call_map.values():

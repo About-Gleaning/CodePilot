@@ -18,7 +18,7 @@ from codepilot.tools.mcp import _open_session, _resolve_stdio_cwd, build_mcp_too
 # 测试场景说明
 # 场景1：正常流程 - 发现 MCP 工具后按 Agent Markdown 的 server 权限暴露并调用。
 # 场景2：边界情况 - 名称规范化、输出截断、图片附件和故障 server 隔离。
-# 场景3：异常处理 - 未授权调用、远端错误、断线重连和非法配置。
+# 场景3：异常处理 - 未授权调用、远端错误、断线不重放和非法配置。
 
 
 class FakeSession:
@@ -142,12 +142,15 @@ async def test_mcp_adapter_rejects_agent_without_server_permission(monkeypatch: 
 
 
 @pytest.mark.asyncio
-async def test_mcp_call_reconnects_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
-    sessions = [FakeSession(fail_calls=1), FakeSession()]
+async def test_mcp_call_failure_is_not_replayed(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+    session = FakeSession(fail_calls=1)
+    open_count = 0
 
     @asynccontextmanager
     async def fake_open_session(config: Any, workspace_path: Any) -> AsyncIterator[FakeSession]:
-        yield sessions.pop(0)
+        nonlocal open_count
+        open_count += 1
+        yield session
 
     monkeypatch.setattr("codepilot.tools.mcp._open_session", fake_open_session)
     registry = ToolRegistry()
@@ -156,9 +159,11 @@ async def test_mcp_call_reconnects_once(monkeypatch: pytest.MonkeyPatch, tmp_pat
     try:
         tool = registry.get(build_mcp_tool_name("github", "create.issue"))
         assert tool is not None
-        result = await tool.execute({"title": "重试"}, context=_context(tmp_path, allowed_tools=["mcp:github"]))
-        assert result["status"] == "ok"
-        assert result["content"][0]["text"] == "create.issue:重试"
+        result = await tool.execute({"title": "不可重放"}, context=_context(tmp_path, allowed_tools=["mcp:github"]))
+        assert result["status"] == "error"
+        assert result["error_type"] == "McpOutcomeUncertain"
+        assert open_count == 1
+        assert session.fail_calls == 0
     finally:
         await manager.shutdown()
 

@@ -102,7 +102,7 @@ def create_app() -> FastAPI:
         session_memory=runtime.session_memory,
         profile_provider=agent_config_service,
         backend=runtime.agent_backend,
-        max_active_runs=1,
+        max_active_runs=5,
         max_started_agents=settings.agent.max_started_agents,
     )
     runtime.event_bus.subscribe_domain(agent_runtime.handle_domain_event)

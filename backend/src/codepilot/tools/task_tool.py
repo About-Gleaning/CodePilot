@@ -88,6 +88,7 @@ class TaskTool(BaseTool):
                     parent_call_id=context.tool_call_id,
                 ),
                 run_ref=context.runtime.run_ref,
+                active_tools=context.runtime.active_tools,
             )
             child_session = await self._agent_loop.run_subagent(
                 parent_session=context.session,

@@ -159,17 +159,17 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
     @router.get("/agents/{agent_id}/sessions/{session_id}/replay")
     async def get_agent_session_replay(agent_id: str, session_id: str) -> JSONResponse:
         try:
-            await app_state.agent_runtime.load_session(agent_id, session_id)
+            replay = await app_state.agent_runtime.validate_session_owner(agent_id, session_id)
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
-        return JSONResponse(await app_state.session_memory.replay(session_id))
+        return JSONResponse(replay)
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/stream")
     async def get_agent_session_stream(agent_id: str, session_id: str, request: Request, after_seq: int = 0) -> StreamingResponse:
         if after_seq < 0:
             raise HTTPException(status_code=422, detail={"code": "invalid_after_seq"})
         try:
-            await app_state.agent_runtime.load_session(agent_id, session_id)
+            await app_state.agent_runtime.validate_session_owner(agent_id, session_id)
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
         return _stream_response(request, app_state, session_id, after_seq)
