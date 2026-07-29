@@ -1,0 +1,11 @@
+{
+  "code": "CODE-48",
+  "generated_by": "backend/tests/test_agent_config.py",
+  "scenarios": [
+    {"id": "config-create-update", "result": "passed"},
+    {"id": "revision-idempotency", "result": "passed"},
+    {"id": "archive-restore", "result": "passed"},
+    {"id": "unknown-tool-rejected", "result": "passed"}
+  ],
+  "redaction": "结果不包含本机路径、Prompt、密钥、环境变量值或附件内容。"
+}

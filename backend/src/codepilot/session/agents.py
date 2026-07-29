@@ -13,6 +13,10 @@ BUILTIN_AGENT_NAMES = frozenset({"build", "plan", "explore"})
 
 class AgentProfile(BaseModel):
     name: str
+    # agent_id/revision_id 为后续运行时归属预留；旧 Markdown 缺失时由加载器派生。
+    agent_id: str = ""
+    revision_id: str = ""
+    source: Literal["builtin", "custom"] = "custom"
     description: str = ""
     system_prompt: str
     kind: Literal["agent", "subagent"] = "agent"
@@ -20,6 +24,9 @@ class AgentProfile(BaseModel):
     readonly: bool = False
     max_iterations: int = 50
     can_call_subagent: bool = False
+    default_provider: str | None = None
+    default_model: str | None = None
+    default_thinking_value: str | None = None
 
 
 class AgentProfileError(ValueError):
@@ -105,6 +112,8 @@ def parse_agent_markdown(
         raise AgentProfileError(f"subagent `{name}` 不能调用其他 subagent")
     return AgentProfile(
         name=name,
+        agent_id=_optional_string(metadata, "agent_id", path=path) or "",
+        revision_id=_optional_string(metadata, "revision_id", path=path) or "",
         description=description,
         system_prompt=prompt,
         kind=kind,
@@ -112,6 +121,9 @@ def parse_agent_markdown(
         readonly=readonly,
         max_iterations=iterations,
         can_call_subagent=can_call_subagent,
+        default_provider=_optional_string(metadata, "default_provider", path=path),
+        default_model=_optional_string(metadata, "default_model", path=path),
+        default_thinking_value=_optional_string(metadata, "default_thinking_value", path=path),
     )
 
 
@@ -175,3 +187,12 @@ def _optional_positive_int(metadata: dict[str, Any], key: str, *, path: Path) ->
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise AgentProfileError(f"{path} 字段 `{key}` 必须是正整数")
     return value
+
+
+def _optional_string(metadata: dict[str, Any], key: str, *, path: Path) -> str | None:
+    value = metadata.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise AgentProfileError(f"{path} 字段 `{key}` 必须是非空字符串")
+    return value.strip()

@@ -76,6 +76,21 @@ class McpClientManager:
         self._servers.clear()
         self._started = False
 
+    def list_server_capabilities(self) -> list[dict[str, Any]]:
+        """提供给配置页的脱敏 MCP 服务目录。"""
+        capabilities: list[dict[str, Any]] = []
+        for name, config in sorted(self._settings.servers.items()):
+            runtime = self._servers.get(name)
+            if not config.enabled:
+                status = "disabled"
+            elif runtime is not None and runtime.error is None and runtime.task is not None and not runtime.task.done():
+                status = "available"
+            else:
+                status = "unavailable"
+            capabilities.append({"name": name, "status": status, "requires_approval": config.requires_approval,
+                                 "description": "MCP 服务权限按服务整体授予，不展示连接配置或凭证。"})
+        return capabilities
+
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, Any]) -> Any:
         runtime = self._servers.get(server_name)
         if runtime is None or runtime.error is not None or runtime.task is None or runtime.task.done():
@@ -207,6 +222,7 @@ class McpToolAdapter(BaseTool):
             can_parallel=False,
             requires_approval=requires_approval,
             timeout_seconds=timeout_seconds,
+            side_effect="external_mutation",
         )
 
     async def execute(

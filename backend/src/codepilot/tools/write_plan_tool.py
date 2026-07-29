@@ -22,6 +22,10 @@ class WritePlanTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="runtime_mutation",
+            assignable_to_custom_agents=False,
+            allowed_agent_names=["plan"],
+            assignment_reason="仅内置 plan Agent 可使用。",
         )
 
     async def execute(

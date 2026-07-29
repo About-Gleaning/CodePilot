@@ -36,6 +36,7 @@ class EditFileTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="workspace_mutation",
         )
 
     async def execute(

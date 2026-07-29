@@ -36,6 +36,7 @@ class MarkItDownConvertTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="read_only",
         )
 
     async def preflight(

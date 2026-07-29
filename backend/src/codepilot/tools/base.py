@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -14,6 +14,11 @@ class ToolSpec(BaseModel):
     can_parallel: bool = False
     requires_approval: bool = False
     timeout_seconds: int
+    # 能力目录使用的安全标签；保守默认值保证旧扩展不会被误标为只读。
+    side_effect: Literal["read_only", "workspace_mutation", "runtime_mutation", "external_mutation"] = "runtime_mutation"
+    assignable_to_custom_agents: bool = True
+    allowed_agent_names: list[str] = []
+    assignment_reason: str | None = None
 
 
 @dataclass(slots=True)

@@ -54,6 +54,7 @@ class QuestionTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="runtime_mutation",
         )
 
     async def execute(

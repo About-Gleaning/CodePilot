@@ -31,6 +31,10 @@ class LongMemoryWriteTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="runtime_mutation",
+            assignable_to_custom_agents=False,
+            allowed_agent_names=["life"],
+            assignment_reason="仅 life Agent 可使用。",
         )
 
     async def execute(

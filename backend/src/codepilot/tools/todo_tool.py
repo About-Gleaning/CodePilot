@@ -42,6 +42,7 @@ class TodoWriteTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="runtime_mutation",
         )
 
     async def execute(
@@ -75,6 +76,7 @@ class TodoReadTool(BaseTool):
             can_parallel=True,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="read_only",
         )
 
     async def execute(

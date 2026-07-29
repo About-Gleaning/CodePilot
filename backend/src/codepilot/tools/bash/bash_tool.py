@@ -44,6 +44,7 @@ class BashTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
+            side_effect="workspace_mutation",
         )
 
     def get_llm_description(self, *, agent_name: str | None = None, agent_readonly: bool | None = None) -> str:

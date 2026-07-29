@@ -3,6 +3,7 @@ import { useAutoScroll } from './hooks/useAutoScroll';
 import { useQuestionInteraction } from './hooks/useQuestionInteraction';
 import { useSessionStream } from './hooks/useSessionStream';
 import { ConfigSelect } from './components/ConfigSelect';
+import { AgentConfigDialog } from './components/AgentConfigDialog';
 import { AttachmentPicker, AttachmentTray } from './components/Attachments';
 import { ApprovalPanel, ScrollToBottomButton } from './components/SessionInteractions';
 import { EventItem } from './components/EventItem';
@@ -474,6 +475,7 @@ function App() {
   const [provider, setProvider] = useState('');
   const [model, setModel] = useState('');
   const [agentName, setAgentName] = useState('build');
+  const [isAgentConfigOpen, setIsAgentConfigOpen] = useState(false);
   const [task, setTask] = useState('');
   const [composerAutocomplete, setComposerAutocomplete] = useState<ComposerAutocomplete | null>(null);
   const [fileSuggestions, setFileSuggestions] = useState<WorkspaceFileOption[]>([]);
@@ -1174,6 +1176,7 @@ function App() {
             <p>agent terminal workspace</p>
           </div>
         </section>
+        <button type="button" className="button secondary" onClick={() => setIsAgentConfigOpen(true)}>管理 Agent</button>
 
         <section className="panel compact-panel session-panel">
           <PanelTitle
@@ -1511,6 +1514,7 @@ function App() {
         onClose={() => setIsHistoryOpen(false)}
         onLoad={handleLoadSession}
       />
+      <AgentConfigDialog open={isAgentConfigOpen} onClose={() => setIsAgentConfigOpen(false)} onChanged={() => void bootstrap()} />
     </div>
   );
 }
