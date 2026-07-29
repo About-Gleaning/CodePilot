@@ -82,6 +82,41 @@ class AgentConfigService:
                 raise AgentConfigError("Agent 不存在", code="agent_not_found", status=404)
             return self._view(record, detail=True)
 
+    def get_active_profile_snapshot(self, agent_id: str) -> AgentProfile:
+        """返回用于启动 Run 的配置快照，归档或损坏记录不能执行。"""
+        with self._lock:
+            record = self._records.get(agent_id)
+            if record is None:
+                raise AgentConfigError("Agent 不存在", code="agent_not_found", status=404)
+            if record.archived:
+                raise AgentConfigError("归档 Agent 不能启动新 Run", code="agent_archived", status=409)
+            if record.profile is None:
+                raise AgentConfigError("Agent 配置无效", code="agent_invalid", status=422)
+            return record.profile.model_copy(deep=True)
+
+    def get_record_snapshot(self, agent_id: str) -> dict[str, Any]:
+        """返回包含归档状态的脱敏记录快照，供运行时查询和关闭使用。"""
+        with self._lock:
+            record = self._records.get(agent_id)
+            if record is None:
+                raise AgentConfigError("Agent 不存在", code="agent_not_found", status=404)
+            return {
+                "agent_id": record.agent_id,
+                "name": record.name,
+                "archived": record.archived,
+                "validation_status": record.status,
+                "profile": record.profile.model_copy(deep=True) if record.profile is not None else None,
+            }
+
+    def list_active_profile_snapshots(self) -> list[AgentProfile]:
+        """原子复制全部可运行主 Agent，禁止 Manager 扫描共享可变字典。"""
+        with self._lock:
+            return [
+                record.profile.model_copy(deep=True)
+                for record in self._records.values()
+                if not record.archived and record.profile is not None and record.profile.kind == "agent"
+            ]
+
     def create(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             profile, metadata = self._validate_payload(payload, name_required=True)

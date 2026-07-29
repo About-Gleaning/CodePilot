@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,8 @@ class JsonlSessionMemory:
         self._sessions_dir = sessions_dir
         self._logger = get_logger("codepilot.memory.session")
         self._session_locks: dict[str, asyncio.Lock] = {}
+        self._summary_cache: dict[str, tuple[tuple[tuple[str, int, int], ...], dict[str, Any]]] = {}
+        self._file_index: dict[str, list[Path]] = {}
 
     async def handle_domain_event(self, event: DomainEvent) -> None:
         """将单个领域事件转换为记录并追加写入当前会话文件。"""
@@ -50,12 +53,19 @@ class JsonlSessionMemory:
         return replay_records(self._load_session_records(session_id))
 
     def list_sessions(self) -> list[dict[str, Any]]:
-        """扫描本地会话文件，返回可供前端展示的历史会话摘要。"""
+        """发现跨进程写入，但只重新解析新增或变化的 Session 文件。"""
+        self._refresh_file_index()
         summaries: list[dict[str, Any]] = []
-        for session_id in self._session_ids():
-            summary = build_session_summary(self._load_session_records(session_id))
+        for session_id, paths in self._file_index.items():
+            signature = tuple((path.name, path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
+            cached = self._summary_cache.get(session_id)
+            summary = cached[1] if cached and cached[0] == signature else build_session_summary(self._load_records_from_paths(paths))
+            if summary is not None and (cached is None or cached[0] != signature):
+                self._summary_cache[session_id] = (signature, summary)
             if summary is not None:
                 summaries.append(summary)
+        for removed in set(self._summary_cache) - set(self._file_index):
+            self._summary_cache.pop(removed, None)
         return sorted(summaries, key=lambda item: str(item.get("updated_at") or ""), reverse=True)
 
     def _to_record(self, event: DomainEvent) -> dict[str, Any]:
@@ -110,8 +120,8 @@ class JsonlSessionMemory:
 
     def _session_files_for_id(self, session_id: str) -> list[Path]:
         """按文件名后缀精确匹配 session_id，避免把外部输入解释为 glob 模式。"""
-        suffix = f"-{session_id}.jsonl"
-        return [path for path in self._session_files() if path.name.endswith(suffix)]
+        self._refresh_file_index()
+        return list(self._file_index.get(session_id, []))
 
     def _session_ids(self) -> list[str]:
         """从文件名中提取唯一 session_id，避免历史列表按文件重复展示。"""
@@ -122,15 +132,23 @@ class JsonlSessionMemory:
                 session_ids.add(stem[11:])
         return sorted(session_ids)
 
+    def _refresh_file_index(self) -> None:
+        index: dict[str, list[Path]] = {}
+        for path in self._session_files():
+            stem = path.name.removesuffix(".jsonl")
+            if len(stem) > 11 and stem[4:5] == "-" and stem[7:8] == "-" and stem[10:11] == "-":
+                index.setdefault(stem[11:], []).append(path)
+        self._file_index = {session_id: sorted(paths) for session_id, paths in index.items()}
+
     def _load_session_records(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """读取目标会话记录；旧版本跨天产生的多个文件会按顺序合并。"""
         paths = self._session_files_for_id(session_id) if session_id else self._latest_session_group()
+        return self._load_records_from_paths(paths)
+
+    def _load_records_from_paths(self, paths: list[Path]) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
         for path in paths:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                if not line.strip():
-                    continue
-                records.append(json.loads(line))
+            records.extend(self._load_records_from_path(path))
         return records
 
     def _latest_session_group(self) -> list[Path]:
@@ -177,16 +195,25 @@ class JsonlEventStore:
         """初始化事件存储目录和日志器。"""
         self._sessions_dir = sessions_dir
         self._logger = get_logger("codepilot.memory.events")
+        self._lock = asyncio.Lock()
 
     async def append(self, event: StreamEvent) -> None:
         """将单个流事件追加写入所属会话的事件文件。"""
         if not event.session_id:
             return
         path = self._event_file(event.session_id)
+        # 持久化完成前 EventBus 不会投递 SSE；flush/fsync 保证重连可见位置可靠。
+        async with self._lock:
+            await asyncio.to_thread(self._append_sync, path, event)
+
+    def _append_sync(self, path: Path, event: StreamEvent) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # 流事件按产生顺序直接追加，便于客户端按 seq 增量恢复。
-        async with aiofiles.open(path, "a", encoding="utf-8") as file:
-            await file.write(json.dumps(event.model_dump(), ensure_ascii=False) + "\n")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(json.dumps(event.model_dump(), ensure_ascii=False) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(path, 0o600)
 
     def replay(self, session_id: str | None = None, after_seq: int = 0) -> list[StreamEvent]:
         """回放指定序号之后的流事件，用于断线重连后的增量补发。"""
@@ -214,7 +241,15 @@ class JsonlEventStore:
     def _latest_event_file(self, session_id: str | None = None) -> Path | None:
         """定位指定会话或全局最新的流事件文件。"""
         if session_id:
-            candidates = sorted(self._sessions_dir.glob(f"*-{session_id}.events.jsonl"))
+            if not self._sessions_dir.is_dir():
+                return None
+            # 外部资源标识只能按普通字符串比较，不能获得 glob 语义。
+            suffix = f"-{session_id}.events.jsonl"
+            candidates = sorted(
+                path
+                for path in self._sessions_dir.iterdir()
+                if path.is_file() and path.name.endswith(suffix)
+            )
             return candidates[-1] if candidates else None
         candidates = sorted(self._sessions_dir.glob("*.events.jsonl"))
         return candidates[-1] if candidates else None

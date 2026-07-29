@@ -260,6 +260,7 @@ class ToolDispatcher:
             tool_call_id=tool_call_id,
             stop_event=stop_event,
             skip_approval=skip_approval,
+            run_ref=runtime.run_ref,
         )
         preflight_part, preflight_approval = await self._run_preflight(
             session, runtime, agent, tool, tool_context, tool_name, tool_args, tool_call_id, skip_approval

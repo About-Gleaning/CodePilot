@@ -3,7 +3,7 @@
 该模块集中暴露事件总线与核心事件模型，供外部模块通过统一路径导入。
 """
 
-from .bus import EventBus
+from .bus import EventBus, RunEventScope, StreamSubscription
 from .definitions import (
     DomainEvent,
     HumanInteractionEvent,
@@ -17,6 +17,8 @@ from .definitions import (
 __all__ = [
     "DomainEvent",
     "EventBus",
+    "RunEventScope",
+    "StreamSubscription",
     "HumanInteractionEvent",
     "MessageCreatedEvent",
     "SessionCompactedEvent",

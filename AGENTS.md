@@ -37,6 +37,10 @@ MCP 连接必须使用官方 Python SDK，主进程和 scheduler worker 都要�
 
 运行时控制接口必须使用完整的 `agent_id + session_id + run_id` 归属键；不得新增全局 current agent/run 作为事实来源。每个 SessionRunner 只能管理一个 Session 的可变执行状态，跨 Session 并发由运行时协调层控制。运行期期望启动状态写入 `workspace/agent-runtimes.json` 时必须原子替换并使用 0600 权限，重启只能取消中断 Run，不能重放 Tool、MCP 或 LLM 副作用。
 
+HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner 的 Task、Event、审批或 Question holder。Manager 获取配置时必须使用 `AgentConfigService` 的不可变快照；Run 启动后固定 revision。Run 终态必须比较并更新，确保 cancel、Agent stop、watcher 和 shutdown 只释放一次容量。`agent-runs.jsonl` 与控制事件必须追加、flush、fsync；末行截断可归档后恢复完整前缀，中间损坏必须拒绝新 Run。Session 历史索引需要识别 Scheduler 跨进程写入，外部 session ID 禁止拼入 glob。
+
+完整 Session SSE 与低频运行态 SSE 必须分离；聚合流不得传 token、Prompt、附件或 Tool 大结果。所有订阅队列固定上限 1000，溢出后要求客户端重连回放，不能阻塞 Agent。Scheduler worker 只构建 Execution Bundle，不得创建 Manager、执行 recover 或写入 `agent-runtimes.json`。
+
 Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；自定义 Agent 位于 `storage.codepilot_home/agents/*.md`，例如用户自定义 `life.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。自定义 Agent 不允许覆盖内置 Agent 名称；没有自定义 Agent 时只暴露三个内置 Agent。
 
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。

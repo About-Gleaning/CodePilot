@@ -45,7 +45,10 @@ class DomainEvent(BaseModel):
     """领域事件基类，承载不同事件共有的元数据。"""
 
     event_type: DomainEventType
+    agent_id: str | None = None
     session_id: str | None = None
+    run_id: str | None = None
+    revision_id: str | None = None
     created_at: str
     data: dict[str, Any] = Field(default_factory=dict)
 

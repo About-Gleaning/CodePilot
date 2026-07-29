@@ -6,10 +6,12 @@
 - `runtime-contract.md`：控制面与执行后端的拓扑无关契约。
 - `validation-plan.md`：可执行验证场景和门槛。
 - `validation-results.json`：由基准脚本生成的脱敏原始结果。
-- `adr-runtime-topology.md`：拓扑决策记录；当前状态为 Proposed。
+- `adr-runtime-topology.md`：拓扑决策记录；当前状态为 Accepted。
 - `agent-config-center.md`：CODE-48 的 Agent 配置、revision、归档和能力目录契约。
 - `agent-config-validation-results.json`：CODE-48 的脱敏验证结果。
 - `single-agent-runtime.md`：CODE-49 的资源化运行时与兼容边界。
 - `single-agent-runtime-validation-results.json`：CODE-49 的脱敏验证结果。
+- `multi-agent-control-plane.md`：CODE-50 的 Manager/Backend、隔离路由、恢复与兼容契约。
+- `multi-agent-control-plane-validation-results.json`：CODE-50 的脱敏容量与性能结果。
 
 后续 CODE-48 至 CODE-53 进入待验收前，必须增加或更新对应设计、验证结果，并在本文件登记链接。

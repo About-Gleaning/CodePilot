@@ -110,6 +110,7 @@ class AgentSettings(BaseModel):
     default_agent_name: str = "build"
     max_loop_iterations: int = 50
     subagent_max_loop_iterations: int = 8
+    max_started_agents: int = Field(default=5, ge=1, le=5)
 
 
 class ContextModelThresholdSettings(BaseModel):

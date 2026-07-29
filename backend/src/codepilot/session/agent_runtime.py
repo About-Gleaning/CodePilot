@@ -1,41 +1,68 @@
 from __future__ import annotations
 
-"""面向资源化 API 的同进程 Agent 运行时。
+"""多 Agent 控制面与同进程执行后端。
 
-CODE-49 只开放一个活动 Run，但该限制只存在于本类的容量策略；每个
-SessionRunner 仍独立持有会话、停止信号与人工交互状态，CODE-51 提升容量时
-不需要改动 Runner 或 HTTP 资源路径。
+Manager 只保存资源索引与持久化状态；SessionRunner、Task 和等待对象均封装在
+Backend 句柄内。这样提升并发容量或替换为 worker 时不需要改动 HTTP 契约。
 """
 
 import asyncio
 import hashlib
 import json
-import os
+import re
 from collections.abc import Callable
-from pathlib import Path
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Protocol
 from uuid import uuid4
 
 from codepilot.config.settings import resolve_llm_selection, resolve_thinking_value
-from codepilot.events import StreamEvent
+from codepilot.events import DomainEvent, EventBus, HumanInteractionEvent, RunEventScope, StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session.agents import AgentProfile
+from codepilot.session.attachments import decode_image_attachment, sanitize_attachment_filename
+from codepilot.session.runtime_store import (
+    JsonlRunStore,
+    RuntimeControlEventStore,
+    RuntimeStateStore,
+    RuntimeStoreCorrupt,
+    encode_runtime_cursor,
+)
 from codepilot.session.session_runner import SessionRunner
-from codepilot.session.state import AgentLifecycleState, AgentRuntimeState, RunRef, RunState, RunStatus, SessionStatus
+from codepilot.session.state import (
+    AgentLifecycleState,
+    AgentRuntimeState,
+    HumanInteractionRef,
+    HumanInteractionState,
+    InteractionStatus,
+    RunRef,
+    RunState,
+    RunStatus,
+    SessionStatus,
+)
 from codepilot.utils import utc_now_iso
 
 
 class RuntimeConflict(ValueError):
-    """资源归属、幂等或容量冲突。"""
+    """资源归属、幂等、恢复或容量冲突。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, status: int = 409, retry_after: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.status = status
+        self.retry_after = retry_after
+
+
+class AgentProfileProvider(Protocol):
+    def get_active_profile_snapshot(self, agent_id: str) -> AgentProfile: ...
+
+    def get_record_snapshot(self, agent_id: str) -> dict[str, Any]: ...
+
+    def list_active_profile_snapshots(self) -> list[AgentProfile]: ...
 
 
 class SessionRunnerFactory:
-    """为每个 Session 创建互不共享可变状态的 Runner。"""
+    """为每个 Session 创建不共享可变状态的 Runner。"""
 
     def __init__(self, create: Callable[[], SessionRunner]) -> None:
         self._create = create
@@ -44,203 +71,609 @@ class SessionRunnerFactory:
         return self._create()
 
 
+@dataclass(slots=True)
+class SessionExecutionHandle:
+    agent_id: str
+    session_id: str
+    runner: SessionRunner
+
+
+@dataclass(slots=True)
+class RunExecutionHandle:
+    run_ref: RunRef
+    runner: SessionRunner
+    event_scope: RunEventScope
+
+    async def wait(self) -> Any:
+        return await self.runner.wait_current_run()
+
+
+class AgentRuntimeBackend(Protocol):
+    async def start_agent(self, agent_id: str) -> None: ...
+
+    async def stop_agent(self, agent_id: str) -> None: ...
+
+    async def load_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        replay: dict[str, Any] | None,
+        profile_snapshot: AgentProfile,
+    ) -> SessionExecutionHandle: ...
+
+    async def start_run(
+        self,
+        session_handle: SessionExecutionHandle,
+        run_ref: RunRef,
+        request: GatewayInput,
+        profile_snapshot: AgentProfile,
+        event_scope: RunEventScope,
+    ) -> RunExecutionHandle: ...
+
+    async def cancel_run(self, session_handle: SessionExecutionHandle, run_ref: RunRef) -> bool: ...
+
+    async def reply_interaction(
+        self,
+        session_handle: SessionExecutionHandle,
+        ref: HumanInteractionRef,
+        payload: GatewayInput,
+    ) -> None: ...
+
+    async def close_session(self, session_handle: SessionExecutionHandle) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
+
 class InProcessAgentRuntimeBackend:
-    """CODE-49 的同进程后端，实现最终形态的资源归属边界。"""
+    """同进程执行后端；不维护全局 Agent、Run 或幂等索引。"""
+
+    def __init__(self, runner_factory: SessionRunnerFactory) -> None:
+        self._runner_factory = runner_factory
+        self._sessions: dict[tuple[str, str], SessionExecutionHandle] = {}
+
+    async def start_agent(self, agent_id: str) -> None:
+        return None
+
+    async def stop_agent(self, agent_id: str) -> None:
+        handles = [handle for key, handle in self._sessions.items() if key[0] == agent_id]
+        await asyncio.gather(*(self.close_session(handle) for handle in handles), return_exceptions=True)
+
+    async def load_session(
+        self,
+        agent_id: str,
+        session_id: str,
+        replay: dict[str, Any] | None,
+        profile_snapshot: AgentProfile,
+    ) -> SessionExecutionHandle:
+        key = (agent_id, session_id)
+        if key in self._sessions:
+            return self._sessions[key]
+        runner = self._runner_factory.create_runner()
+        if replay is not None:
+            runner.load_session(session_id, replay)
+        handle = SessionExecutionHandle(agent_id=agent_id, session_id=session_id, runner=runner)
+        self._sessions[key] = handle
+        return handle
+
+    async def start_run(
+        self,
+        session_handle: SessionExecutionHandle,
+        run_ref: RunRef,
+        request: GatewayInput,
+        profile_snapshot: AgentProfile,
+        event_scope: RunEventScope,
+    ) -> RunExecutionHandle:
+        await session_handle.runner.start_resource_run(
+            request,
+            run_ref=run_ref,
+            profile=profile_snapshot,
+            event_scope=event_scope,
+        )
+        return RunExecutionHandle(run_ref=run_ref, runner=session_handle.runner, event_scope=event_scope)
+
+    async def cancel_run(self, session_handle: SessionExecutionHandle, run_ref: RunRef) -> bool:
+        await session_handle.runner.handle_input(GatewayInput(type=GatewayInputType.STOP))
+        try:
+            await asyncio.wait_for(session_handle.runner.wait_current_run(), timeout=1)
+        except TimeoutError:
+            await asyncio.wait_for(session_handle.runner.force_cancel_current_run(), timeout=9)
+        return True
+
+    async def reply_interaction(
+        self,
+        session_handle: SessionExecutionHandle,
+        ref: HumanInteractionRef,
+        payload: GatewayInput,
+    ) -> None:
+        await session_handle.runner.handle_input(payload)
+
+    async def close_session(self, session_handle: SessionExecutionHandle) -> None:
+        await session_handle.runner.shutdown()
+        self._sessions.pop((session_handle.agent_id, session_handle.session_id), None)
+
+    async def shutdown(self) -> None:
+        await asyncio.gather(*(self.close_session(handle) for handle in list(self._sessions.values())), return_exceptions=True)
+
+
+@dataclass(slots=True)
+class SessionRuntimeHandle:
+    execution: SessionExecutionHandle
+    profile_revision_id: str
+    active_run_id: str | None = None
+    last_accessed_at: str = ""
+
+
+class AgentRuntimeManager:
+    """HTTP 主进程唯一使用的多 Agent 控制面。"""
 
     def __init__(
         self,
         *,
         workspace: Any,
         config: Any,
-        event_bus: Any,
+        event_bus: EventBus,
         session_memory: JsonlSessionMemory,
-        agent_profiles: dict[str, AgentProfile],
-        runner_factory: SessionRunnerFactory,
+        profile_provider: AgentProfileProvider,
+        backend: AgentRuntimeBackend,
         max_active_runs: int = 1,
-        max_running_agents: int = 1,
+        max_started_agents: int = 5,
     ) -> None:
-        self._workspace = workspace
         self._config = config
         self._event_bus = event_bus
         self._session_memory = session_memory
-        self._agent_profiles = agent_profiles
-        self._runner_factory = runner_factory
+        self._profile_provider = profile_provider
+        self._backend = backend
         self._max_active_runs = max_active_runs
-        self._max_running_agents = max_running_agents
+        self._max_started_agents = max_started_agents
         self._runtimes: dict[str, AgentRuntimeState] = {}
-        self._runners: dict[tuple[str, str], SessionRunner] = {}
+        self._sessions: dict[tuple[str, str], SessionRuntimeHandle] = {}
         self._runs: dict[tuple[str, str, str], RunState] = {}
         self._idempotency: dict[str, tuple[str, tuple[str, str, str]]] = {}
+        self._executions: dict[tuple[str, str, str], RunExecutionHandle] = {}
+        self._interactions: dict[tuple[str, str, str, str], HumanInteractionState] = {}
+        self._watchers: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
-        self._state_path = Path(workspace.workspace_dir) / "agent-runtimes.json"
+        self._state_store = RuntimeStateStore(workspace.workspace_dir)
+        self._run_store = JsonlRunStore(workspace.workspace_dir)
+        self._control_store = RuntimeControlEventStore(workspace.workspace_dir)
+        self._control_bus = EventBus()
+        self._control_bus.subscribe_stream(self._control_store.append)
+        self._recovery_error: str | None = None
 
     async def recover(self) -> None:
-        """恢复期望状态，但绝不重放可能产生副作用的旧 Run。"""
-        payload = await asyncio.to_thread(self._read_state_file)
+        """恢复期望启动状态与幂等索引，不重放任何旧副作用。"""
+        try:
+            payload, recovered = await asyncio.gather(self._state_store.read(), self._run_store.recover())
+            await self._control_store.recover()
+            self._control_bus.set_initial_seq(self._control_store.current_seq)
+        except RuntimeStoreCorrupt:
+            self._recovery_error = "runtime_recovery_incomplete"
+            return
+        self._runs, self._idempotency = recovered
+        for run in list(self._runs.values()):
+            if run.status in _ACTIVE_RUN_STATUSES:
+                await self._transition_terminal(run, RunStatus.CANCELLED, error_code="service_restarted")
         agents = payload.get("agents") if isinstance(payload, dict) else {}
         if not isinstance(agents, dict):
+            self._recovery_error = "runtime_recovery_incomplete"
             return
         for agent_id, item in agents.items():
             if not isinstance(item, dict) or item.get("desired_state") != AgentLifecycleState.RUNNING.value:
                 continue
-            if len([state for state in self._runtimes.values() if state.desired_state == AgentLifecycleState.RUNNING]) >= self._max_running_agents:
+            if self._started_count() >= self._max_started_agents:
                 break
-            profile = self._profile_by_id(agent_id)
-            if profile is None:
-                continue
-            self._runtimes[agent_id] = AgentRuntimeState(
-                agent_id=agent_id,
-                desired_state=AgentLifecycleState.RUNNING,
-                lifecycle_state=AgentLifecycleState.RUNNING,
-                recent_session_id=_string_or_none(item.get("recent_session_id")),
-            )
+            try:
+                self._profile_provider.get_record_snapshot(agent_id)
+                await self._backend.start_agent(agent_id)
+            except Exception:  # 配置可能已删除或损坏，保留 ERROR 供用户处理。
+                self._runtimes[agent_id] = AgentRuntimeState(
+                    agent_id=agent_id,
+                    desired_state=AgentLifecycleState.RUNNING,
+                    lifecycle_state=AgentLifecycleState.ERROR,
+                    recent_session_id=_string_or_none(item.get("recent_session_id")),
+                    error_code="agent_recovery_failed",
+                )
+            else:
+                self._runtimes[agent_id] = AgentRuntimeState(
+                    agent_id=agent_id,
+                    desired_state=AgentLifecycleState.RUNNING,
+                    lifecycle_state=AgentLifecycleState.RUNNING,
+                    recent_session_id=_string_or_none(item.get("recent_session_id")),
+                )
 
     async def shutdown(self) -> None:
-        for agent_id in list(self._runtimes):
-            await self.stop_agent(agent_id, persist_desired=False)
+        targets = [run.ref for run in self._runs.values() if run.status in _ACTIVE_RUN_STATUSES]
+        await asyncio.gather(*(self.cancel_run(ref) for ref in targets), return_exceptions=True)
+        if self._watchers:
+            await asyncio.gather(*self._watchers, return_exceptions=True)
+        try:
+            await asyncio.wait_for(self._backend.shutdown(), timeout=10)
+        except TimeoutError:
+            self._recovery_error = "runtime_recovery_incomplete"
 
     async def start_agent(self, agent_id: str) -> AgentRuntimeState:
+        profile = self._active_profile(agent_id)
+        if profile.kind != "agent":
+            raise RuntimeConflict("agent_not_runnable", "subagent 不能直接启动")
         async with self._lock:
-            profile = self._require_profile(agent_id)
-            if profile.kind != "agent":
-                raise RuntimeConflict("agent_not_runnable", "subagent 不能直接启动")
-            state = self._runtimes.get(agent_id)
-            if state and state.desired_state == AgentLifecycleState.RUNNING:
-                return state
-            running = [item for item in self._runtimes.values() if item.desired_state == AgentLifecycleState.RUNNING]
-            if len(running) >= self._max_running_agents:
-                raise RuntimeConflict("runtime_capacity_exceeded", "当前运行容量已满")
-            state = AgentRuntimeState(agent_id=agent_id, desired_state=AgentLifecycleState.RUNNING, lifecycle_state=AgentLifecycleState.RUNNING)
+            current = self._runtimes.get(agent_id)
+            if current and current.desired_state == AgentLifecycleState.RUNNING:
+                return current
+            if current and current.lifecycle_state == AgentLifecycleState.STOPPING:
+                raise RuntimeConflict("agent_stopping", "Agent 正在关闭，请等待终态")
+            if current and current.error_code == "cancellation_uncertain":
+                raise RuntimeConflict("cancellation_uncertain", "上次取消结果不确定，需重启服务后再启动")
+            if self._started_count() >= self._max_started_agents:
+                raise RuntimeConflict("started_agent_capacity_exceeded", "已启动 Agent 数量已达上限")
+            state = AgentRuntimeState(
+                agent_id=agent_id,
+                desired_state=AgentLifecycleState.RUNNING,
+                lifecycle_state=AgentLifecycleState.STARTING,
+            )
             self._runtimes[agent_id] = state
-            await self._persist_runtime_states()
-            return state
+        await self._persist_states()
+        try:
+            await self._backend.start_agent(agent_id)
+        except Exception as exc:
+            async with self._lock:
+                state.lifecycle_state = AgentLifecycleState.ERROR
+                state.error_code = "agent_start_failed"
+            raise RuntimeConflict("agent_start_failed", "Agent 启动失败") from exc
+        async with self._lock:
+            state.lifecycle_state = AgentLifecycleState.RUNNING
+        await self._publish_control("agent_running", agent_id=agent_id)
+        return state
 
     async def stop_agent(self, agent_id: str, *, persist_desired: bool = True) -> AgentRuntimeState:
+        self._record(agent_id)
         async with self._lock:
-            self._require_profile(agent_id)
             state = self._runtimes.setdefault(agent_id, AgentRuntimeState(agent_id=agent_id))
-            state.lifecycle_state = AgentLifecycleState.STOPPING
-            targets = [run for run in self._runs.values() if run.ref.agent_id == agent_id and run.status in _ACTIVE_RUN_STATUSES]
-        for run in targets:
-            await self.cancel_run(run.ref)
-        async with self._lock:
-            state = self._runtimes[agent_id]
-            state.lifecycle_state = AgentLifecycleState.STOPPED
             if persist_desired:
                 state.desired_state = AgentLifecycleState.STOPPED
-                await self._persist_runtime_states()
+            already_stopped = state.lifecycle_state == AgentLifecycleState.STOPPED
+            if not already_stopped:
+                state.lifecycle_state = AgentLifecycleState.STOPPING
+            targets = [] if already_stopped else [
+                run.ref
+                for run in self._runs.values()
+                if run.ref.agent_id == agent_id and run.status in _ACTIVE_RUN_STATUSES
+            ]
+        if persist_desired:
+            await self._persist_states()
+        if already_stopped:
             return state
+        uncertain = False
+        try:
+            async with asyncio.timeout(10):
+                results = await asyncio.gather(*(self.cancel_run(ref) for ref in targets), return_exceptions=True)
+                uncertain = any(
+                    isinstance(result, RuntimeConflict) and result.code == "cancellation_uncertain"
+                    for result in results
+                )
+                if not uncertain:
+                    await self._backend.stop_agent(agent_id)
+        except TimeoutError:
+            uncertain = True
+        async with self._lock:
+            if not uncertain:
+                for key in [key for key in self._sessions if key[0] == agent_id]:
+                    self._sessions.pop(key, None)
+            state.lifecycle_state = AgentLifecycleState.ERROR if uncertain else AgentLifecycleState.STOPPED
+            state.error_code = "cancellation_uncertain" if uncertain else None
+        await self._publish_control("agent_error" if uncertain else "agent_stopped", agent_id=agent_id)
+        return state
 
-    async def start_run(self, agent_id: str, request: GatewayInput, session_id: str | None = None, client_request_id: str = "") -> RunState:
+    async def start_run(
+        self,
+        agent_id: str,
+        request: GatewayInput,
+        session_id: str | None = None,
+        client_request_id: str = "",
+    ) -> RunState:
+        self._ensure_recovered()
         if request.type != GatewayInputType.USER_MESSAGE:
             raise ValueError("仅 user_message 可以创建 Run")
-        if not client_request_id:
-            raise ValueError("client_request_id 不能为空")
+        _validate_resource_id(client_request_id, "client_request_id", max_length=128)
+        target_session = session_id or request.session_id
+        if target_session:
+            _validate_resource_id(target_session, "session_id")
+        fingerprint = _request_fingerprint(agent_id, target_session, request)
         async with self._lock:
-            state = self._runtimes.get(agent_id)
-            if state is None or state.lifecycle_state != AgentLifecycleState.RUNNING:
-                raise RuntimeConflict("agent_not_running", "Agent 尚未启动")
-            profile = self._require_profile(agent_id)
-            if len([run for run in self._runs.values() if run.status in _ACTIVE_RUN_STATUSES]) >= self._max_active_runs:
-                raise RuntimeConflict("runtime_capacity_exceeded", "当前活动 Run 容量已满")
-            target_session_id = session_id or request.session_id
-            runner: SessionRunner
-            if target_session_id:
-                runner = await self._runner_for(agent_id, target_session_id)
-                self._assert_session_owner(runner, agent_id)
-                provider, model, thinking = self._locked_session_llm(runner, request)
-            else:
-                provider, model, thinking = self._resolve_new_session_llm(profile, request)
-                runner = self._runner_factory.create_runner()
-            fingerprint = self._fingerprint(agent_id, target_session_id, profile.revision_id, provider, model, request)
             existing = self._idempotency.get(client_request_id)
             if existing:
-                old_fingerprint, old_key = existing
+                old_fingerprint, key = existing
                 if old_fingerprint != fingerprint:
                     raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
-                return self._runs[old_key]
-            run_id = f"run_{uuid4().hex}"
-            # GatewayInput 的旧校验要求 provider/model 完整；运行时先完成默认值解析再交给旧 Runner。
-            request = request.model_copy(update={"session_id": target_session_id, "agent_name": profile.name, "provider": provider, "model": model, "metadata": {**request.metadata, "thinking_value": thinking, "agent_id": agent_id, "revision_id": profile.revision_id, "run_id": run_id}})
-            session = await runner.handle_input(request)
-            assert session is not None
-            key = (agent_id, session.session_id, run_id)
-            run = RunState(ref=RunRef(agent_id=agent_id, session_id=session.session_id, run_id=run_id, revision_id=profile.revision_id), client_request_id=client_request_id, status=RunStatus.RUNNING, created_at=utc_now_iso(), started_at=utc_now_iso())
+                return self._runs[key]
+
+        profile = self._active_profile(agent_id)
+        state = self._runtimes.get(agent_id)
+        if state is None or state.lifecycle_state != AgentLifecycleState.RUNNING:
+            raise RuntimeConflict("agent_not_running", "Agent 尚未启动")
+
+        if target_session:
+            replay = await self._session_memory.replay(target_session)
+            provider, model, thinking = self._locked_session_llm(agent_id, profile, replay, request)
+            session_id_value = target_session
+        else:
+            replay = None
+            provider, model, thinking = self._resolve_new_session_llm(profile, request)
+            session_id_value = f"sess_{uuid4().hex}"
+        key_base = (agent_id, session_id_value)
+        run_id = f"run_{uuid4().hex}"
+        run = RunState(
+            ref=RunRef(agent_id=agent_id, session_id=session_id_value, run_id=run_id, revision_id=profile.revision_id),
+            client_request_id=client_request_id,
+            status=RunStatus.STARTING,
+            created_at=utc_now_iso(),
+            request_fingerprint=fingerprint,
+            provider=provider,
+            model=model,
+            thinking_value=thinking,
+        )
+        key = (*key_base, run_id)
+        async with self._lock:
+            if self._active_run_count() >= self._max_active_runs:
+                raise RuntimeConflict("run_capacity_exceeded", "活动 Run 容量已满", retry_after=1)
+            session_handle = self._sessions.get(key_base)
+            if session_handle and session_handle.active_run_id:
+                raise RuntimeConflict("session_run_conflict", "目标 Session 已有活动 Run")
             self._runs[key] = run
             self._idempotency[client_request_id] = (fingerprint, key)
-            self._runners[(agent_id, session.session_id)] = runner
-            state.recent_session_id = session.session_id
             state.active_run_count += 1
-            await self._persist_runtime_states()
-            await self._publish_runtime_event(run, "run_started", {"client_request_id": client_request_id})
-            asyncio.create_task(self._watch_run(run, runner), name=f"codepilot-run-watch-{run_id}")
-            return run
+        try:
+            await self._run_store.append(run)
+        except Exception:
+            async with self._lock:
+                self._runs.pop(key, None)
+                self._idempotency.pop(client_request_id, None)
+                state.active_run_count = max(0, state.active_run_count - 1)
+            raise
+
+        try:
+            if session_handle is None:
+                execution = await self._backend.load_session(agent_id, session_id_value, replay, profile)
+                session_handle = SessionRuntimeHandle(
+                    execution=execution,
+                    profile_revision_id=profile.revision_id,
+                    last_accessed_at=utc_now_iso(),
+                )
+                self._sessions[key_base] = session_handle
+            prepared = request.model_copy(
+                update={
+                    "session_id": session_id_value,
+                    "agent_name": profile.name,
+                    "provider": provider,
+                    "model": model,
+                    "metadata": {
+                        **request.metadata,
+                        "thinking_value": thinking,
+                        "agent_id": agent_id,
+                        "revision_id": profile.revision_id,
+                        "run_id": run_id,
+                    },
+                }
+            )
+            scope = RunEventScope(self._event_bus, run.ref, initial_run_seq=run.run_seq)
+            execution = await self._backend.start_run(session_handle.execution, run.ref, prepared, profile, scope)
+        except Exception:
+            await self._transition_terminal(run, RunStatus.FAILED, error_code="backend_start_failed")
+            raise
+        async with self._lock:
+            session_handle.active_run_id = run_id
+            run.status = RunStatus.RUNNING
+            run.started_at = utc_now_iso()
+            state.recent_session_id = session_id_value
+            self._executions[key] = execution
+        try:
+            await self._run_store.append(run)
+            await self._persist_states()
+            await self._publish_control("run_running", run=run)
+        except Exception as exc:
+            await asyncio.gather(
+                self._backend.cancel_run(session_handle.execution, run.ref),
+                return_exceptions=True,
+            )
+            async with self._lock:
+                run.status = RunStatus.FAILED
+                run.error_code = "runtime_state_persist_failed"
+                run.ended_at = utc_now_iso()
+                state.active_run_count = max(0, state.active_run_count - 1)
+                session_handle.active_run_id = None
+                state.lifecycle_state = AgentLifecycleState.ERROR
+                state.error_code = "runtime_state_persist_failed"
+                self._recovery_error = "runtime_recovery_incomplete"
+            raise RuntimeConflict("runtime_recovery_incomplete", "Run 状态持久化失败，已停止执行") from exc
+        watcher = asyncio.create_task(self._watch_run(run, execution), name=f"codepilot-run-watch-{run_id}")
+        self._watchers.add(watcher)
+        watcher.add_done_callback(self._watchers.discard)
+        return run
 
     async def cancel_run(self, ref: RunRef) -> RunState:
         async with self._lock:
             run = self._require_run(ref)
-            if run.status not in _ACTIVE_RUN_STATUSES:
+            if run.status in _TERMINAL_RUN_STATUSES:
                 return run
             run.status = RunStatus.CANCELLING
-            runner = self._runners[(ref.agent_id, ref.session_id)]
-        await runner.handle_input(GatewayInput(type=GatewayInputType.STOP))
+            await self._run_store.append(run)
+            handle = self._sessions.get((ref.agent_id, ref.session_id))
+            if handle is not None:
+                interaction_id = handle.execution.runner.get_status_snapshot().get("pending_human_interaction_id")
+                if isinstance(interaction_id, str) and interaction_id:
+                    interaction = self._interactions.get((*_run_key(ref), interaction_id))
+                    if interaction and interaction.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}:
+                        interaction.status = InteractionStatus.CANCELLED
+                        interaction.ended_at = utc_now_iso()
+        if handle is None:
+            return await self._transition_terminal(run, RunStatus.FAILED, error_code="cancellation_uncertain")
         try:
-            await asyncio.wait_for(runner.wait_current_run(), timeout=1)
-        except TimeoutError:
-            # Runner 内部只拥有本 Session 的 task，强制取消不会串扰其他会话。
-            task = getattr(runner, "_task", None)
-            if task and not task.done():
-                task.cancel()
-        async with self._lock:
-            was_active = run.status in _ACTIVE_RUN_STATUSES
-            run.status = RunStatus.CANCELLED
-            run.ended_at = utc_now_iso()
-            if was_active:
-                self._finish_run_counts(run)
-            await self._publish_runtime_event(run, "run_cancelled", {})
-            return run
+            confirmed = await asyncio.wait_for(self._backend.cancel_run(handle.execution, run.ref), timeout=10)
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            state = self._runtimes.get(ref.agent_id)
+            if state:
+                state.lifecycle_state = AgentLifecycleState.ERROR
+                state.error_code = "cancellation_uncertain"
+            await self._transition_terminal(run, RunStatus.FAILED, error_code="cancellation_uncertain")
+            raise RuntimeConflict("cancellation_uncertain", "无法确认外部副作用已停止")
+        return await self._transition_terminal(run, RunStatus.CANCELLED)
 
     async def reply_interaction(self, ref: RunRef, interaction_id: str, payload: GatewayInput) -> RunState:
+        _validate_resource_id(interaction_id, "interaction_id")
+        result_fingerprint = hashlib.sha256(
+            json.dumps(payload.model_dump(mode="json"), ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         async with self._lock:
             run = self._require_run(ref)
-            runner = self._runners.get((ref.agent_id, ref.session_id))
-            if runner is None:
-                raise RuntimeConflict("interaction_not_found", "交互所属 Run 不存在")
-        if payload.type == GatewayInputType.HUMAN_REPLY and payload.approval_id != interaction_id:
-            raise RuntimeConflict("interaction_mismatch", "审批 ID 不匹配")
-        if payload.type in {GatewayInputType.QUESTION_REPLY, GatewayInputType.QUESTION_DECLINE} and payload.question_id != interaction_id:
-            raise RuntimeConflict("interaction_mismatch", "问题 ID 不匹配")
-        await runner.handle_input(payload)
+            handle = self._sessions.get((ref.agent_id, ref.session_id))
+            if handle is None or handle.active_run_id != ref.run_id:
+                raise RuntimeConflict("resource_ownership_mismatch", "interaction 不属于目标 Run")
+            key = (*_run_key(ref), interaction_id)
+            interaction = self._interactions.get(key)
+            if interaction and interaction.status == InteractionStatus.RESOLVED:
+                if interaction.result_fingerprint == result_fingerprint:
+                    return run
+                raise RuntimeConflict("interaction_result_conflict", "interaction 已提交不同结果")
+            snapshot = handle.execution.runner.get_status_snapshot()
+            if interaction is None or snapshot.get("pending_human_interaction_id") != interaction_id:
+                raise RuntimeConflict("interaction_result_conflict", "interaction 已过期或归属不匹配")
+            if interaction.status != InteractionStatus.PENDING:
+                raise RuntimeConflict("interaction_result_conflict", "interaction 正在处理或已经失效")
+            interaction.status = InteractionStatus.RESOLVING
+        interaction_ref = HumanInteractionRef(
+            agent_id=ref.agent_id,
+            session_id=ref.session_id,
+            run_id=ref.run_id,
+            interaction_id=interaction_id,
+        )
+        try:
+            await self._backend.reply_interaction(handle.execution, interaction_ref, payload)
+        except Exception:
+            async with self._lock:
+                if run.status in _ACTIVE_RUN_STATUSES:
+                    interaction.status = InteractionStatus.PENDING
+                else:
+                    interaction.status = InteractionStatus.CANCELLED
+                    interaction.ended_at = utc_now_iso()
+            raise
+        async with self._lock:
+            interaction.status = InteractionStatus.RESOLVED
+            interaction.result_fingerprint = result_fingerprint
+            interaction.ended_at = utc_now_iso()
         return run
 
-    async def load_session(self, agent_id: str, session_id: str) -> SessionRunner:
-        runner = await self._runner_for(agent_id, session_id)
-        self._assert_session_owner(runner, agent_id)
-        return runner
+    async def handle_domain_event(self, event: DomainEvent) -> None:
+        """把 Runner 的人工交互事件投影为四级资源索引。"""
+        if not isinstance(event, HumanInteractionEvent):
+            return
+        if not event.agent_id or not event.session_id or not event.run_id:
+            return
+        kind = event.data.get("kind")
+        if kind not in {"approval", "question"}:
+            return
+        key = (event.agent_id, event.session_id, event.run_id, event.interaction_id)
+        async with self._lock:
+            if event.data.get("status") == "pending":
+                self._interactions[key] = HumanInteractionState(
+                    ref=HumanInteractionRef(
+                        agent_id=event.agent_id,
+                        session_id=event.session_id,
+                        run_id=event.run_id,
+                        interaction_id=event.interaction_id,
+                    ),
+                    kind=kind,
+                    status=InteractionStatus.PENDING,
+                    created_at=event.created_at,
+                )
+                state = self._runtimes.get(event.agent_id)
+                if state:
+                    state.waiting_human_count += 1
+                run = self._runs.get((event.agent_id, event.session_id, event.run_id))
+                if run and run.status in {RunStatus.RUNNING, RunStatus.STARTING}:
+                    run.status = RunStatus.WAITING_HUMAN
+            else:
+                interaction = self._interactions.get(key)
+                if interaction and interaction.status != InteractionStatus.CANCELLED:
+                    interaction.status = InteractionStatus.RESOLVED
+                    interaction.ended_at = event.created_at
+                state = self._runtimes.get(event.agent_id)
+                if state:
+                    state.waiting_human_count = max(0, state.waiting_human_count - 1)
+                run = self._runs.get((event.agent_id, event.session_id, event.run_id))
+                if run and run.status == RunStatus.WAITING_HUMAN:
+                    run.status = RunStatus.RUNNING
+
+    async def load_session(self, agent_id: str, session_id: str) -> SessionExecutionHandle:
+        _validate_resource_id(session_id, "session_id")
+        profile = self._record_profile(agent_id)
+        key = (agent_id, session_id)
+        existing = self._sessions.get(key)
+        if existing:
+            return existing.execution
+        replay = await self._session_memory.replay(session_id)
+        self._assert_session_owner(replay, agent_id, profile)
+        execution = await self._backend.load_session(agent_id, session_id, replay, profile)
+        self._sessions[key] = SessionRuntimeHandle(
+            execution=execution,
+            profile_revision_id=profile.revision_id,
+            last_accessed_at=utc_now_iso(),
+        )
+        return execution
 
     def get_agent_state(self, agent_id: str) -> AgentRuntimeState:
-        self._require_profile(agent_id)
+        self._record(agent_id)
         return self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id))
 
     def get_run_state(self, ref: RunRef) -> RunState:
         return self._require_run(ref)
 
     def list_agent_states(self) -> list[AgentRuntimeState]:
-        return [self.get_agent_state(profile.agent_id) for profile in self._agent_profiles.values() if profile.kind == "agent"]
+        profiles = self._profile_provider.list_active_profile_snapshots()
+        return [self._runtimes.get(item.agent_id, AgentRuntimeState(agent_id=item.agent_id)) for item in profiles]
 
-    async def _runner_for(self, agent_id: str, session_id: str) -> SessionRunner:
-        existing = self._runners.get((agent_id, session_id))
-        if existing:
-            return existing
-        replay = await self._session_memory.replay(session_id)
-        runner = self._runner_factory.create_runner()
-        runner.load_session(session_id, replay)
-        self._runners[(agent_id, session_id)] = runner
-        return runner
+    def list_sessions(self, agent_id: str) -> list[dict[str, Any]]:
+        profile = self._record_profile(agent_id)
+        return [
+            item
+            for item in self._session_memory.list_sessions()
+            if item.get("agent_id") == agent_id
+            or (not item.get("agent_id") and item.get("agent_name") == profile.name)
+        ]
 
-    async def _watch_run(self, run: RunState, runner: SessionRunner) -> None:
+    def find_active_agent_id(self, agent_name: str) -> str:
+        for profile in self._profile_provider.list_active_profile_snapshots():
+            if profile.name == agent_name:
+                return profile.agent_id
+        raise KeyError("Agent 不存在")
+
+    def get_session_status(self, agent_id: str, session_id: str) -> dict[str, Any]:
+        handle = self._sessions.get((agent_id, session_id))
+        if handle is None:
+            raise KeyError("Session 未加载")
+        return handle.execution.runner.get_status_snapshot()
+
+    async def replay_runtime_events(self, cursor: str | None) -> list[tuple[int, str, StreamEvent]]:
         try:
-            session = await runner.wait_current_run()
+            return await self._control_store.replay(cursor)
+        except ValueError as exc:
+            raise RuntimeConflict("invalid_runtime_cursor", "运行时 cursor 无效", status=422) from exc
+
+    def create_runtime_subscription(self) -> Any:
+        return self._control_bus.create_stream_subscription()
+
+    def remove_runtime_subscription(self, subscription: Any) -> None:
+        self._control_bus.remove_stream_subscription(subscription)
+
+    def current_runtime_cursor(self) -> str:
+        return encode_runtime_cursor(self._control_store.current_seq)
+
+    def runtime_cursor_for_seq(self, seq: int) -> str:
+        return encode_runtime_cursor(seq)
+
+    async def _watch_run(self, run: RunState, execution: RunExecutionHandle) -> None:
+        try:
+            session = await execution.wait()
             status = RunStatus.COMPLETED
             if session and session.status == SessionStatus.FAILED:
                 status = RunStatus.FAILED
@@ -248,22 +681,132 @@ class InProcessAgentRuntimeBackend:
                 status = RunStatus.CANCELLED
         except asyncio.CancelledError:
             status = RunStatus.CANCELLED
-        except Exception:  # AgentLoop 已持久化脱敏错误事件。
+        except Exception:
             status = RunStatus.FAILED
-        async with self._lock:
-            was_active = run.status in _ACTIVE_RUN_STATUSES
-            if run.status == RunStatus.CANCELLING:
-                status = RunStatus.CANCELLED
-            run.status = status
-            run.ended_at = utc_now_iso()
-            if was_active:
-                self._finish_run_counts(run)
-            await self._publish_runtime_event(run, f"run_{status.value.lower()}", {})
+        run.run_seq = execution.event_scope.run_seq
+        await self._transition_terminal(run, status)
 
-    def _finish_run_counts(self, run: RunState) -> None:
-        state = self._runtimes.get(run.ref.agent_id)
-        if state:
-            state.active_run_count = max(0, state.active_run_count - 1)
+    async def _transition_terminal(
+        self,
+        run: RunState,
+        status: RunStatus,
+        *,
+        error_code: str | None = None,
+    ) -> RunState:
+        async with self._lock:
+            if run.status in _TERMINAL_RUN_STATUSES:
+                return run
+            run.status = status
+            run.error_code = error_code
+            run.ended_at = utc_now_iso()
+            state = self._runtimes.get(run.ref.agent_id)
+            if state:
+                state.active_run_count = max(0, state.active_run_count - 1)
+            handle = self._sessions.get((run.ref.agent_id, run.ref.session_id))
+            if handle and handle.active_run_id == run.ref.run_id:
+                handle.active_run_id = None
+            self._executions.pop((run.ref.agent_id, run.ref.session_id, run.ref.run_id), None)
+            try:
+                await self._run_store.append(run)
+                await self._publish_control(f"run_{status.value.lower()}", run=run)
+            except Exception:
+                if state:
+                    state.lifecycle_state = AgentLifecycleState.ERROR
+                    state.error_code = "runtime_state_persist_failed"
+                self._recovery_error = "runtime_recovery_incomplete"
+            return run
+
+    async def _publish_control(
+        self,
+        event_type: str,
+        *,
+        agent_id: str | None = None,
+        run: RunState | None = None,
+    ) -> None:
+        await self._control_bus.publish_stream_event(
+            StreamEvent(
+                event_type=event_type,
+                agent_id=agent_id or (run.ref.agent_id if run else None),
+                session_id=run.ref.session_id if run else None,
+                run_id=run.ref.run_id if run else None,
+                run_seq=run.run_seq if run else 0,
+                created_at=utc_now_iso(),
+                data={"status": run.status.value, "error_code": run.error_code} if run else {},
+            )
+        )
+
+    async def _persist_states(self) -> None:
+        await self._state_store.write(
+            {
+                "schema_version": 1,
+                "agents": {
+                    agent_id: {
+                        "desired_state": state.desired_state.value,
+                        "recent_session_id": state.recent_session_id,
+                        "updated_at": utc_now_iso(),
+                    }
+                    for agent_id, state in self._runtimes.items()
+                },
+            }
+        )
+
+    def _active_profile(self, agent_id: str) -> AgentProfile:
+        try:
+            return self._profile_provider.get_active_profile_snapshot(agent_id)
+        except Exception as exc:
+            code = getattr(exc, "code", "agent_not_found")
+            status = getattr(exc, "status", 404)
+            raise RuntimeConflict(code, str(exc), status=status) from exc
+
+    def _record(self, agent_id: str) -> dict[str, Any]:
+        try:
+            return self._profile_provider.get_record_snapshot(agent_id)
+        except Exception as exc:
+            raise KeyError("Agent 不存在") from exc
+
+    def _record_profile(self, agent_id: str) -> AgentProfile:
+        record = self._record(agent_id)
+        profile = record.get("profile")
+        if not isinstance(profile, AgentProfile):
+            raise RuntimeConflict("agent_invalid", "Agent 配置无效")
+        return profile
+
+    def _require_run(self, ref: RunRef) -> RunState:
+        key = (ref.agent_id, ref.session_id, ref.run_id)
+        run = self._runs.get(key)
+        if run is None:
+            # 若 run_id 存在但归属不同，明确返回归属错误，避免跨 Agent 探测。
+            if any(item.ref.run_id == ref.run_id for item in self._runs.values()):
+                raise RuntimeConflict("resource_ownership_mismatch", "Run 归属不匹配")
+            raise KeyError("Run 不存在")
+        return run
+
+    def _assert_session_owner(self, replay: dict[str, Any], agent_id: str, profile: AgentProfile) -> None:
+        session = replay.get("session")
+        if not isinstance(session, dict) or not isinstance(session.get("data"), dict):
+            raise KeyError("Session 不存在")
+        data = session["data"]
+        owner = data.get("agent_id")
+        if owner and owner != agent_id:
+            raise RuntimeConflict("resource_ownership_mismatch", "Session 不属于指定 Agent")
+        if not owner and data.get("agent_name") != profile.name:
+            raise RuntimeConflict("resource_ownership_mismatch", "旧 Session 无法解析到指定 Agent")
+
+    def _locked_session_llm(
+        self,
+        agent_id: str,
+        profile: AgentProfile,
+        replay: dict[str, Any],
+        request: GatewayInput,
+    ) -> tuple[str, str, str | None]:
+        self._assert_session_owner(replay, agent_id, profile)
+        data = replay["session"]["data"]
+        provider, model = data.get("provider"), data.get("model")
+        if request.provider and request.model and (request.provider != provider or request.model != model):
+            raise RuntimeConflict("session_model_locked", "Session 创建后不能切换 Provider 或 Model")
+        if bool(request.provider) != bool(request.model):
+            raise ValueError("provider 与 model 必须同时提供")
+        return str(provider), str(model), data.get("metadata", {}).get("thinking_value")
 
     def _resolve_new_session_llm(self, profile: AgentProfile, request: GatewayInput) -> tuple[str, str, str | None]:
         explicit_provider, explicit_model = request.provider, request.model
@@ -275,84 +818,77 @@ class InProcessAgentRuntimeBackend:
             provider, model = profile.default_provider, profile.default_model
         if not provider or not model:
             raise ValueError("请提供完整 Provider/Model，或先为 Agent 配置默认模型")
-        activated, selected = resolve_llm_selection(settings=self._config, requested_provider=provider, requested_model=model)
-        thinking = resolve_thinking_value(settings=self._config, provider=activated.provider, model=selected, metadata=request.metadata)
+        activated, selected = resolve_llm_selection(
+            settings=self._config,
+            requested_provider=provider,
+            requested_model=model,
+        )
+        thinking = resolve_thinking_value(
+            settings=self._config,
+            provider=activated.provider,
+            model=selected,
+            metadata=request.metadata,
+        )
         if "thinking_value" not in request.metadata and using_default:
             thinking = profile.default_thinking_value
         return activated.provider, selected, thinking
 
-    def _locked_session_llm(self, runner: SessionRunner, request: GatewayInput) -> tuple[str, str, str | None]:
-        snapshot = runner.get_status_snapshot()
-        provider, model = snapshot["provider"], snapshot["model"]
-        if request.provider and request.model and (request.provider != provider or request.model != model):
-            raise RuntimeConflict("session_model_locked", "Session 创建后不能切换 Provider 或 Model")
-        if bool(request.provider) != bool(request.model):
-            raise ValueError("provider 与 model 必须同时提供")
-        return str(provider), str(model), snapshot.get("thinking_value")
+    def _active_run_count(self) -> int:
+        return sum(run.status in _ACTIVE_RUN_STATUSES for run in self._runs.values())
 
-    def _require_profile(self, agent_id: str) -> AgentProfile:
-        profile = self._profile_by_id(agent_id)
-        if profile is None:
-            raise KeyError("Agent 不存在")
-        return profile
+    def _started_count(self) -> int:
+        return sum(
+            state.desired_state == AgentLifecycleState.RUNNING
+            and state.lifecycle_state in {AgentLifecycleState.RUNNING, AgentLifecycleState.STARTING, AgentLifecycleState.ERROR}
+            for state in self._runtimes.values()
+        )
 
-    def _profile_by_id(self, agent_id: str) -> AgentProfile | None:
-        return next((item for item in self._agent_profiles.values() if item.agent_id == agent_id), None)
-
-    def _assert_session_owner(self, runner: SessionRunner, agent_id: str) -> None:
-        snapshot = runner.get_status_snapshot()
-        profile = self._require_profile(agent_id)
-        if snapshot.get("agent_name") != profile.name:
-            raise RuntimeConflict("session_agent_mismatch", "Session 不属于指定 Agent")
-
-    def _require_run(self, ref: RunRef) -> RunState:
-        try:
-            run = self._runs[(ref.agent_id, ref.session_id, ref.run_id)]
-        except KeyError as exc:
-            raise KeyError("Run 不存在") from exc
-        if ref.revision_id and run.ref.revision_id != ref.revision_id:
-            raise RuntimeConflict("run_revision_mismatch", "Run revision 不匹配")
-        return run
-
-    def _fingerprint(self, agent_id: str, session_id: str | None, revision_id: str, provider: str, model: str, request: GatewayInput) -> str:
-        attachment_hashes = [hashlib.sha256(item.data_base64.encode()).hexdigest() for item in request.attachments]
-        payload = {"agent_id": agent_id, "session_id": session_id, "revision_id": revision_id, "provider": provider, "model": model, "content": hashlib.sha256((request.content or "").encode()).hexdigest(), "attachments": attachment_hashes}
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-    async def _publish_runtime_event(self, run: RunState, event_type: str, data: dict[str, Any]) -> None:
-        run.run_seq += 1
-        await self._event_bus.publish_stream_event(StreamEvent(event_type=event_type, agent_id=run.ref.agent_id, session_id=run.ref.session_id, run_id=run.ref.run_id, run_seq=run.run_seq, created_at=utc_now_iso(), data=data))
-
-    async def _persist_runtime_states(self) -> None:
-        payload = {"schema_version": 1, "agents": {agent_id: {"desired_state": state.desired_state.value, "recent_session_id": state.recent_session_id, "updated_at": utc_now_iso()} for agent_id, state in self._runtimes.items() if state.desired_state == AgentLifecycleState.RUNNING}}
-        await asyncio.to_thread(self._atomic_write, payload)
-
-    def _read_state_file(self) -> dict[str, Any]:
-        if not self._state_path.exists():
-            return {}
-        try:
-            return json.loads(self._state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-    def _atomic_write(self, payload: dict[str, Any]) -> None:
-        self._state_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self._state_path.with_suffix(".tmp")
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(temporary, self._state_path)
-            os.chmod(self._state_path, 0o600)
-        finally:
-            if temporary.exists():
-                temporary.unlink(missing_ok=True)
+    def _ensure_recovered(self) -> None:
+        if self._recovery_error:
+            raise RuntimeConflict("runtime_recovery_incomplete", "运行态恢复不完整，已拒绝新的 Run")
 
 
-_ACTIVE_RUN_STATUSES = {RunStatus.STARTING, RunStatus.RUNNING, RunStatus.WAITING_HUMAN, RunStatus.CANCELLING}
+_ACTIVE_RUN_STATUSES = {
+    RunStatus.STARTING,
+    RunStatus.RUNNING,
+    RunStatus.WAITING_HUMAN,
+    RunStatus.CANCELLING,
+}
+_TERMINAL_RUN_STATUSES = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.CANCELLED}
+_RESOURCE_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _validate_resource_id(value: str, field: str, *, max_length: int = 160) -> None:
+    if not value or len(value) > max_length or not _RESOURCE_ID_PATTERN.fullmatch(value):
+        raise ValueError(f"{field} 格式无效")
+
+
+def _request_fingerprint(agent_id: str, session_id: str | None, request: GatewayInput) -> str:
+    attachments: list[dict[str, str]] = []
+    for item in request.attachments:
+        data, mime = decode_image_attachment(item.data_base64, item.mime)
+        attachments.append(
+            {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mime": mime,
+                "filename": sanitize_attachment_filename(item.filename),
+            }
+        )
+    payload = {
+        "agent_id": agent_id,
+        "session_id": session_id or "__new_session__",
+        "content_sha256": hashlib.sha256((request.content or "").encode("utf-8")).hexdigest(),
+        "attachments": attachments,
+        "provider": request.provider or "__agent_default__",
+        "model": request.model or "__agent_default__",
+        "thinking_value": request.metadata.get("thinking_value", "__agent_default__"),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _run_key(ref: RunRef) -> tuple[str, str, str]:
+    return ref.agent_id, ref.session_id, ref.run_id

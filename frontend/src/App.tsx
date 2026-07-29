@@ -892,6 +892,7 @@ function App() {
       return;
     }
     const isStartingNewSession = !currentSessionIdRef.current;
+    const clientRequestId = `web_${crypto.randomUUID().replace(/-/g, '')}`;
     try {
       const payload = {
         type: 'user_message',
@@ -900,7 +901,10 @@ function App() {
         provider,
         model,
         attachments: attachments.map(({ filename, mime, data_base64 }) => ({ filename, mime, data_base64 })),
-        metadata: thinkingValue ? { thinking_value: thinkingValue } : {},
+        metadata: {
+          ...(thinkingValue ? { thinking_value: thinkingValue } : {}),
+          client_request_id: clientRequestId,
+        },
         ...(currentSessionId ? { session_id: currentSessionId } : {}),
       };
       const response = await postJson<{ ok: boolean; session: StatusResponse | null }>('/api/session/input', payload);

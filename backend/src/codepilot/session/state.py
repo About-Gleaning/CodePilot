@@ -49,6 +49,29 @@ class RunRef(BaseModel):
     revision_id: str = ""
 
 
+class InteractionStatus(str, Enum):
+    PENDING = "PENDING"
+    RESOLVING = "RESOLVING"
+    RESOLVED = "RESOLVED"
+    CANCELLED = "CANCELLED"
+
+
+class HumanInteractionRef(BaseModel):
+    agent_id: str
+    session_id: str
+    run_id: str
+    interaction_id: str
+
+
+class HumanInteractionState(BaseModel):
+    ref: HumanInteractionRef
+    kind: Literal["approval", "question"]
+    status: InteractionStatus = InteractionStatus.PENDING
+    result_fingerprint: str | None = None
+    created_at: str
+    ended_at: str | None = None
+
+
 class RunState(BaseModel):
     ref: RunRef
     client_request_id: str
@@ -58,6 +81,10 @@ class RunState(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
     error_code: str | None = None
+    request_fingerprint: str = ""
+    provider: str | None = None
+    model: str | None = None
+    thinking_value: str | None = None
 
 
 class AgentRuntimeState(BaseModel):
@@ -72,6 +99,7 @@ class AgentRuntimeState(BaseModel):
 
 class SessionState(BaseModel):
     session_id: str
+    agent_id: str = ""
     title: str | None = None
     workspace_id: str
     workspace_path: str

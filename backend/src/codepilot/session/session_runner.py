@@ -12,14 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from codepilot.config.settings import resolve_llm_selection, resolve_thinking_value
-from codepilot.events import MessageCreatedEvent, SessionLifecycleEvent, SessionMetaEvent, StreamEvent
+from codepilot.events import MessageCreatedEvent, RunEventScope, SessionLifecycleEvent, SessionMetaEvent, StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.hooks import HookManager, RuntimeHandles
 from codepilot.session.agents import AgentProfile
 from codepilot.session.attachments import attachment_message_dir, decode_image_attachment, sanitize_attachment_filename
 from codepilot.session.message import FilePart, FileSource, Message, MessagePart, TextPart, build_user_message_info
 from codepilot.session.session import AgentLoop
-from codepilot.session.state import ApprovalResult, QuestionResult, SessionState, SessionStatus
+from codepilot.session.state import ApprovalResult, QuestionResult, RunRef, SessionState, SessionStatus
 from codepilot.session.title import SessionTitleService
 from codepilot.utils import new_message_id, new_session_id, utc_now_iso, utc_now_millis
 
@@ -41,6 +41,7 @@ class SessionRunner:
     ) -> None:
         self._workspace = workspace
         self._config = config
+        self._base_event_bus = event_bus
         self._event_bus = event_bus
         self._hook_manager = hook_manager
         self._agent_loop = agent_loop
@@ -69,6 +70,27 @@ class SessionRunner:
             return await self._handle_question_decline(gateway_input)
         return await self._handle_user_message(gateway_input)
 
+    async def start_resource_run(
+        self,
+        gateway_input: GatewayInput,
+        *,
+        run_ref: RunRef,
+        profile: AgentProfile,
+        event_scope: RunEventScope | None = None,
+    ) -> SessionState:
+        """按完整 RunRef 启动执行，确保新 API 不依赖隐式当前会话。"""
+        if gateway_input.type != GatewayInputType.USER_MESSAGE:
+            raise ValueError("资源化 Run 只能由 user_message 启动")
+        if gateway_input.session_id != run_ref.session_id:
+            raise ValueError("RunRef 与输入 Session 不一致")
+        self._event_bus = event_scope or RunEventScope(self._base_event_bus, run_ref)
+        return await self._handle_user_message(
+            gateway_input,
+            force_new=self._session is None,
+            run_ref=run_ref,
+            profile_override=profile,
+        )
+
     def get_status_snapshot(self) -> dict[str, Any]:
         """返回当前会话的轻量状态快照，供外部轮询查看。"""
         pending_human_type = self._session.metadata.get("pending_human_type") if self._session else None
@@ -77,6 +99,7 @@ class SessionRunner:
             "workspace_id": self._workspace.workspace_id,
             "workspace_path": str(self._workspace.workspace_path),
             "session_id": self._session.session_id if self._session else None,
+            "agent_id": self._session.agent_id if self._session else None,
             "status": self._session.status.value if self._session else SessionStatus.IDLE.value,
             "agent_name": self._session.agent_name if self._session else self._default_agent_name(),
             "provider": self._session.provider if self._session else None,
@@ -84,6 +107,7 @@ class SessionRunner:
             "thinking_enabled": bool(self._session.metadata.get("thinking_enabled")) if self._session else False,
             "thinking_value": self._session.metadata.get("thinking_value") if self._session else None,
             "pending_human_type": pending_human_type if isinstance(pending_human_type, str) else None,
+            "pending_human_interaction_id": self._session.metadata.get("pending_human_interaction_id") if self._session else None,
             "pending_human_request": pending_human_request if isinstance(pending_human_request, dict) else None,
         }
 
@@ -95,6 +119,21 @@ class SessionRunner:
         """等待当前后台执行任务结束，供 headless worker 在进程内同步收尾。"""
         if self._task and not self._task.done():
             await self._task
+        return self._session
+
+    async def force_cancel_current_run(self) -> SessionState | None:
+        """仅强制终止本 Runner 的任务；控制面负责决定最终 Run 状态。"""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        for task in tuple(self._title_tasks):
+            if not task.done():
+                task.cancel()
+        if self._title_tasks:
+            await asyncio.gather(*self._title_tasks, return_exceptions=True)
         return self._session
 
     def load_session(self, session_id: str, replay: dict[str, Any]) -> SessionState:
@@ -133,8 +172,20 @@ class SessionRunner:
         if self._task and not self._task.done():
             self._stop_event.set()
             await self._task
+        for task in tuple(self._title_tasks):
+            if not task.done():
+                task.cancel()
+        if self._title_tasks:
+            await asyncio.gather(*self._title_tasks, return_exceptions=True)
 
-    async def _handle_user_message(self, gateway_input: GatewayInput) -> SessionState:
+    async def _handle_user_message(
+        self,
+        gateway_input: GatewayInput,
+        *,
+        force_new: bool = False,
+        run_ref: RunRef | None = None,
+        profile_override: AgentProfile | None = None,
+    ) -> SessionState:
         """处理新的用户消息，并在必要时启动一轮新的会话执行。"""
         if self._session and self._session.status == SessionStatus.RUNNING:
             raise ValueError("当前 session 正在运行，只允许 stop")
@@ -143,8 +194,8 @@ class SessionRunner:
         if self._session and self._session.status == SessionStatus.WAITING_HUMAN:
             raise ValueError("当前 session 正在等待人工确认，不接受新的 user_message")
 
-        is_new_session = not gateway_input.session_id
-        if gateway_input.session_id:
+        is_new_session = force_new or not gateway_input.session_id
+        if gateway_input.session_id and not force_new:
             if self._session is None:
                 raise ValueError(f"session `{gateway_input.session_id}` 不存在或未加载")
             if self._session.session_id != gateway_input.session_id:
@@ -165,7 +216,34 @@ class SessionRunner:
             self._session.status = SessionStatus.RUNNING
             self._session.updated_at = utc_now_iso()
         else:
-            self._session = self._new_session(gateway_input)
+            self._session = self._new_session(
+                gateway_input,
+                session_id=run_ref.session_id if run_ref else None,
+                agent_id=run_ref.agent_id if run_ref else "",
+            )
+
+        binding_upgrade = run_ref is not None and not self._session.agent_id
+        if run_ref is not None:
+            self._session.agent_id = run_ref.agent_id
+            self._session.metadata.update(
+                {
+                    "agent_id": run_ref.agent_id,
+                    "revision_id": run_ref.revision_id,
+                    "run_id": run_ref.run_id,
+                }
+            )
+            if binding_upgrade and not is_new_session:
+                await self._event_bus.publish_domain_event(
+                    SessionMetaEvent(
+                        session_id=self._session.session_id,
+                        created_at=utc_now_iso(),
+                        data={
+                            "agent_id": run_ref.agent_id,
+                            "agent_name": self._session.agent_name,
+                            "updated_at": self._session.updated_at,
+                        },
+                    )
+                )
 
         # 用户输入先落入 session 内存，再交给 AgentLoop 负责完整的一次 session 执行。
         message = self._build_user_message(gateway_input)
@@ -182,6 +260,7 @@ class SessionRunner:
                         "title": self._session.title,
                         "workspace_id": self._session.workspace_id,
                         "workspace_path": self._session.workspace_path,
+                        "agent_id": self._session.agent_id,
                         "initial_user_message_id": message.info.id,
                         "updated_at": self._session.updated_at,
                     }
@@ -206,8 +285,8 @@ class SessionRunner:
             )
             self._schedule_title_generation(self._session)
 
-        runtime = RuntimeHandles(event_bus=self._event_bus)
-        profile = self._agent_profiles[self._session.agent_name]
+        runtime = RuntimeHandles(event_bus=self._event_bus, run_ref=run_ref)
+        profile = profile_override or self._agent_profiles[self._session.agent_name]
         await self._event_bus.publish_domain_event(
             MessageCreatedEvent(
                 session_id=self._session.session_id,
@@ -294,15 +373,16 @@ class SessionRunner:
         if self._session.status == SessionStatus.WAITING_HUMAN:
             # 等待人工确认时没有运行中的 Loop 可中断，需要通过审批结果唤醒等待协程。
             self._session.status = SessionStatus.CANCELLED
+            interaction_id = str(self._session.metadata.get("pending_human_interaction_id") or "")
             self._approval_result_holder["result"] = ApprovalResult(
-                approval_id="stop_during_waiting",
+                approval_id=interaction_id,
                 approved=False,
                 comment="用户停止任务",
                 created_at=utc_now_iso(),
             )
             self._approval_event.set()
             self._question_result_holder["result"] = QuestionResult(
-                question_id="stop_during_waiting",
+                question_id=interaction_id,
                 declined=True,
                 comment="用户停止任务",
                 created_at=utc_now_iso(),
@@ -381,7 +461,13 @@ class SessionRunner:
         self._question_event.set()
         return self._session
 
-    def _new_session(self, gateway_input: GatewayInput) -> SessionState:
+    def _new_session(
+        self,
+        gateway_input: GatewayInput,
+        *,
+        session_id: str | None = None,
+        agent_id: str = "",
+    ) -> SessionState:
         """基于当前输入创建新的 session，并解析本次会话使用的 LLM 选择。"""
         now = utc_now_iso()
         self._ensure_agent_supported(gateway_input.agent_name)
@@ -391,7 +477,8 @@ class SessionRunner:
             requested_model=gateway_input.model,
         )
         return SessionState(
-            session_id=new_session_id(),
+            session_id=session_id or new_session_id(),
+            agent_id=agent_id,
             workspace_id=self._workspace.workspace_id,
             workspace_path=str(self._workspace.workspace_path),
             agent_name=gateway_input.agent_name or self._default_agent_name(),

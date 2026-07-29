@@ -59,7 +59,7 @@ class RuntimeBundle:
     skill_registry: SkillRegistry
     agent_profiles: dict[str, Any]
     session_runner: SessionRunner
-    agent_runtime: InProcessAgentRuntimeBackend
+    agent_backend: InProcessAgentRuntimeBackend
     mcp_manager: McpClientManager
 
     async def start(self) -> None:
@@ -83,7 +83,7 @@ def build_runtime_bundle(
     session_memory = JsonlSessionMemory(workspace.sessions_dir)
     event_store = JsonlEventStore(workspace.sessions_dir)
     event_bus.set_initial_seq(event_store.latest_seq())
-    event_bus.subscribe_domain(session_memory.handle_domain_event)
+    event_bus.subscribe_domain(session_memory.handle_domain_event, critical=True)
     event_bus.subscribe_stream(event_store.append)
 
     skill_registry = SkillRegistry(workspace.codepilot_home / "skills")
@@ -142,14 +142,7 @@ def build_runtime_bundle(
 
     # 保留一个旧 Runner 给兼容接口；新资源化 API 始终经由独立 RunnerFactory。
     session_runner = create_session_runner()
-    agent_runtime = InProcessAgentRuntimeBackend(
-        workspace=workspace,
-        config=settings,
-        event_bus=event_bus,
-        session_memory=session_memory,
-        agent_profiles=agent_profiles,
-        runner_factory=SessionRunnerFactory(create_session_runner),
-    )
+    agent_backend = InProcessAgentRuntimeBackend(SessionRunnerFactory(create_session_runner))
     return RuntimeBundle(
         event_bus=event_bus,
         event_store=event_store,
@@ -160,7 +153,7 @@ def build_runtime_bundle(
         skill_registry=skill_registry,
         agent_profiles=agent_profiles,
         session_runner=session_runner,
-        agent_runtime=agent_runtime,
+        agent_backend=agent_backend,
         mcp_manager=mcp_manager,
     )
 

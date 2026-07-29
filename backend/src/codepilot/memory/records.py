@@ -16,6 +16,11 @@ from codepilot.events import (
 
 def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
     """把不同类型的领域事件映射成统一可落盘的记录结构。"""
+    ownership = {
+        "agent_id": event.agent_id,
+        "run_id": event.run_id,
+        "revision_id": event.revision_id,
+    }
     if isinstance(event, SessionMetaEvent):
         return {
             "record_type": "session_meta",
@@ -23,6 +28,7 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "created_at": event.created_at,
             "updated_at": event.data.get("updated_at") or event.created_at,
             "data": event.data,
+            **ownership,
         }
     if isinstance(event, MessageCreatedEvent):
         return {
@@ -31,6 +37,7 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "message_id": event.message.info.id,
             "created_at": event.created_at,
             "data": event.message.model_dump(),
+            **ownership,
         }
     if isinstance(event, HumanInteractionEvent):
         return {
@@ -39,6 +46,7 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "interaction_id": event.interaction_id,
             "created_at": event.created_at,
             "data": event.data,
+            **ownership,
         }
     if isinstance(event, SessionCompactedEvent):
         return {
@@ -46,6 +54,7 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "session_id": event.session_id,
             "created_at": event.created_at,
             "data": event.data,
+            **ownership,
         }
     if isinstance(event, SessionLifecycleEvent):
         lifecycle_type = _lifecycle_record_type(event)
@@ -54,25 +63,34 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "session_id": event.session_id,
             "created_at": event.created_at,
             "data": lifecycle_data(event),
+            **ownership,
         }
     return {
         "record_type": event.event_type.value,
         "session_id": event.session_id,
         "created_at": event.created_at,
         "data": event.data,
+        **ownership,
     }
 
 
 def lifecycle_data(event: SessionLifecycleEvent) -> dict[str, Any]:
     """只持久化状态事件自身需要的字段，避免重复保存会话全局信息。"""
     data = event.data
-    return {
+    result = {
         "status": event.status,
         "agent_name": data.get("agent_name"),
         "provider": data.get("provider"),
         "model": data.get("model"),
         "updated_at": data.get("updated_at") or event.created_at,
     }
+    optional = {
+        "agent_id": event.agent_id or data.get("agent_id"),
+        "run_id": event.run_id or data.get("run_id"),
+        "revision_id": event.revision_id or data.get("revision_id"),
+    }
+    result.update({key: value for key, value in optional.items() if value})
+    return result
 
 
 def _lifecycle_record_type(event: SessionLifecycleEvent) -> str:

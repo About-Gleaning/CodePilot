@@ -6,16 +6,19 @@ import argparse
 import asyncio
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
 
 from codepilot.config import WorkspaceState, build_workspace_id, load_settings
 from codepilot.gateway import GatewayInput
+from codepilot.events import RunEventScope
 from codepilot.logging import configure_logging
 from codepilot.runtime import build_runtime_bundle
 from codepilot.scheduler.models import ScheduleRunStatus
 from codepilot.session import SessionStatus
+from codepilot.session.state import RunRef
 
 
 def main() -> None:
@@ -60,8 +63,19 @@ async def run_worker(args: argparse.Namespace) -> None:
         await runtime.start()
         _prepare_worker_runtime(runtime)
         prompt = _read_prompt_file(Path(args.prompt_file))
+        profile = runtime.agent_profiles.get(args.agent_name)
+        if profile is None or profile.kind != "agent":
+            raise ValueError("定时任务 Agent 不存在或已归档")
+        session_id = f"sess_{uuid4().hex}"
+        run_ref = RunRef(
+            agent_id=profile.agent_id,
+            session_id=session_id,
+            run_id=args.run_id,
+            revision_id=profile.revision_id,
+        )
         payload = GatewayInput(
             type="user_message",
+            session_id=session_id,
             content=prompt,
             agent_name=args.agent_name,
             provider=args.provider,
@@ -71,9 +85,17 @@ async def run_worker(args: argparse.Namespace) -> None:
                 "schedule_task_id": args.task_id,
                 "schedule_run_id": args.run_id,
                 "schedule_task_name": args.task_name,
+                "agent_id": profile.agent_id,
+                "revision_id": profile.revision_id,
+                "run_id": args.run_id,
             },
         )
-        session = await runtime.session_runner.handle_input(payload)
+        session = await runtime.session_runner.start_resource_run(
+            payload,
+            run_ref=run_ref,
+            profile=profile,
+            event_scope=RunEventScope(runtime.event_bus, run_ref),
+        )
         session_id = session.session_id if session else None
         finished = await runtime.session_runner.wait_current_run()
         status = _run_status_from_session(finished.status if finished else None)

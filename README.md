@@ -222,6 +222,8 @@ llm:
 
 页面中的“管理 Agent”可以创建、编辑、归档和恢复自定义主 Agent。配置保存为 Markdown，并保留 revision 快照；默认 Provider/Model 在当前阶段仅作为 Agent 默认配置保存，现有会话仍显式选择模型。
 
+运行时由 `AgentRuntimeManager` 统一管理，最多可保持 5 个 Agent 启动；每个 Session 使用独立 SessionRunner，资源 API 按 `agent_id/session_id/run_id` 精确路由。CODE-50 仍限制全局一个活动 Run，CODE-51 将负责开放 5 Run 并发和 workspace 写入租约。
+
 Agent 分为两类：
 
 - 主 agent：`kind="agent"`，会通过 `/api/config` 返回给前端，可在前端下拉框直接选择。

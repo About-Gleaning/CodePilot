@@ -28,7 +28,7 @@ from codepilot.runtime import build_runtime_bundle
 from codepilot.scheduler import ScheduleRunner, ScheduleStore
 from codepilot.skills import SkillRegistry
 from codepilot.session import SessionRunner
-from codepilot.session.agent_runtime import InProcessAgentRuntimeBackend
+from codepilot.session.agent_runtime import AgentRuntimeManager
 from codepilot.session.agent_config import AgentConfigService
 from codepilot.tools import ScheduleManageTool, ToolRegistry
 
@@ -47,7 +47,7 @@ class AppContext:
     skill_registry: SkillRegistry
     agent_profiles: dict[str, object]
     session_runner: SessionRunner
-    agent_runtime: InProcessAgentRuntimeBackend
+    agent_runtime: AgentRuntimeManager
     schedule_store: ScheduleStore
     schedule_runner: ScheduleRunner
     agent_config_service: AgentConfigService
@@ -95,6 +95,17 @@ def create_app() -> FastAPI:
         tool_registry=runtime.tool_registry,
         mcp_manager=runtime.mcp_manager,
     )
+    agent_runtime = AgentRuntimeManager(
+        workspace=workspace,
+        config=settings,
+        event_bus=runtime.event_bus,
+        session_memory=runtime.session_memory,
+        profile_provider=agent_config_service,
+        backend=runtime.agent_backend,
+        max_active_runs=1,
+        max_started_agents=settings.agent.max_started_agents,
+    )
+    runtime.event_bus.subscribe_domain(agent_runtime.handle_domain_event)
 
     app_state = AppContext(
         settings=settings,
@@ -108,7 +119,7 @@ def create_app() -> FastAPI:
         skill_registry=runtime.skill_registry,
         agent_profiles=runtime.agent_profiles,
         session_runner=runtime.session_runner,
-        agent_runtime=runtime.agent_runtime,
+        agent_runtime=agent_runtime,
         schedule_store=schedule_store,
         schedule_runner=schedule_runner,
         agent_config_service=agent_config_service,

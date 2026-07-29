@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from codepilot.events import EventBus, StreamEvent
+from codepilot.events import StreamEvent
 from codepilot.session import AgentState, ApprovalRequest, LLMState, Message, SessionState
 
 
@@ -19,7 +19,8 @@ from codepilot.session import AgentState, ApprovalRequest, LLMState, Message, Se
 class RuntimeHandles:
     """封装 Hook 执行期需要访问的运行时基础设施。"""
 
-    event_bus: EventBus
+    event_bus: Any
+    run_ref: Any | None = None
 
 
 @dataclass(slots=True)

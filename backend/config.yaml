@@ -65,6 +65,7 @@ agent:
   max_loop_iterations: 200
   subagent_max_loop_iterations: 200
   subagent_max_depth: 1
+  max_started_agents: 5
 context:
   compression_enabled: true
   model_thresholds:

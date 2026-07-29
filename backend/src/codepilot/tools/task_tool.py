@@ -86,7 +86,8 @@ class TaskTool(BaseTool):
                     parent_bus=context.runtime.event_bus,
                     agent=target_profile.name,
                     parent_call_id=context.tool_call_id,
-                )
+                ),
+                run_ref=context.runtime.run_ref,
             )
             child_session = await self._agent_loop.run_subagent(
                 parent_session=context.session,

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "work_item": "CODE-50",
+  "generated_at": "2026-07-29T07:17:29.123563+00:00",
+  "contains_sensitive_payloads": false,
+  "scenarios": [
+    {
+      "id": "CODE50-CAPACITY-001",
+      "passed": true,
+      "started_agents": 5
+    },
+    {
+      "id": "CODE50-STREAM-001",
+      "passed": true,
+      "queue_limit": 1000
+    }
+  ],
+  "metrics": {
+    "agent_ready_ms": {
+      "samples": 100,
+      "p50": 0.447,
+      "p95": 0.594,
+      "threshold_p95": 2000
+    },
+    "control_event_route_ms": {
+      "samples": 1001,
+      "p50": 0.004,
+      "p95": 0.006,
+      "threshold_p95": 50
+    },
+    "five_idle_agents_peak_rss_delta_bytes": 0,
+    "five_idle_agents_threshold_bytes": 1073741824
+  }
+}
