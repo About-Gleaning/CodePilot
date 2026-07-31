@@ -7,8 +7,9 @@ CodePilot 是一个以 Web 为入口、Gateway 为统一协议层、Agent Runtim
 - 后端：`FastAPI + LiteLLM + SSE + jsonl`
 - 前端：`React + Vite + TypeScript`
 - 单实例只绑定一个 workspace
-- 单实例只允许一个 active session
-- 支持 Web 页面发起任务
+- 最多同时启动 5 个 Agent、执行 5 个交互式 Run
+- 同一 Agent 的不同 Session 与不同 Agent 的 Session 均可并行
+- 支持 Agent Studio 页面配置、启停、聊天、历史和自动化管理
 - 支持 LiteLLM 真实流式输出
 - 支持一个无副作用 demo tool：`echo_tool`
 - 支持 Hook 基础设施与 `PromptPluginHook`
@@ -197,16 +198,13 @@ llm:
 
 ## API 概览
 
-- `POST /api/session/input`
-  统一处理 `user_message / human_reply / stop`
-- `GET /api/session/stream?after_seq=0`
-  SSE 事件流，支持 replay + 实时订阅
-- `GET /api/session/status`
-  当前 workspace 与 session 快照
-- `GET /api/session/replay`
-  从 `session.jsonl` 恢复消息与会话记录
-- `GET /api/config`
-  返回前端初始化所需配置
+- `/api/agents`：Agent 配置、revision、归档和恢复。
+- `/api/agent-runtimes`：多 Agent 运行态、容量和低频控制 SSE。
+- `/api/agents/{agent_id}/sessions`：按 Agent 查询 Session 历史。
+- `/api/agents/{agent_id}/runs`：创建幂等 Run。
+- `/api/agents/{agent_id}/sessions/{session_id}/replay`：恢复消息、事件边界和安全运行态。
+- `/api/agents/{agent_id}/sessions/{session_id}/stream`：当前 Session 的完整 SSE。
+- `/api/session/*`：仅保留给历史客户端的兼容入口，新页面不再调用。
 
 ## 使用说明
 
@@ -220,7 +218,7 @@ llm:
 
 ## 新增 Agent
 
-页面中的“管理 Agent”可以创建、编辑、归档和恢复自定义主 Agent。配置保存为 Markdown，并保留 revision 快照；默认 Provider/Model 在当前阶段仅作为 Agent 默认配置保存，现有会话仍显式选择模型。
+Agent Studio 的“配置”检查器可以创建、编辑、复制、归档和恢复自定义主 Agent。配置保存为 Markdown 并保留 revision 快照；新 Session 默认采用 Agent 的 Provider/Model，也可以在首条消息前显式覆盖。
 
 运行时由 `AgentRuntimeManager` 统一管理，最多可保持 5 个 Agent 启动和 5 个交互式活动 Run；每个 Session 使用独立 SessionRunner，资源 API 按 `agent_id/session_id/run_id` 精确路由。同一 Session 只允许一个活动 Run，workspace 变更 Tool 通过跨进程写入租约串行化。
 

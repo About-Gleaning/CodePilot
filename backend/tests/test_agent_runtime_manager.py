@@ -8,7 +8,7 @@ from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 
 from codepilot.api.session_routes import register_session_routes
-from codepilot.events import EventBus
+from codepilot.events import EventBus, HumanInteractionEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.memory import JsonlSessionMemory
 from codepilot.session.agent_runtime import AgentRuntimeManager, RuntimeConflict, _request_fingerprint
@@ -51,6 +51,9 @@ class FakeBackend:
 
     async def stop_agent(self, agent_id: str) -> None:
         self.stopped.add(agent_id)
+
+    def get_session_snapshot(self, _handle: object) -> dict[str, object]:
+        return {}
 
     async def shutdown(self) -> None:
         return None
@@ -109,6 +112,14 @@ def test_resource_api_enforces_started_capacity_and_cursor_validation(tmp_path: 
     register_session_routes(router, state)
     app.include_router(router)
     with TestClient(app) as client:
+        overview = client.get("/api/agent-runtimes").json()
+        assert overview["capacity"] == {
+            "started_agents": 0,
+            "max_started_agents": 5,
+            "active_runs": 0,
+            "max_active_runs": 1,
+        }
+        assert isinstance(overview["cursor"], str)
         for index in range(5):
             assert client.post(f"/api/agents/agent-{index}/start").status_code == 200
         rejected = client.post("/api/agents/agent-5/start")
@@ -117,6 +128,65 @@ def test_resource_api_enforces_started_capacity_and_cursor_validation(tmp_path: 
         invalid_cursor = client.get("/api/agent-runtimes/stream?cursor=not-a-cursor")
         assert invalid_cursor.status_code == 422
         assert invalid_cursor.json()["detail"]["code"] == "invalid_runtime_cursor"
+
+
+@pytest.mark.asyncio
+async def test_runtime_overview_keeps_archived_agent_with_runtime_state(tmp_path: Path) -> None:
+    provider = FakeProfileProvider()
+    backend = FakeBackend()
+    manager = AgentRuntimeManager(
+        workspace=SimpleNamespace(workspace_dir=tmp_path),
+        config=SimpleNamespace(),
+        event_bus=EventBus(),
+        session_memory=JsonlSessionMemory(tmp_path / "sessions"),
+        profile_provider=provider,
+        backend=backend,  # type: ignore[arg-type]
+        max_started_agents=5,
+    )
+    await manager.start_agent("agent-0")
+    provider.profiles.pop("agent-0")
+    overview = await manager.get_runtime_overview()
+    runtime = next(item for item in overview["runtimes"] if item["agent_id"] == "agent-0")
+    assert runtime["lifecycle_state"] == "RUNNING"
+    assert overview["capacity"]["started_agents"] == 1
+
+
+@pytest.mark.asyncio
+async def test_interaction_changes_publish_safe_control_events(tmp_path: Path) -> None:
+    manager, _ = build_manager(tmp_path)
+    await manager.start_agent("agent-0")
+    run = RunState(
+        ref=RunRef(agent_id="agent-0", session_id="session-0", run_id="run-0", revision_id="revision-0"),
+        client_request_id="request-0",
+        request_fingerprint="fingerprint-0",
+        status=RunStatus.RUNNING,
+        created_at="2026-07-31T00:00:00Z",
+    )
+    manager._runs[("agent-0", "session-0", "run-0")] = run
+    subscription = manager.create_runtime_subscription()
+    await manager.handle_domain_event(
+        HumanInteractionEvent(
+            agent_id="agent-0",
+            session_id="session-0",
+            run_id="run-0",
+            revision_id="revision-0",
+            interaction_id="interaction-0",
+            created_at="2026-07-31T00:00:01Z",
+            data={
+                "kind": "approval",
+                "status": "pending",
+                "request": {"secret": "不能进入聚合流"},
+            },
+        )
+    )
+    event = await subscription.queue.get()
+    assert event.event_type == "interaction_pending"
+    assert event.data == {
+        "interaction_id": "interaction-0",
+        "kind": "approval",
+        "status": "pending",
+    }
+    assert manager.get_agent_state("agent-0").waiting_human_count == 1
 
 
 def test_request_fingerprint_depends_only_on_client_intent() -> None:

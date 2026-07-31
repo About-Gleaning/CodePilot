@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "work_item": "CODE-52",
+  "environment": "local-development",
+  "verification": {
+    "backend_pytest": {
+      "passed": true,
+      "passed_count": 291,
+      "skipped_count": 1
+    },
+    "frontend_vitest": {
+      "passed": true,
+      "test_file_count": 1,
+      "passed_count": 3
+    },
+    "frontend_production_build": {
+      "passed": true,
+      "javascript_bundle_kib": 362.03,
+      "javascript_gzip_kib": 111.72,
+      "css_bundle_kib": 80.79,
+      "css_gzip_kib": 15.27
+    }
+  },
+  "browser_validation": {
+    "viewports": [
+      "1440x900",
+      "1280x800",
+      "390x844"
+    ],
+    "desktop_three_column_layout": true,
+    "desktop_horizontal_overflow": false,
+    "mobile_agent_drawer": true,
+    "mobile_inspector_drawer": true,
+    "mobile_config_tab_persists": true,
+    "new_agent_form_persists_without_auto_selection": true,
+    "screenshots_committed": false,
+    "screenshot_note": "本地环境包含真实历史摘要，视觉检查完成后未持久化截图，避免把用户数据写入仓库。"
+  },
+  "race_validation": {
+    "strict_mode_single_control_stream": true,
+    "stale_replay_ignored": true,
+    "stale_session_event_ignored": true,
+    "callback_identity_does_not_reload_replay": true,
+    "session_list_is_bound_to_agent": true
+  },
+  "contract_validation": {
+    "agent_list_has_default_llm": true,
+    "agent_list_has_prompt": false,
+    "runtime_overview_has_capacity": true,
+    "runtime_overview_has_cursor": true,
+    "archived_runtime_remains_visible": true,
+    "interaction_control_event_is_redacted": true,
+    "legacy_session_api_used_by_agent_studio": false
+  },
+  "sensitive_data_scan": {
+    "prompt_body": false,
+    "attachment_base64": false,
+    "authorization": false,
+    "secret": false,
+    "absolute_user_path": false
+  },
+  "plane_sync": {
+    "performed": false,
+    "reason": "Plane 写入返回 HTTP 402，负责人授权本地 bypass 开发轮次。"
+  }
+}

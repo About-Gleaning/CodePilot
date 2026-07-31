@@ -43,6 +43,8 @@ HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner �
 
 完整 Session SSE 与低频运行态 SSE 必须分离；聚合流不得传 token、Prompt、附件或 Tool 大结果。所有订阅队列固定上限 1000，溢出后要求客户端重连回放，不能阻塞 Agent。Scheduler worker 只构建 Execution Bundle，不得创建 Manager、执行 recover 或写入 `agent-runtimes.json`。
 
+Agent Studio 只能调用资源化 `/api/agents/*` 与 `/api/agent-runtimes*` 接口，不得重新依赖 `/api/session/*` 全局兼容指针。前端选择状态使用 `agent_id + session_id`；fetch、replay 和 SSE 必须用 generation、AbortController 与事件归属校验隔离快速切换。聚合 SSE 全局最多一条，高频 SSE 只为当前查看的 Session 保留一条，事件去重、消息列表和历史 DOM 都必须有固定上限。
+
 Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；自定义 Agent 位于 `storage.codepilot_home/agents/*.md`，例如用户自定义 `life.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。自定义 Agent 不允许覆盖内置 Agent 名称；没有自定义 Agent 时只暴露三个内置 Agent。
 
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。
@@ -71,7 +73,7 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 ## Testing Guidelines
 
-后端使用 `pytest` 与 `pytest-asyncio`，测试文件命名为 `test_*.py`。新增修复应先覆盖可复现行为，再实现代码；涉及异步会话、工具调用、上下文压缩或配置加载时，应补充对应单元测试。前端当前未配置测试框架，至少执行 `pnpm build` 验证类型与打包。
+后端使用 `pytest` 与 `pytest-asyncio`，测试文件命名为 `test_*.py`。新增修复应先覆盖可复现行为，再实现代码；涉及异步会话、工具调用、上下文压缩或配置加载时，应补充对应单元测试。前端使用 Vitest、jsdom、React Testing Library 和受控 MockEventSource；涉及 hooks、请求竞态或 SSE 生命周期的改动必须执行 `pnpm test --run`，并继续执行 `pnpm build` 验证类型与生产打包。
 
 ## Commit & Pull Request Guidelines
 

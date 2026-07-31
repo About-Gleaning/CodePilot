@@ -15,3 +15,7 @@ CODE-50 起，HTTP API 只依赖 `AgentRuntimeManager`。Manager 通过配置服
 Run 状态使用 compare-and-set 写入唯一终态；服务重启、取消、Agent 关闭和 watcher 不得重复发布终态或重复释放容量。最后一条不完整 JSONL 可归档证据后恢复完整前缀，中间损坏必须 fail closed。
 
 workspace 变更 Tool 必须以 RunRef 获取非阻塞跨进程写入租约，并持有到执行终态；subagent 继承父 Run 租约。MCP 每服务最多 5 个并发调用、20 个 pending，请求发出后失败不得自动重放。
+
+CODE-52 起，新页面只使用复数资源 API。Agent 列表可以返回默认 LLM，但不得返回 Prompt；Prompt 只由 Agent 详情接口按需读取。Session replay 必须同时返回 `latest_event_seq` 和安全运行态，客户端从该边界建立 Session SSE。
+
+前端选择状态必须按 `agent_id + session_id` 隔离。异步 replay、Session 列表和 SSE 均需校验 generation 与资源归属；切换查看上下文不得解释为取消 Run。聚合控制流全局只保留一条，Session 高频流只为当前查看的 Session 建立一条。

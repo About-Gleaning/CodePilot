@@ -43,7 +43,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
     legacy = LegacySessionAdapter(app_state)
     @router.get("/agent-runtimes")
     async def get_agent_runtimes() -> JSONResponse:
-        return JSONResponse({"runtimes": [item.model_dump() for item in app_state.agent_runtime.list_agent_states()]})
+        return JSONResponse(await app_state.agent_runtime.get_runtime_overview())
 
     @router.get("/agent-runtimes/stream")
     async def get_agent_runtime_stream(request: Request, cursor: str | None = None) -> StreamingResponse:
@@ -159,7 +159,15 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
     @router.get("/agents/{agent_id}/sessions/{session_id}/replay")
     async def get_agent_session_replay(agent_id: str, session_id: str) -> JSONResponse:
         try:
+            # 先固定已持久化事件边界；其后的事件由 SSE 重放，重复部分由 event_id 去重。
+            latest_event_seq = app_state.event_store.latest_seq(session_id)
             replay = await app_state.agent_runtime.validate_session_owner(agent_id, session_id)
+            replay["latest_event_seq"] = latest_event_seq
+            replay["runtime"] = await app_state.agent_runtime.get_session_runtime_snapshot(
+                agent_id,
+                session_id,
+                replay,
+            )
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
         return JSONResponse(replay)

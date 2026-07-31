@@ -375,12 +375,18 @@ class AgentRuntimeManager:
             )
             self._runtimes[agent_id] = state
         await self._persist_states()
+        await self._publish_control("agent_starting", agent_id=agent_id)
         try:
             await self._backend.start_agent(agent_id)
         except Exception as exc:
             async with self._lock:
                 state.lifecycle_state = AgentLifecycleState.ERROR
                 state.error_code = "agent_start_failed"
+            await self._publish_control(
+                "agent_error",
+                agent_id=agent_id,
+                data={"error_code": "agent_start_failed"},
+            )
             raise RuntimeConflict("agent_start_failed", "Agent 启动失败") from exc
         async with self._lock:
             state.lifecycle_state = AgentLifecycleState.RUNNING
@@ -405,6 +411,7 @@ class AgentRuntimeManager:
             await self._persist_states()
         if already_stopped:
             return state
+        await self._publish_control("agent_stopping", agent_id=agent_id)
         uncertain = False
         try:
             async with asyncio.timeout(10):
@@ -756,6 +763,16 @@ class AgentRuntimeManager:
                     changed_run = run
         if changed_run is not None:
             await self._run_store.append(changed_run)
+        await self._publish_control(
+            "interaction_pending" if event.data.get("status") == "pending" else "interaction_resolved",
+            run=changed_run or self._runs.get((event.agent_id, event.session_id, event.run_id)),
+            agent_id=event.agent_id,
+            data={
+                "interaction_id": event.interaction_id,
+                "kind": kind,
+                "status": "pending" if event.data.get("status") == "pending" else "resolved",
+            },
+        )
 
     async def load_session(self, agent_id: str, session_id: str) -> SessionExecutionHandle:
         _validate_resource_id(session_id, "session_id")
@@ -792,7 +809,107 @@ class AgentRuntimeManager:
 
     def list_agent_states(self) -> list[AgentRuntimeState]:
         profiles = self._profile_provider.list_active_profile_snapshots()
-        return [self._runtimes.get(item.agent_id, AgentRuntimeState(agent_id=item.agent_id)) for item in profiles]
+        active_ids = {item.agent_id for item in profiles}
+        ordered_ids = [item.agent_id for item in profiles]
+        ordered_ids.extend(agent_id for agent_id in self._runtimes if agent_id not in active_ids)
+        return [
+            self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id)).model_copy(deep=True)
+            for agent_id in ordered_ids
+        ]
+
+    async def get_runtime_overview(self) -> dict[str, Any]:
+        """在控制事件边界之后复制快照，客户端可从 cursor 无缝续接变化。"""
+        cursor = self.current_runtime_cursor()
+        profiles = self._profile_provider.list_active_profile_snapshots()
+        async with self._lock:
+            active_ids = {item.agent_id for item in profiles}
+            ordered_ids = [item.agent_id for item in profiles]
+            ordered_ids.extend(agent_id for agent_id in self._runtimes if agent_id not in active_ids)
+            runtimes = [
+                self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id)).model_copy(deep=True)
+                for agent_id in ordered_ids
+            ]
+            capacity = {
+                "started_agents": self._started_count(),
+                "max_started_agents": self._max_started_agents,
+                "active_runs": self._active_run_total,
+                "max_active_runs": self._max_active_runs,
+            }
+        return {
+            "runtimes": [item.model_dump(mode="json") for item in runtimes],
+            "capacity": capacity,
+            "cursor": cursor,
+        }
+
+    async def get_session_runtime_snapshot(
+        self,
+        agent_id: str,
+        session_id: str,
+        replay: dict[str, Any],
+    ) -> dict[str, Any]:
+        """返回页面恢复所需的安全快照，不加载历史 SessionRunner。"""
+        data = ((replay.get("session") or {}).get("data") or {})
+        session_key = (agent_id, session_id)
+        async with self._lock:
+            active_run_id = self._active_sessions.get(session_key)
+            active_run = (
+                self._runs.get((agent_id, session_id, active_run_id))
+                if active_run_id
+                else None
+            )
+            pending = next(
+                (
+                    item.model_copy(deep=True)
+                    for item in self._interactions.values()
+                    if item.ref.agent_id == agent_id
+                    and item.ref.session_id == session_id
+                    and item.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}
+                ),
+                None,
+            )
+            handle = self._sessions.get(session_key)
+        live_snapshot = self._backend.get_session_snapshot(handle.execution) if handle else {}
+        pending_request = (
+            live_snapshot.get("pending_human_request")
+            if pending
+            and live_snapshot.get("pending_human_interaction_id") == pending.ref.interaction_id
+            else None
+        )
+        return {
+            "status": (
+                active_run.status.value
+                if active_run
+                else str(data.get("status") or live_snapshot.get("status") or "IDLE")
+            ),
+            "provider": data.get("provider") or live_snapshot.get("provider"),
+            "model": data.get("model") or live_snapshot.get("model"),
+            "thinking_value": (
+                (data.get("metadata") or {}).get("thinking_value")
+                or live_snapshot.get("thinking_value")
+                if isinstance(data.get("metadata"), dict)
+                else live_snapshot.get("thinking_value")
+            ),
+            "active_run": (
+                {
+                    "run_id": active_run.ref.run_id,
+                    "status": active_run.status.value,
+                    "revision_id": active_run.ref.revision_id,
+                    "started_at": active_run.started_at,
+                }
+                if active_run
+                else None
+            ),
+            "pending_interaction": (
+                {
+                    "interaction_id": pending.ref.interaction_id,
+                    "run_id": pending.ref.run_id,
+                    "kind": pending.kind,
+                    "request": pending_request if isinstance(pending_request, dict) else {},
+                }
+                if pending
+                else None
+            ),
+        }
 
     def list_sessions(self, agent_id: str) -> list[dict[str, Any]]:
         profile = self._record_profile(agent_id)
@@ -918,6 +1035,7 @@ class AgentRuntimeManager:
         *,
         agent_id: str | None = None,
         run: RunState | None = None,
+        data: dict[str, Any] | None = None,
     ) -> None:
         await self._control_bus.publish_stream_event(
             StreamEvent(
@@ -927,7 +1045,13 @@ class AgentRuntimeManager:
                 run_id=run.ref.run_id if run else None,
                 run_seq=run.run_seq if run else 0,
                 created_at=utc_now_iso(),
-                data={"status": run.status.value, "error_code": run.error_code} if run else {},
+                data=(
+                    data
+                    if data is not None
+                    else {"status": run.status.value, "error_code": run.error_code}
+                    if run
+                    else {}
+                ),
             )
         )
 

@@ -325,7 +325,15 @@ class AgentConfigService:
         result = {"agent_id": record.agent_id, "revision_id": record.revision_id, "name": record.name, "source": record.source,
                   "archived": record.archived, "validation_status": record.status,
                   "validation_issues": [{"code": i.code, "field": i.field, "message": i.message} for i in record.issues]}
-        if profile: result.update({"description": profile.description, "readonly": profile.readonly})
+        if profile:
+            result.update({
+                "description": profile.description,
+                "readonly": profile.readonly,
+                # 列表页需要直接展示默认模型，但不能为此提前返回 Prompt。
+                "default_provider": profile.default_provider,
+                "default_model": profile.default_model,
+                "default_thinking_value": profile.default_thinking_value,
+            })
         if detail and profile:
             result.update({"system_prompt": profile.system_prompt, "default_provider": profile.default_provider, "default_model": profile.default_model,
                            "default_thinking_value": profile.default_thinking_value, "tool_names": [x for x in profile.allowed_tools if not x.startswith("mcp:")],

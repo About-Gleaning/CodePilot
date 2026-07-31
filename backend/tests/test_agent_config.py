@@ -65,5 +65,8 @@ def test_agent_routes_hide_prompt_from_list(tmp_path: Path) -> None:
     with TestClient(app) as client:
         created = client.post("/agents", json=_payload()).json()
         listed = client.get("/agents").json()["agents"]
-        assert "system_prompt" not in listed[0]
+        assert all("system_prompt" not in item for item in listed)
+        summary = next(item for item in listed if item["agent_id"] == created["agent_id"])
+        assert summary["default_provider"] == "test"
+        assert summary["default_model"] == "model"
         assert client.get(f"/agents/{created['agent_id']}").json()["system_prompt"] == "请审查代码。"

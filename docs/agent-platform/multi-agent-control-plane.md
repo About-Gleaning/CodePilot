@@ -53,3 +53,9 @@ Session SSE 保留 token、Tool、审批和 subagent 等完整事件。`/api/age
 确定性验证结果见 `multi-agent-control-plane-validation-results.json`。预热 3 轮、正式 20 轮后，Agent ready p95 为 0.594ms，控制事件路由 p95 为 0.006ms；5 个空闲 Agent 未推动进程峰值 RSS 上升，均低于门槛。这些数据不包含真实 LLM 网络延迟。
 
 运行态文件、事件和验证结果不保存 Prompt、附件 base64、Authorization、密钥或完整 Tool 大结果。
+
+## Agent Studio 消费契约
+
+CODE-52 的 `/api/agent-runtimes` 同时返回运行态、容量和不透明 cursor。结果是活动配置 Agent 与已有运行态 Agent 的并集，因此已归档但仍在收尾的 Agent 仍可查询和关闭。
+
+`interaction_pending/resolved` 与 Agent/Run 生命周期变化会发布低频控制事件；聚合流不包含人工交互正文。Session 详情通过资源化 replay 单独返回当前 pending interaction，并以 `latest_event_seq` 建立 replay/SSE 一致性边界。
