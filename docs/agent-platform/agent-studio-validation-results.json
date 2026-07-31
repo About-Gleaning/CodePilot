@@ -10,15 +10,15 @@
     },
     "frontend_vitest": {
       "passed": true,
-      "test_file_count": 1,
-      "passed_count": 3
+      "test_file_count": 2,
+      "passed_count": 6
     },
     "frontend_production_build": {
       "passed": true,
       "javascript_bundle_kib": 362.03,
       "javascript_gzip_kib": 111.72,
-      "css_bundle_kib": 80.79,
-      "css_gzip_kib": 15.27
+      "css_bundle_kib": 80.94,
+      "css_gzip_kib": 15.31
     }
   },
   "browser_validation": {
@@ -33,6 +33,12 @@
     "mobile_inspector_drawer": true,
     "mobile_config_tab_persists": true,
     "new_agent_form_persists_without_auto_selection": true,
+    "composer_regression_viewport": "1280x720",
+    "composer_bottom_px": 702,
+    "message_viewport_height_px": 427,
+    "message_scroll_height_px": 16537,
+    "composer_visible_with_long_session": true,
+    "message_scroll_isolated_from_composer": true,
     "screenshots_committed": false,
     "screenshot_note": "本地环境包含真实历史摘要，视觉检查完成后未持久化截图，避免把用户数据写入仓库。"
   },
