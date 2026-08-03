@@ -14,9 +14,11 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from dotenv import load_dotenv
 
 from codepilot.api import build_api_router
+from codepilot.api.security import LocalAccessMiddleware
 from codepilot.config import AppSettings, WorkspaceState, build_workspace_id, load_settings
 from codepilot.events import EventBus
 from codepilot.hooks import HookManager
@@ -31,6 +33,7 @@ from codepilot.session import SessionRunner
 from codepilot.session.agent_runtime import AgentRuntimeManager
 from codepilot.session.agent_config import AgentConfigService
 from codepilot.tools import ScheduleManageTool, ToolRegistry
+from codepilot.tools import McpClientManager
 
 
 @dataclass(slots=True)
@@ -51,6 +54,7 @@ class AppContext:
     schedule_store: ScheduleStore
     schedule_runner: ScheduleRunner
     agent_config_service: AgentConfigService
+    mcp_manager: McpClientManager
 
 
 def create_app() -> FastAPI:
@@ -123,6 +127,7 @@ def create_app() -> FastAPI:
         schedule_store=schedule_store,
         schedule_runner=schedule_runner,
         agent_config_service=agent_config_service,
+        mcp_manager=runtime.mcp_manager,
     )
 
     @asynccontextmanager
@@ -139,9 +144,15 @@ def create_app() -> FastAPI:
             await runtime.shutdown()
 
     app = FastAPI(title="CodePilot", version="0.1.0", lifespan=lifespan)
+    app.add_middleware(LocalAccessMiddleware)
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "[::1]"],
+    )
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=[],
+        allow_origin_regex=r"^http://(?:localhost|127\.0\.0\.1|\[::1\])(?::\d{1,5})?$",
         allow_methods=["*"],
         allow_headers=["*"],
     )

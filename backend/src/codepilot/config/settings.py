@@ -405,6 +405,12 @@ def load_settings(
     settings = AppSettings()
     loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     merged = _merge_dict(settings.model_dump(), loaded)
+    source_env = environ or os.environ
+    codepilot_home = source_env.get("CODEPILOT_HOME")
+    if codepilot_home:
+        if "\x00" in codepilot_home:
+            raise ValueError("CODEPILOT_HOME 包含非法字符")
+        merged["storage"] = {**merged.get("storage", {}), "codepilot_home": codepilot_home}
     resolved_settings = AppSettings.model_validate(merged)
-    runtime = build_llm_runtime_settings(resolved_settings.llm, environ=environ)
+    runtime = build_llm_runtime_settings(resolved_settings.llm, environ=source_env)
     return resolved_settings.model_copy(update={"llm_runtime": runtime})

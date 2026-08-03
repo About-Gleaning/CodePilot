@@ -19,3 +19,7 @@ workspace 变更 Tool 必须以 RunRef 获取非阻塞跨进程写入租约，�
 CODE-52 起，新页面只使用复数资源 API。Agent 列表可以返回默认 LLM，但不得返回 Prompt；Prompt 只由 Agent 详情接口按需读取。Session replay 必须同时返回 `latest_event_seq` 和安全运行态，客户端从该边界建立 Session SSE。
 
 前端选择状态必须按 `agent_id + session_id` 隔离。异步 replay、Session 列表和 SSE 均需校验 generation 与资源归属；切换查看上下文不得解释为取消 Run。聚合控制流全局只保留一条，Session 高频流只为当前查看的 Session 建立一条。
+
+CODE-53 的源码发布边界固定为本机单用户。HTTP 只接受回环 Client、Host 和 Origin；配置、replay 与附件响应禁止缓存。`live` 只反映进程装配，`ready` 必须同时满足运行时恢复完整、状态存储可写和至少一个 Provider 可用，MCP 降级不得泄露连接信息。
+
+请求进入 Runtime 前必须完成正文、附件、文件名和人工交互字段的大小校验。LLM 请求日志只能记录安全摘要，所有日志与验证结果必须递归清除认证信息、图片 data URL 和绝对用户目录。源码发布门禁的确定性测试、真实 Provider、依赖审计和敏感信息扫描任一阻塞都不得标记为通过。

@@ -109,6 +109,8 @@ pnpm dev
 
 如果脚本提示缺少 `uv` 或 `pnpm`，请先完成对应工具安装与依赖初始化。后端启动时会自动加载 `backend/.env`，因此不需要额外执行 `export`。
 
+当前源码发布只支持本机单用户访问。后端和开发脚本仅允许监听回环地址，不支持局域网或公网暴露；远程访问、登录和反向代理属于后续独立安全范围。
+
 ## LiteLLM 配置
 
 在 `backend/.env` 中配置对应 Provider 所需的密钥。当前内置支持 `openai`、`qwen` 与 `deepseek`：
@@ -198,6 +200,8 @@ llm:
 
 ## API 概览
 
+- `/api/health/live`：进程存活探针。
+- `/api/health/ready`：运行时恢复、存储和 Provider 就绪探针。
 - `/api/agents`：Agent 配置、revision、归档和恢复。
 - `/api/agent-runtimes`：多 Agent 运行态、容量和低频控制 SSE。
 - `/api/agents/{agent_id}/sessions`：按 Agent 查询 Session 历史。
@@ -205,6 +209,23 @@ llm:
 - `/api/agents/{agent_id}/sessions/{session_id}/replay`：恢复消息、事件边界和安全运行态。
 - `/api/agents/{agent_id}/sessions/{session_id}/stream`：当前 Session 的完整 SSE。
 - `/api/session/*`：仅保留给历史客户端的兼容入口，新页面不再调用。
+
+## 源码发布验证
+
+发布前先备份 `CODEPILOT_HOME`，使用 frozen lock 安装依赖，然后运行：
+
+```bash
+cd backend
+uv run python scripts/validate_agent_platform_release.py \
+  --mode all \
+  --live-provider deepseek \
+  --live-model deepseek-v4-flash \
+  --output ../docs/agent-platform/release-validation-results.json
+```
+
+该命令覆盖后端与前端测试、并发和恢复压力、本地 MCP 协议、真实 DeepSeek、生产依赖漏洞审计及敏感信息扫描。任一硬门槛失败或审计服务不可用都会以非零状态退出。启动后应确认 `/api/health/live` 与 `/api/health/ready` 均返回 200。
+
+当前没有数据库迁移，旧 Session 与 Agent Markdown 保持兼容。回滚时停止服务、切回上一 Git 提交并恢复 `CODEPILOT_HOME` 备份；中断 Run 只会取消，不会重放副作用。
 
 ## 使用说明
 

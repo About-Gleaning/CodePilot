@@ -10,6 +10,8 @@ from typing import Any
 SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_ATTACHMENTS_PER_MESSAGE = 4
+# base64 最坏约为原始字节的 4/3，并为 data URL 前缀保留少量空间。
+MAX_IMAGE_ATTACHMENT_BASE64_CHARS = ((MAX_IMAGE_ATTACHMENT_BYTES + 2) // 3) * 4 + 128
 
 
 class AttachmentError(ValueError):

@@ -5,6 +5,7 @@
   "iterations": {
     "warmup": 3,
     "measured": 20,
+    "active_runs": 5,
     "events_per_run": 100
   },
   "scenarios": {
@@ -28,27 +29,21 @@
   },
   "metrics_ms": {
     "event_persist_route_per_event": {
-      "p50": 0.008,
-      "p95": 0.008
+      "p50": 0.007,
+      "p95": 0.013
     },
     "workspace_lease_acquire": {
-      "p50": 0.125,
-      "p95": 0.206
+      "p50": 0.13,
+      "p95": 0.205
     },
     "workspace_lease_reject": {
-      "p50": 0.035,
-      "p95": 0.081
+      "p50": 0.036,
+      "p95": 0.086
     }
   },
   "verification": {
-    "backend_pytest": {
-      "passed": true,
-      "passed_count": 289,
-      "skipped_count": 1
-    },
-    "frontend_build": {
-      "passed": true
-    },
+    "backend_pytest": "run_by_release_gate",
+    "frontend_build": "run_by_release_gate",
     "real_llm_network": "not_measured",
     "real_mcp_network": "not_measured"
   },

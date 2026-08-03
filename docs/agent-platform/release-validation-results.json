@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "work_item": "CODE-53",
+  "environment": "isolated-local",
+  "deterministic": {
+    "uv_lock": {
+      "passed": true
+    },
+    "backend_pytest": {
+      "passed": true,
+      "passed_count": 298,
+      "skipped_count": 1
+    },
+    "frontend_test": {
+      "passed": true
+    },
+    "frontend_build": {
+      "passed": true
+    },
+    "mcp_protocol": {
+      "passed": true,
+      "passed_count": 14,
+      "skipped_count": 0
+    },
+    "parallel_runtime": {
+      "passed": true,
+      "metrics_ms": {
+        "event_persist_route_per_event": {
+          "p50": 0.007,
+          "p95": 0.013
+        },
+        "workspace_lease_acquire": {
+          "p50": 0.13,
+          "p95": 0.205
+        },
+        "workspace_lease_reject": {
+          "p50": 0.036,
+          "p95": 0.086
+        }
+      }
+    }
+  },
+  "dependency_audits": {
+    "python": {
+      "passed": false,
+      "vulnerability_count": null,
+      "error_code": "audit_blocked"
+    },
+    "frontend": {
+      "passed": true,
+      "high": 0,
+      "critical": 0
+    }
+  },
+  "live_deepseek": {
+    "passed": true,
+    "provider": "deepseek",
+    "model": "deepseek-v4-flash",
+    "warmup_calls": 1,
+    "measured_calls": 15,
+    "cancel_calls": 1,
+    "first_event_ms": {
+      "p50": 650.098,
+      "p95": 711.335
+    },
+    "completion_ms": {
+      "p50": 956.498,
+      "p95": 1205.527
+    },
+    "cancel_ms": 0.373,
+    "zero_cross_run_routing": true,
+    "marker_match_count": 15
+  },
+  "external_mcp": {
+    "status": "not_configured"
+  },
+  "local_http_smoke": {
+    "passed": true,
+    "live_status": 200,
+    "ready_status": 200,
+    "hostile_origin_status": 403,
+    "non_loopback_bind_rejected": true
+  },
+  "sensitive_data_scan": {
+    "passed": true,
+    "finding_codes": []
+  },
+  "browser_acceptance": {
+    "passed": false,
+    "status": "blocked_by_browser_security_policy",
+    "persisted_screenshots": false
+  },
+  "passed": false
+}

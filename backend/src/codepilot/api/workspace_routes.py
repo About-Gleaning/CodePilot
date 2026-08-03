@@ -18,7 +18,7 @@ def register_workspace_routes(router: APIRouter, app_state: Any) -> None:
     async def get_config() -> JSONResponse:
         settings = app_state.settings
         providers = [{"provider": item.provider, "label": item.label, "models": item.models, "model_capabilities": {model: {"thinking": config.thinking.model_dump() if config.thinking else None} for model, config in item.model_settings.items()}} for item in settings.llm_runtime.activated_providers.values()]
-        return JSONResponse({"workspace_id": app_state.workspace.workspace_id, "workspace_path": str(app_state.workspace.workspace_path), "codepilot_home": str(app_state.workspace.codepilot_home), "activated_providers": providers, "agents": [name for name, profile in app_state.agent_profiles.items() if getattr(profile, "kind", "agent") == "agent"], "skills": app_state.skill_registry.list_briefs() if hasattr(app_state, "skill_registry") else [], "sse": settings.sse.model_dump()})
+        return JSONResponse({"workspace_id": app_state.workspace.workspace_id, "activated_providers": providers, "agents": [name for name, profile in app_state.agent_profiles.items() if getattr(profile, "kind", "agent") == "agent"], "skills": app_state.skill_registry.list_briefs() if hasattr(app_state, "skill_registry") else [], "sse": settings.sse.model_dump()})
 
     @router.get("/workspace/files")
     async def get_workspace_files(q: str = "", limit: int = Query(default=40, ge=1, le=80)) -> JSONResponse:

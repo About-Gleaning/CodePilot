@@ -57,7 +57,7 @@ llm:
       litellm_model_prefix: "openai/"
   max_tokens: 4096
   stream: true
-  log_requests: true
+  log_requests: false
   title_provider: "deepseek"
   title_model: "deepseek-v4-flash"
 agent:
@@ -87,7 +87,7 @@ tools:
   default_requires_approval: false
   default_error_policy: "return_tool_result"
   bash:
-    approval_mode: "none"
+    approval_mode: "all"
     allowlist: []
     blacklist: []
     readonly_allowlist:

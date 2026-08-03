@@ -13,6 +13,14 @@ FRONTEND_PORT=5173
 BACKEND_GRACEFUL_SHUTDOWN_SECONDS=5
 DEV_HOST="${CODEPILOT_HOST:-127.0.0.1}"
 
+case "$DEV_HOST" in
+  127.0.0.1|localhost|::1) ;;
+  *)
+    echo "错误: CodePilot 首版仅允许绑定本机回环地址。"
+    exit 1
+    ;;
+esac
+
 BACKEND_CMD=(
   uv run uvicorn codepilot.main:app
   --app-dir src

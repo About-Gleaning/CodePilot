@@ -297,9 +297,12 @@ class AgentRuntimeManager:
         self._control_bus = EventBus()
         self._control_bus.subscribe_stream(self._control_store.append)
         self._recovery_error: str | None = None
+        self._recovered = False
 
     async def recover(self) -> None:
         """恢复期望启动状态与幂等索引，不重放任何旧副作用。"""
+        # lifespan 完成前不会接收请求；该标记表示恢复流程已经被执行过。
+        self._recovered = True
         try:
             payload, recovered = await asyncio.gather(self._state_store.read(), self._run_store.recover())
             await self._control_store.recover()
@@ -803,6 +806,15 @@ class AgentRuntimeManager:
     def get_agent_state(self, agent_id: str) -> AgentRuntimeState:
         self._record(agent_id)
         return self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id))
+
+    def readiness_snapshot(self) -> dict[str, Any]:
+        """返回不包含内部句柄或异常正文的只读就绪投影。"""
+        return {
+            "recovered": self._recovered,
+            "error_code": self._recovery_error,
+            "active_run_count": self._active_run_total,
+            "started_agent_count": self._started_count(),
+        }
 
     def get_run_state(self, ref: RunRef) -> RunState:
         return self._require_run(ref)

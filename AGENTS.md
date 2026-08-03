@@ -88,3 +88,9 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 ## Security & Configuration Tips
 
 `backend/config.yaml` 是可提交的项目配置，用于维护服务端口、模型清单和工具策略；真实 `backend/.env`、API Key、会话 jsonl、日志和本地 workspace 数据不得提交。处理文件工具、workspace 路径和 LLM 输入时，注意路径越权、敏感信息泄露和非预期写入风险。
+
+源码发布仅支持本机单用户回环访问。后端、开发脚本、Host 与 CORS 都不得放宽到非回环地址；配置、Session replay 和附件响应必须使用 `no-store`。健康探针只能返回稳定组件状态和计数，不得返回路径、Agent 配置、MCP 地址或底层异常。
+
+用户正文、附件编码、文件名、审批备注、Question 回答和 metadata 必须在进入 Runtime 前执行有限长度校验。LLM 请求日志默认关闭；开启后也只能记录 Provider、Model、数量和耗时摘要。日志与发布结果必须递归脱敏认证信息、图片 data URL 和绝对用户目录。
+
+发布前必须执行 CODE-53 一键源码门禁。确定性并发、真实 Provider、本地 MCP、依赖漏洞审计和敏感信息扫描任一失败或外部审计不可用，都不得声明发布通过；结果文件不得保存 Prompt、模型输出、请求 ID 或真实用户数据。

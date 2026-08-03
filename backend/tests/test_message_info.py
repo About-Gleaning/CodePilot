@@ -681,11 +681,13 @@ def test_litellm_complete_text_logs_redacted_request(monkeypatch: pytest.MonkeyP
     assert captured_kwargs["api_key"] == "sk-qwen"
     assert logger.records[0]["event"] == "llm api request"
     assert logger.records[0]["endpoint"] == "complete_text"
-    logged_request = logger.records[0]["request"]
-    assert isinstance(logged_request, dict)
-    assert logged_request["api_key"] == "***REDACTED***"
-    assert logged_request["api_base"] == "https://qwen.example.com/v1"
-    assert logged_request["messages"] == [{"role": "user", "content": "hello"}]
+    logged_request = logger.records[0]
+    assert logged_request["model"] == "openai/qwen3.5-flash"
+    assert logged_request["message_count"] == 1
+    assert logged_request["tool_count"] == 0
+    assert "request" not in logged_request
+    assert "hello" not in str(logged_request)
+    assert "sk-qwen" not in str(logged_request)
 
 
 def test_litellm_provider_kwargs_support_deepseek_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

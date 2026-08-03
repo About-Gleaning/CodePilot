@@ -33,7 +33,7 @@ async def _measure() -> dict[str, object]:
     for _ in range(20):
         started = time.perf_counter()
         sequences = await _event_round()
-        event_samples.append((time.perf_counter() - started) * 1000 / len(sequences))
+        event_samples.append((time.perf_counter() - started) * 1000 / sum(len(items) for items in sequences.values()))
 
     with tempfile.TemporaryDirectory(prefix="codepilot-validation-") as raw:
         root = Path(raw)
@@ -56,7 +56,7 @@ async def _measure() -> dict[str, object]:
         "schema_version": 1,
         "work_item": "CODE-51",
         "environment": "deterministic-local",
-        "iterations": {"warmup": 3, "measured": 20, "events_per_run": 100},
+        "iterations": {"warmup": 3, "measured": 20, "active_runs": 5, "events_per_run": 100},
         "scenarios": {
             "event_ordering": {
                 "passed": True,
@@ -82,8 +82,8 @@ async def _measure() -> dict[str, object]:
             "workspace_lease_reject": _summary(lease_reject_samples),
         },
         "verification": {
-            "backend_pytest": {"passed": True, "passed_count": 289, "skipped_count": 1},
-            "frontend_build": {"passed": True},
+            "backend_pytest": "run_by_release_gate",
+            "frontend_build": "run_by_release_gate",
             "real_llm_network": "not_measured",
             "real_mcp_network": "not_measured",
         },
@@ -97,18 +97,28 @@ async def _measure() -> dict[str, object]:
     }
 
 
-async def _event_round() -> list[int]:
+async def _event_round() -> dict[str, list[int]]:
     bus = EventBus()
-    recorded: list[int] = []
+    recorded: dict[str, list[int]] = {f"run-{index}": [] for index in range(5)}
 
     async def persist(event: StreamEvent) -> None:
-        recorded.append(event.run_seq)
+        if event.run_id not in recorded:
+            raise RuntimeError("事件路由到未知 Run")
+        recorded[event.run_id].append(event.run_seq)
 
     bus.subscribe_stream(persist)
-    scope = RunEventScope(
-        bus,
-        RunRef(agent_id="agent", session_id="session", run_id="run", revision_id="revision"),
-    )
+    scopes = [
+        RunEventScope(
+            bus,
+            RunRef(
+                agent_id=f"agent-{index}",
+                session_id=f"session-{index}",
+                run_id=f"run-{index}",
+                revision_id="revision",
+            ),
+        )
+        for index in range(5)
+    ]
     await asyncio.gather(
         *(
             scope.publish_stream_event(
@@ -118,11 +128,12 @@ async def _event_round() -> list[int]:
                     data={"index": index},
                 )
             )
+            for scope in scopes
             for index in range(100)
         )
     )
-    if recorded != list(range(1, 101)):
-        raise RuntimeError("Run 事件序号不连续")
+    if any(items != list(range(1, 101)) for items in recorded.values()):
+        raise RuntimeError("Run 事件序号不连续或发生串线")
     return recorded
 
 

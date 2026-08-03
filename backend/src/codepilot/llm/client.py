@@ -18,7 +18,6 @@ from codepilot.session.message import AssistantMessageTokens, MessageTokenCache
 from codepilot.utils import utc_now_iso
 
 TOOL_RESULT_PLACEHOLDER = "[Old tool result content cleared]"
-_SENSITIVE_KEYS = {"api_key", "token", "password", "authorization", "cookie", "secret"}
 
 
 @dataclass(slots=True)
@@ -244,23 +243,17 @@ class LiteLLMClient:
     def _log_request_if_enabled(self, *, endpoint: str, request: dict[str, Any]) -> None:
         if not self._log_requests:
             return
-        # 请求体包含用户上下文和供应商参数，日志保留业务字段但必须递归脱敏凭证。
-        self._logger.info("llm api request", endpoint=endpoint, request=self._redact_request(request))
-
-    def _redact_request(self, value: Any) -> Any:
-        if isinstance(value, dict):
-            redacted: dict[str, Any] = {}
-            for key, item in value.items():
-                if key.lower() in _SENSITIVE_KEYS and item is not None:
-                    redacted[key] = "***REDACTED***"
-                    continue
-                redacted[key] = self._redact_request(item)
-            return redacted
-        if isinstance(value, list):
-            return [self._redact_request(item) for item in value]
-        if isinstance(value, str) and value.startswith("data:image/"):
-            return "[image data url redacted]"
-        return value
+        # 诊断日志只记录低基数字段；消息正文和工具 schema 永不进入日志。
+        messages = request.get("messages")
+        tools = request.get("tools")
+        self._logger.info(
+            "llm api request",
+            endpoint=endpoint,
+            model=request.get("model"),
+            message_count=len(messages) if isinstance(messages, list) else 0,
+            tool_count=len(tools) if isinstance(tools, list) else 0,
+            stream=bool(request.get("stream")),
+        )
 
     def _build_provider_kwargs(self, llm_state: LLMState) -> dict[str, Any]:
         kwargs: dict[str, Any] = {}

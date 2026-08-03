@@ -1,3 +1,3 @@
-from .gateway_input import GatewayInput, GatewayInputType
+from .gateway_input import GatewayInput, GatewayInputType, UploadedAttachmentInput
 
-__all__ = ["GatewayInput", "GatewayInputType"]
+__all__ = ["GatewayInput", "GatewayInputType", "UploadedAttachmentInput"]

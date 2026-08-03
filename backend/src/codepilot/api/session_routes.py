@@ -3,16 +3,18 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from codepilot.events import StreamEvent
-from codepilot.gateway import GatewayInput
+from codepilot.gateway import GatewayInput, UploadedAttachmentInput
 from codepilot.gateway import GatewayInputType
+from codepilot.gateway.gateway_input import MAX_USER_CONTENT_CHARS
 from codepilot.session.state import RunRef
 from codepilot.session.agent_runtime import RuntimeConflict
 from codepilot.utils import utc_now_iso
@@ -24,19 +26,19 @@ class LoadSessionRequest(BaseModel):
 
 class StartRunRequest(BaseModel):
     session_id: str | None = None
-    content: str
+    content: str = Field(min_length=1, max_length=MAX_USER_CONTENT_CHARS)
     provider: str | None = None
     model: str | None = None
-    metadata: dict[str, Any] = {}
-    attachments: list[Any] = []
-    client_request_id: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    attachments: list[UploadedAttachmentInput] = Field(default_factory=list, max_length=4)
+    client_request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
 class InteractionReplyRequest(BaseModel):
     type: GatewayInputType
     approved: bool | None = None
     answers: dict[str, Any] | None = None
-    comment: str | None = None
+    comment: str | None = Field(default=None, max_length=2_000)
 
 
 def register_session_routes(router: APIRouter, app_state: Any) -> None:
@@ -170,7 +172,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             )
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
-        return JSONResponse(replay)
+        return JSONResponse(_safe_replay(replay))
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/stream")
     async def get_agent_session_stream(agent_id: str, session_id: str, request: Request, after_seq: int = 0) -> StreamingResponse:
@@ -251,6 +253,63 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
 
 def _to_sse(event: StreamEvent) -> str:
     return f"id: {event.seq}\nevent: {event.event_type}\ndata: {json.dumps(event.model_dump(), ensure_ascii=False)}\n\n"
+
+
+def _safe_replay(replay: dict[str, Any]) -> dict[str, Any]:
+    """只返回 Agent Studio 使用的会话投影，隐藏内部记录和本机路径。"""
+    session = replay.get("session")
+    safe_session: dict[str, Any] | None = None
+    if isinstance(session, dict):
+        data = session.get("data") if isinstance(session.get("data"), dict) else {}
+        safe_data = {
+            key: data.get(key)
+            for key in (
+                "session_id",
+                "agent_id",
+                "agent_name",
+                "title",
+                "provider",
+                "model",
+                "status",
+                "created_at",
+                "updated_at",
+                "source",
+                "schedule_task_id",
+                "schedule_run_id",
+                "schedule_task_name",
+            )
+            if data.get(key) is not None
+        }
+        safe_session = {
+            "record_type": session.get("record_type"),
+            "session_id": session.get("session_id"),
+            "created_at": session.get("created_at"),
+            "data": safe_data,
+        }
+    return {
+        "session": safe_session,
+        "messages": [
+            _redact_local_paths(message)
+            for message in replay.get("messages", [])
+            if isinstance(message, dict)
+        ],
+        "latest_event_seq": int(replay.get("latest_event_seq") or 0),
+        "runtime": _redact_local_paths(replay.get("runtime")) if isinstance(replay.get("runtime"), dict) else {},
+    }
+
+
+def _redact_local_paths(value: Any, *, key: str = "") -> Any:
+    """保留页面所需消息结构，但隐藏运行目录字段和用户主目录。"""
+    if isinstance(value, dict):
+        return {item_key: _redact_local_paths(item, key=str(item_key)) for item_key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_local_paths(item) for item in value]
+    if not isinstance(value, str):
+        return value
+    if key in {"workspace_path", "codepilot_home", "local_path", "cwd", "root"}:
+        return "<LOCAL_PATH>"
+    home = str(Path.home())
+    return value.replace(home, "<USER_HOME>") if home else value
 
 
 def _to_control_sse(event: StreamEvent, cursor: str) -> str:

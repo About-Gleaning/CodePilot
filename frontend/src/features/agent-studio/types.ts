@@ -95,8 +95,6 @@ export type SessionRuntime = {
 export type ReplayResponse = {
   session: { data?: Record<string, unknown> } | null;
   messages: MessageRecord[];
-  records: Array<Record<string, unknown>>;
-  pending_question?: Record<string, unknown> | null;
   latest_event_seq: number;
   runtime: SessionRuntime;
 };
