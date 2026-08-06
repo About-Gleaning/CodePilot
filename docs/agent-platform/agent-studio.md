@@ -8,11 +8,15 @@ Agent Studio 将 Agent 配置、启停、Session 历史、聊天和 Scheduler �
 
 ## 页面结构
 
-桌面使用三栏布局：
+桌面以对话为中心：左侧 Agent 导航默认展开但可收起；会话、配置和自动化检查器按需从右侧展开，避免长期占用对话宽度。
 
 - 左栏：Agent 搜索、活动/归档/异常筛选、运行状态、容量和新建入口。
 - 中栏：当前 Agent/Session、启动、取消当前 Run、关闭 Agent、消息流、人工交互、附件和输入区。
 - 右栏：Session 历史、Agent 配置和 Scheduler 自动化。
+
+视觉层使用独立的 `agent-studio-refined.css`，只覆盖展示令牌和响应式布局，不改变 API、SSE、持久化或状态隔离。当前采用“信号台”设计语言：深色设备栏、黑白工作画布和高对比橙色运行信号；亮色主题保持相同信息层级，不复用旧版米白绿色卡片语言。空 Session 提供本地草稿建议，点击仅填充 Composer，不会自动发送或产生后端请求。
+
+视觉重构必须保持业务 DOM 的可访问名称和交互入口稳定。桌面检查器仍按需展开，900px 以下左右栏转为抽屉；抽屉层级必须高于带 `backdrop-filter` 的遮罩，避免导航内容被整体模糊。动画统一支持 `prefers-reduced-motion`，不以动效传达唯一状态信息。
 
 `/` 与 `/mobile` 复用同一组 hooks 和组件。窄屏仅把左右栏变为抽屉，不维护第二份 Agent、Session 或 Run 状态。
 
@@ -56,6 +60,13 @@ Agent 列表只返回默认 Provider、Model 和思考参数，不返回 Prompt�
 - Session 历史默认只渲染 50 条，每次“加载更多”增加 50 条。
 - 只有当前 Session 消费高频事件，避免后台 Agent token 占用渲染带宽。
 - 运行态 mutation 使用 Agent ID 级同步 guard，重复点击不会发出第二个启停请求。
+
+## C 端体验层验证
+
+- `pnpm test --run`：覆盖 Agent 选择、会话与输入交互、主题以及 hooks 回归。
+- `pnpm build`：通过 TypeScript 检查和 Vite 生产构建。
+- 浏览器视觉检查：覆盖桌面亮色、桌面暗色、右侧检查器、390px 窄屏主界面与移动端 Agent 抽屉。
+- 体验层仅增加本地 UI 状态（侧栏展开与收起、空态草稿填充）；不新增网络请求，空态建议不会自动发送任务。
 
 ## 错误恢复
 

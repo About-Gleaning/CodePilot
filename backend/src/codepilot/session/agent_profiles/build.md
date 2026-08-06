@@ -2,6 +2,8 @@
 name: build
 kind: agent
 description: 自主完成代码开发、修复和验证任务。
+default_provider: deepseek
+default_model: deepseek-v4-pro
 tools:
   - bash_tool
   - read_file

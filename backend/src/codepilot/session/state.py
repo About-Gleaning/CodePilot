@@ -81,6 +81,7 @@ class RunState(BaseModel):
     started_at: str | None = None
     ended_at: str | None = None
     error_code: str | None = None
+    error_summary: str | None = None
     request_fingerprint: str = ""
     provider: str | None = None
     model: str | None = None

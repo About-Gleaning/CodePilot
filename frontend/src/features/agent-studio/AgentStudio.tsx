@@ -1,18 +1,21 @@
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity, Archive, Bot, Brain, CalendarClock, Check, ChevronDown, CircleDot,
-  History, Menu, MessageSquareText, PanelRight, Play, Plus, Radio, RefreshCw,
+  History, Menu, MessageSquareText, PanelLeft, PanelRight, Play, Plus, Radio, RefreshCw,
   Search, Send, Settings2, ShieldCheck, Square, Terminal, X,
 } from 'lucide-react';
 
-import { ApiError } from '../../api/client';
+import { ApiError, apiRequest } from '../../api/client';
 import { AttachmentPicker, AttachmentTray } from '../../components/Attachments';
 import { MessageStream } from '../../components/MessageStream';
 import { ReasoningBlock, TextBlock } from '../../components/MessageContent';
-import type { MessagePart, PendingAttachment, QuestionItem, TokenUsage } from '../../types';
+import { ThemeToggle } from '../../components/ThemeToggle';
+import { useQuestionInteraction } from '../../hooks/useQuestionInteraction';
+import { useTheme } from '../../hooks/useTheme';
+import type { MessagePart, PendingAttachment, TokenUsage } from '../../types';
 import { AgentConfigPanel } from './AgentConfigPanel';
 import { AutomationPanel } from './AutomationPanel';
-import type { AgentRuntime, AgentSummary, PendingInteraction } from './types';
+import type { AgentRuntime, AgentSummary, PendingInteraction, ProviderConfig } from './types';
 import { useAgentCatalog } from './useAgentCatalog';
 import { isUnknownRequest, useAgentSession } from './useAgentSession';
 
@@ -28,6 +31,18 @@ type Draft = {
   clientRequestId: string | null;
 };
 
+type ComposerAutocomplete = {
+  kind: 'skill' | 'file';
+  trigger: '$' | '@';
+  start: number;
+  end: number;
+  query: string;
+  activeIndex: number;
+};
+
+type ComposerOption = { value: string; label: string; description?: string };
+type SkillOption = { name: string; description: string };
+
 const EMPTY_DRAFT: Draft = {
   content: '',
   attachments: [],
@@ -39,6 +54,7 @@ const EMPTY_DRAFT: Draft = {
 };
 
 export default function AgentStudio() {
+  const { theme, toggleTheme } = useTheme();
   const catalog = useAgentCatalog();
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [creatingAgent, setCreatingAgent] = useState(false);
@@ -46,6 +62,8 @@ export default function AgentStudio() {
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sessions');
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>(null);
+  const [agentRailCollapsed, setAgentRailCollapsed] = useState(false);
+  const [inspectorOpen, setInspectorOpen] = useState(false);
   const [agentSearch, setAgentSearch] = useState('');
   const [agentFilter, setAgentFilter] = useState<'active' | 'archived' | 'error'>('active');
   const [historyLimit, setHistoryLimit] = useState(50);
@@ -53,6 +71,12 @@ export default function AgentStudio() {
   const [sending, setSending] = useState(false);
   const [interactionBusy, setInteractionBusy] = useState(false);
   const [localError, setLocalError] = useState('');
+  const [skills, setSkills] = useState<SkillOption[]>([]);
+  const [providers, setProviders] = useState<ProviderConfig[]>([]);
+  const [composerAutocomplete, setComposerAutocomplete] = useState<ComposerAutocomplete | null>(null);
+  const [fileSuggestions, setFileSuggestions] = useState<ComposerOption[]>([]);
+  const [fileSuggestionsLoading, setFileSuggestionsLoading] = useState(false);
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const draftsRef = useRef(drafts);
 
@@ -104,6 +128,40 @@ export default function AgentStudio() {
     draftsRef.current = drafts;
   }, [drafts]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void apiRequest<{ skills: SkillOption[]; activated_providers: ProviderConfig[] }>('/api/config', { signal: controller.signal })
+      .then((value) => {
+        if (controller.signal.aborted) return;
+        setSkills(value.skills || []);
+        setProviders(value.activated_providers || []);
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setSkills([]);
+        setProviders([]);
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (composerAutocomplete?.kind !== 'file') {
+      setFileSuggestions([]);
+      setFileSuggestionsLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setFileSuggestionsLoading(true);
+      const params = new URLSearchParams({ q: composerAutocomplete.query, limit: '40' });
+      void apiRequest<{ files: Array<{ path: string }> }>(`/api/workspace/files?${params}`, { signal: controller.signal })
+        .then((value) => { if (!controller.signal.aborted) setFileSuggestions(value.files.map((file) => ({ value: file.path, label: file.path }))); })
+        .catch(() => { if (!controller.signal.aborted) setFileSuggestions([]); })
+        .finally(() => { if (!controller.signal.aborted) setFileSuggestionsLoading(false); });
+    }, 120);
+    return () => { controller.abort(); window.clearTimeout(timer); };
+  }, [composerAutocomplete?.kind, composerAutocomplete?.query]);
+
   useEffect(() => () => {
     Object.values(draftsRef.current)
       .flatMap((item) => item.attachments)
@@ -116,6 +174,34 @@ export default function AgentStudio() {
       ...current,
       [selectedAgentId]: { ...(current[selectedAgentId] || EMPTY_DRAFT), ...patch },
     }));
+  };
+
+  const composerOptions = !composerAutocomplete ? [] : composerAutocomplete.kind === 'file'
+    ? fileSuggestions
+    : buildSkillComposerOptions(skills, composerAutocomplete.query);
+  const overrideProvider = providers.find((item) => item.provider === draft.provider) || null;
+  const overrideModels = overrideProvider?.models || [];
+  const overrideThinking = draft.model ? overrideProvider?.model_capabilities?.[draft.model]?.thinking || null : null;
+  const defaultOverrideProvider = providers.find((item) => item.provider === selectedAgent?.default_provider) || providers[0] || null;
+  const defaultOverrideModel = defaultOverrideProvider?.models.includes(selectedAgent?.default_model || '')
+    ? selectedAgent?.default_model || ''
+    : '';
+
+  const updateComposerAutocomplete = (value: string, caret: number | null) => {
+    setComposerAutocomplete(detectComposerAutocomplete(value, caret ?? value.length));
+  };
+
+  const pickComposerOption = (option: ComposerOption) => {
+    if (!composerAutocomplete) return;
+    const replacement = `${composerAutocomplete.trigger}${option.value} `;
+    const content = `${draft.content.slice(0, composerAutocomplete.start)}${replacement}${draft.content.slice(composerAutocomplete.end)}`;
+    const nextCaret = composerAutocomplete.start + replacement.length;
+    updateDraft({ content, clientRequestId: null });
+    setComposerAutocomplete(null);
+    window.requestAnimationFrame(() => {
+      composerRef.current?.focus();
+      composerRef.current?.setSelectionRange(nextCaret, nextCaret);
+    });
   };
 
   const selectAgent = (agentId: string) => {
@@ -141,6 +227,11 @@ export default function AgentStudio() {
     setMobilePanel(null);
   };
 
+  const startSuggestedTask = (content: string) => {
+    updateDraft({ content, clientRequestId: null });
+    window.requestAnimationFrame(() => composerRef.current?.focus());
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (!selectedAgent || !selectedRuntime || sending || !draft.content.trim()) return;
@@ -158,7 +249,7 @@ export default function AgentStudio() {
     setLocalError('');
     try {
       await session.send({
-        content: draft.content.trim(),
+        content: translateSkillShortcuts(draft.content.trim(), skills),
         attachments: draft.attachments,
         provider: draft.overrideModel ? draft.provider : undefined,
         model: draft.overrideModel ? draft.model : undefined,
@@ -223,8 +314,7 @@ export default function AgentStudio() {
   });
 
   return (
-    <div className="agent-studio-shell">
-      <div className="studio-grain" />
+    <div className={`agent-studio-shell ${agentRailCollapsed ? 'is-agent-rail-collapsed' : ''} ${inspectorOpen ? 'is-inspector-open' : ''}`}>
       {runtimeRecoveryBlocked ? (
         <div className="global-runtime-banner">
           <Radio size={14} />
@@ -234,14 +324,20 @@ export default function AgentStudio() {
       <header className="studio-mobile-header">
         <button type="button" onClick={() => setMobilePanel('agents')} aria-label="打开 Agent 导航"><Menu size={18} /></button>
         <div><strong>{selectedAgent?.name || 'Agent Studio'}</strong><span>{selectedSessionId ? shortId(selectedSessionId) : '新会话'}</span></div>
-        <button type="button" onClick={() => setMobilePanel('inspector')} aria-label="打开检查器"><PanelRight size={18} /></button>
+        <div className="studio-mobile-actions">
+          <ThemeToggle theme={theme} onToggle={toggleTheme} />
+          <button type="button" onClick={() => setMobilePanel('inspector')} aria-label="打开检查器"><PanelRight size={18} /></button>
+        </div>
       </header>
 
       <aside className={`studio-agent-rail ${mobilePanel === 'agents' ? 'is-mobile-open' : ''}`}>
-        <div className="studio-brand">
+          <div className="studio-brand">
           <div className="brand-mark"><Terminal size={18} /></div>
           <div><span>CODEPILOT</span><strong>Agent Studio</strong></div>
-          <small>CONTROL / 52</small>
+          <div className="studio-brand-actions">
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+            <button type="button" className="rail-collapse-button" onClick={() => setAgentRailCollapsed((value) => !value)} aria-label={agentRailCollapsed ? '展开 Agent 导航' : '收起 Agent 导航'} title={agentRailCollapsed ? '展开导航' : '收起导航'}><PanelLeft size={16} /></button>
+          </div>
         </div>
         <div className="agent-search">
           <Search size={14} />
@@ -294,6 +390,7 @@ export default function AgentStudio() {
             {selectedAgent?.revision_id ? <code>rev {selectedAgent.revision_id.slice(0, 8)}</code> : null}
           </div>
           <div className="chat-runtime-actions">
+            <button type="button" className="studio-icon-button inspector-toggle" onClick={() => setInspectorOpen((value) => !value)} aria-label={inspectorOpen ? '收起会话与设置面板' : '打开会话与设置面板'} title={inspectorOpen ? '收起侧栏' : '会话与设置'}><PanelRight size={15} /></button>
             {selectedRuntime?.lifecycle_state !== 'RUNNING' ? (
               <button type="button" className="studio-button primary" disabled={!selectedAgent || selectedAgent.archived || catalog.mutating.has(selectedAgent.agent_id)} onClick={() => selectedAgent && void catalog.startAgent(selectedAgent.agent_id).catch(showError(setLocalError))}>
                 <Play size={14} />启动 Agent
@@ -318,12 +415,13 @@ export default function AgentStudio() {
           <span><MessageSquareText size={13} />{selectedSessionId ? shortId(selectedSessionId) : '草稿 / 首条消息后创建 Session'}</span>
           <span><Brain size={13} />{session.runtime?.provider || selectedAgent?.default_provider || '-'} / {session.runtime?.model || selectedAgent?.default_model || '-'}</span>
           <span><Activity size={13} />{runtimeLabel(selectedRuntime)}</span>
+          {session.runtime?.last_run ? <span><CircleDot size={13} />最近 Run：{session.runtime.last_run.status}{session.runtime.last_run.error_code ? ` · ${session.runtime.last_run.error_code}` : ''}</span> : null}
           {session.streamOffline ? <em>Session 流离线，正在重连</em> : null}
         </div>
-        {(catalog.error || session.error || localError) ? (
+        {(catalog.error || session.error || localError || selectedRuntime?.error_code || session.runtime?.last_run?.error_summary) ? (
           <div className="chat-local-error" role="alert">
             <CircleDot size={14} />
-            <span>{localError || session.error || catalog.error}</span>
+            <span>{localError || session.error || selectedRuntime?.error_code || session.runtime?.last_run?.error_summary || catalog.error}</span>
             <button type="button" onClick={() => { setLocalError(''); session.setError(''); void catalog.refresh(); }}><RefreshCw size={13} />刷新</button>
           </div>
         ) : null}
@@ -335,6 +433,7 @@ export default function AgentStudio() {
               liveReasoningDelta={session.view.liveReasoningDelta}
               subagentLiveDeltas={session.view.subagentLiveDeltas}
               subagentLiveReasoningDeltas={session.view.subagentLiveReasoningDeltas}
+              emptyContent={<WelcomePanel agentName={selectedAgent?.name} onChoose={startSuggestedTask} />}
               renderParts={renderMessageParts}
               renderStepFinish={(part, key) => <div className="step-finish" key={key}>步骤完成 · {String(part.reason || 'done')}</div>}
               formatTime={formatTime}
@@ -359,28 +458,76 @@ export default function AgentStudio() {
           />
           {!session.runtime?.pending_interaction ? (
             <>
-              <textarea
-                rows={3}
-                value={draft.content}
-                disabled={!selectedAgent}
-                onChange={(event) => updateDraft({ content: event.target.value, clientRequestId: null })}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter' && !event.shiftKey) {
-                    event.preventDefault();
-                    event.currentTarget.form?.requestSubmit();
-                  }
-                }}
-                placeholder={selectedRuntime?.lifecycle_state === 'RUNNING' ? '输入任务；Enter 发送，Shift+Enter 换行。' : '启动 Agent 后开始对话。'}
-              />
+              <div className="composer-input-shell">
+                <textarea
+                  ref={composerRef}
+                  rows={3}
+                  value={draft.content}
+                  disabled={!selectedAgent}
+                  onChange={(event) => {
+                    updateDraft({ content: event.target.value, clientRequestId: null });
+                    updateComposerAutocomplete(event.target.value, event.target.selectionStart);
+                  }}
+                  onKeyDown={(event) => {
+                    if (composerAutocomplete) {
+                      if (event.key === 'Escape') { event.preventDefault(); setComposerAutocomplete(null); return; }
+                      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+                        event.preventDefault();
+                        if (composerOptions.length) setComposerAutocomplete((current) => current ? {
+                          ...current,
+                          activeIndex: (current.activeIndex + (event.key === 'ArrowDown' ? 1 : -1) + composerOptions.length) % composerOptions.length,
+                        } : current);
+                        return;
+                      }
+                      if (event.key === 'Enter' || event.key === 'Tab') {
+                        event.preventDefault();
+                        const option = composerOptions[Math.min(composerAutocomplete.activeIndex, composerOptions.length - 1)];
+                        if (option) pickComposerOption(option);
+                        return;
+                      }
+                    }
+                    if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  placeholder={selectedRuntime?.lifecycle_state === 'RUNNING' ? '输入任务；Enter 发送，Shift+Enter 换行。' : '启动 Agent 后开始对话。'}
+                />
+                <ComposerAutocompletePanel
+                  state={composerAutocomplete}
+                  options={composerOptions}
+                  loading={fileSuggestionsLoading}
+                  onHover={(activeIndex) => setComposerAutocomplete((current) => current ? { ...current, activeIndex } : null)}
+                  onPick={pickComposerOption}
+                />
+              </div>
               <AttachmentTray attachments={draft.attachments} onRemove={removeAttachment} />
               {!selectedSessionId ? (
                 <div className="model-override">
-                  <label><input type="checkbox" checked={draft.overrideModel} onChange={(event) => updateDraft({ overrideModel: event.target.checked, clientRequestId: null })} />覆盖 Agent 默认模型</label>
+                  <label><input type="checkbox" checked={draft.overrideModel} onChange={(event) => {
+                    const enabled = event.target.checked;
+                    updateDraft({
+                      overrideModel: enabled,
+                      provider: enabled && !draft.provider ? defaultOverrideProvider?.provider || '' : draft.provider,
+                      model: enabled && !draft.model ? defaultOverrideModel : draft.model,
+                      clientRequestId: null,
+                    });
+                  }} />覆盖 Agent 默认模型</label>
                   {draft.overrideModel ? (
                     <div>
-                      <input placeholder="Provider" value={draft.provider} onChange={(event) => updateDraft({ provider: event.target.value, clientRequestId: null })} />
-                      <input placeholder="Model" value={draft.model} onChange={(event) => updateDraft({ model: event.target.value, clientRequestId: null })} />
-                      <input placeholder="Thinking（可选）" value={draft.thinkingValue} onChange={(event) => updateDraft({ thinkingValue: event.target.value, clientRequestId: null })} />
+                      <select aria-label="Provider" value={draft.provider} onChange={(event) => updateDraft({ provider: event.target.value, model: '', thinkingValue: '', clientRequestId: null })}>
+                        <option value="">选择 Provider</option>
+                        {providers.map((item) => <option value={item.provider} key={item.provider}>{item.label}</option>)}
+                      </select>
+                      <select aria-label="Model" value={draft.model} disabled={!overrideProvider} onChange={(event) => updateDraft({ model: event.target.value, thinkingValue: '', clientRequestId: null })}>
+                        <option value="">选择 Model</option>
+                        {overrideModels.map((model) => <option value={model} key={model}>{model}</option>)}
+                      </select>
+                      {overrideThinking ? <select aria-label="Thinking（可选）" value={draft.thinkingValue} onChange={(event) => updateDraft({ thinkingValue: event.target.value, clientRequestId: null })}>
+                        <option value="">使用默认 Thinking</option>
+                        {overrideThinking.allowed_values.map((value) => <option value={value} key={value}>{value}</option>)}
+                      </select> : null}
                     </div>
                   ) : <span>使用 {selectedAgent?.default_provider || '-'} / {selectedAgent?.default_model || '-'}</span>}
                 </div>
@@ -390,7 +537,7 @@ export default function AgentStudio() {
                   <AttachmentPicker onFiles={(files) => void handleFiles(files)} />
                   {draft.clientRequestId ? <small>将复用未确认请求 {draft.clientRequestId.slice(-8)}</small> : null}
                 </div>
-                <button type="submit" className="studio-button primary send-button" disabled={!draft.content.trim() || sending || selectedRuntime?.lifecycle_state !== 'RUNNING' || runtimeRecoveryBlocked}>
+                <button type="submit" className="studio-button primary send-button" disabled={!draft.content.trim() || sending || selectedRuntime?.lifecycle_state !== 'RUNNING' || runtimeRecoveryBlocked || (draft.overrideModel && (!draft.provider || !draft.model))}>
                   <Send size={15} />{sending ? '发送中…' : draft.clientRequestId ? '重试原请求' : '发送'}
                 </button>
               </div>
@@ -469,6 +616,25 @@ export default function AgentStudio() {
   );
 }
 
+function WelcomePanel({ agentName, onChoose }: { agentName?: string; onChoose: (content: string) => void }) {
+  const suggestions = [
+    ['梳理一个想法', '帮我把这个想法拆成清晰的目标、步骤和下一步行动：'],
+    ['分析一份材料', '请阅读并提炼这份材料的重点、风险与待确认事项：'],
+    ['从任务开始', '我想完成下面这件事，请先给出一个可执行方案：'],
+  ] as const;
+
+  return (
+    <section className="studio-welcome" aria-label="开始新任务">
+      <span className="welcome-kicker">CODEPILOT · YOUR THINKING SPACE</span>
+      <h1>{agentName ? `和 ${agentName} 一起，把想法推进一步。` : '把想法推进一步。'}</h1>
+      <p>从一个问题、一份材料，或一个还不完整的念头开始。你始终可以在发送前补充技能、文件和图片。</p>
+      <div className="welcome-suggestions">
+        {suggestions.map(([title, content]) => <button type="button" key={title} onClick={() => onChoose(content)}><strong>{title}</strong><span>{content}</span></button>)}
+      </div>
+    </section>
+  );
+}
+
 function AgentNavigationItem({ agent, runtime, selected, onClick }: {
   agent: AgentSummary;
   runtime: AgentRuntime;
@@ -492,17 +658,53 @@ function AgentNavigationItem({ agent, runtime, selected, onClick }: {
   );
 }
 
+function ComposerAutocompletePanel({ state, options, loading, onHover, onPick }: {
+  state: ComposerAutocomplete | null;
+  options: ComposerOption[];
+  loading: boolean;
+  onHover: (index: number) => void;
+  onPick: (option: ComposerOption) => void;
+}) {
+  if (!state) return null;
+  return (
+    <div className="composer-autocomplete" role="listbox" aria-label={`${state.kind === 'skill' ? 'Skills' : 'Files'} 补全`}>
+      <div className="autocomplete-heading"><span>{state.trigger}</span><strong>{state.kind === 'skill' ? 'Skills' : 'Files'}</strong>{state.query ? <code>{state.query}</code> : null}</div>
+      {loading ? <div className="autocomplete-empty">搜索中...</div> : null}
+      {!loading && !options.length ? <div className="autocomplete-empty">无匹配结果</div> : null}
+      {!loading && options.length ? <div className="autocomplete-list">{options.map((option, index) => (
+        <button type="button" className={`autocomplete-option ${index === state.activeIndex ? 'is-active' : ''}`} key={`${state.kind}:${option.value}`} onMouseEnter={() => onHover(index)} onMouseDown={(event) => { event.preventDefault(); onPick(option); }} role="option" aria-selected={index === state.activeIndex}>
+          <span>{option.label}</span>{option.description ? <small>{option.description}</small> : null}
+        </button>
+      ))}</div> : null}
+    </div>
+  );
+}
+
 function InteractionPanel({ interaction, busy, onReply }: {
   interaction: PendingInteraction | null;
   busy: boolean;
   onReply: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [comment, setComment] = useState('');
-  const [answers, setAnswers] = useState<Record<string, { values: string[]; note: string }>>({});
+  const question = useQuestionInteraction({
+    onSubmit: async (_request, answers) => { await onReply({ type: 'question_reply', answers }); return true; },
+    onDecline: async () => { await onReply({ type: 'question_decline' }); return true; },
+  });
   useEffect(() => {
     setComment('');
-    setAnswers({});
+    question.restorePendingQuestion(interaction?.kind === 'question' ? interaction.request : null);
   }, [interaction?.interaction_id]);
+  useEffect(() => {
+    if (interaction?.kind !== 'question' || !question.questionRequest) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLElement && event.target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      if (event.key === 'ArrowLeft') { event.preventDefault(); question.moveActiveQuestion(-1); }
+      if (event.key === 'ArrowRight') { event.preventDefault(); question.moveActiveQuestion(1); }
+      if (event.key === 'Escape') { event.preventDefault(); void question.handleQuestionDecline(); }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [interaction?.kind, question.questionRequest, question.activeQuestionIndex]);
   if (!interaction) return null;
   if (interaction.kind === 'approval') {
     const reason = String(interaction.request.reason || 'Agent 请求执行需要人工确认的操作。');
@@ -513,31 +715,35 @@ function InteractionPanel({ interaction, busy, onReply }: {
         <p>{reason}</p>
         {Object.keys(action as object).length ? <pre>{JSON.stringify(action, null, 2)}</pre> : null}
         <textarea rows={2} placeholder="审批备注（可选）" value={comment} onChange={(event) => setComment(event.target.value)} />
-        <div><button type="button" className="studio-button danger" disabled={busy} onClick={() => void onReply({ type: 'human_reply', approved: false, comment })}><X size={14} />拒绝</button><button type="button" className="studio-button primary" disabled={busy} onClick={() => void onReply({ type: 'human_reply', approved: true, comment })}><Check size={14} />同意</button></div>
+        <div className="interaction-actions"><button type="button" className="studio-button danger" disabled={busy} onClick={() => void onReply({ type: 'human_reply', approved: false, comment })}><X size={14} />拒绝</button><button type="button" className="studio-button primary" disabled={busy} onClick={() => void onReply({ type: 'human_reply', approved: true, comment })}><Check size={14} />同意</button></div>
       </section>
     );
   }
-  const questions = Array.isArray(interaction.request.questions) ? interaction.request.questions as QuestionItem[] : [];
+  const activeQuestion = question.questionRequest?.questions[question.activeQuestionIndex] || null;
+  const activeAnswer = activeQuestion ? question.questionAnswers[activeQuestion.id] || { values: [], note: '' } : null;
+  if (!question.questionRequest || !activeQuestion || !activeAnswer) {
+    return (
+      <section className="studio-interaction composer-question" aria-label="用户回答" role="alert">
+        <header><MessageSquareText size={16} /><strong>无法展示问题</strong><code>{shortId(interaction.interaction_id)}</code></header>
+        <p>问题数据不完整，请退出本次提问后重新发起。</p>
+        <div className="interaction-actions"><button type="button" className="studio-button danger" disabled={busy} onClick={() => void onReply({ type: 'question_decline' })}><X size={14} />退出</button></div>
+      </section>
+    );
+  }
   return (
-    <section className="studio-interaction">
+    <section className="studio-interaction composer-question" aria-label="用户回答">
       <header><MessageSquareText size={16} /><strong>Agent 正在等待回答</strong><code>{shortId(interaction.interaction_id)}</code></header>
-      {questions.map((question) => (
-        <fieldset key={question.id}>
-          <legend>{question.question}</legend>
-          {question.options.map((option) => {
-            const current = answers[question.id] || { values: [], note: '' };
-            const checked = current.values.includes(option.value);
-            return <label key={option.value}><input type={question.multiple ? 'checkbox' : 'radio'} name={question.id} checked={checked} onChange={(event) => {
-              const values = question.multiple
-                ? event.target.checked ? [...current.values, option.value] : current.values.filter((value) => value !== option.value)
-                : [option.value];
-              setAnswers((items) => ({ ...items, [question.id]: { ...current, values } }));
-            }} />{option.label}</label>;
-          })}
-          <input placeholder="备注（可选）" value={answers[question.id]?.note || ''} onChange={(event) => setAnswers((items) => ({ ...items, [question.id]: { ...(items[question.id] || { values: [] }), note: event.target.value } }))} />
+      <div className="question-flow">
+        <div className="question-progress" aria-label="问题进度">{question.questionRequest.questions.map((item, index) => <button type="button" key={item.id} className={`question-step ${index === question.activeQuestionIndex ? 'is-active' : ''} ${question.questionAnswers[item.id]?.values.length ? 'is-done' : ''}`} aria-current={index === question.activeQuestionIndex ? 'step' : undefined} onClick={() => { question.setActiveQuestionIndex(index); question.setActiveQuestionOptionIndex(0); question.setQuestionError(''); question.focusQuestionOptions(); }}>{index + 1}</button>)}</div>
+        <fieldset className="question-fieldset"><legend><span>第 {question.activeQuestionIndex + 1} / {question.questionRequest.questions.length} 题</span>{activeQuestion.question}</legend>
+          <div className="question-options" ref={question.questionOptionsRef} role={activeQuestion.multiple ? 'group' : 'radiogroup'} aria-label={activeQuestion.question} tabIndex={0} onKeyDown={(event) => question.handleQuestionOptionsKeyDown(event, activeQuestion)}>
+            {activeQuestion.options.map((option, index) => <label className={`question-option ${index === question.activeQuestionOptionIndex ? 'is-keyboard-active' : ''}`} key={option.value}><input type={activeQuestion.multiple ? 'checkbox' : 'radio'} name={activeQuestion.id} checked={activeAnswer.values.includes(option.value)} tabIndex={-1} onChange={(event) => { question.setActiveQuestionOptionIndex(index); question.updateQuestionChoice(activeQuestion, option.value, event.target.checked); }} /><span>{option.label}</span></label>)}
+          </div>
+          <textarea ref={question.questionNoteRef} rows={3} placeholder="备注（可选）" value={activeAnswer.note} onChange={(event) => question.updateQuestionNote(activeQuestion.id, event.target.value)} onKeyDown={question.handleQuestionNoteKeyDown} />
+          {question.questionError ? <p className="question-error">{question.questionError}</p> : null}
         </fieldset>
-      ))}
-      <div><button type="button" className="studio-button danger" disabled={busy} onClick={() => void onReply({ type: 'question_decline' })}><X size={14} />退出</button><button type="button" className="studio-button primary" disabled={busy || questions.some((question) => !(answers[question.id]?.values.length))} onClick={() => void onReply({ type: 'question_reply', answers })}><Check size={14} />提交回答</button></div>
+      </div>
+      <div className="interaction-actions"><button type="button" className="studio-button danger" disabled={busy} onClick={() => void question.handleQuestionDecline()}><X size={14} />退出</button><button type="button" className="studio-button secondary" disabled={busy || question.activeQuestionIndex === 0} onClick={() => question.moveActiveQuestion(-1)}>上一题</button><button type="button" className="studio-button primary" disabled={busy} onClick={() => void question.confirmActiveQuestion()}>{question.activeQuestionIndex === question.questionRequest.questions.length - 1 ? '提交回答' : '下一题'}</button></div>
     </section>
   );
 }
@@ -564,6 +770,28 @@ function renderMessageParts(parts: MessagePart[], isAssistant: boolean): ReactNo
     }
     if (part.type === 'step-start' || part.type === 'step-finish') return null;
     return isAssistant ? <details className="studio-unknown-part" key={key}><summary>{String(part.type || 'unknown')}</summary><pre>{JSON.stringify(part, null, 2)}</pre></details> : <TextBlock key={key} text={JSON.stringify(part, null, 2)} />;
+  });
+}
+
+function detectComposerAutocomplete(value: string, caret: number): ComposerAutocomplete | null {
+  const beforeCaret = value.slice(0, caret);
+  const match = /(^|\s)([$@])([^\s$@]*)$/.exec(beforeCaret);
+  if (!match) return null;
+  const trigger = match[2] as '$' | '@';
+  const query = match[3] || '';
+  return { kind: trigger === '$' ? 'skill' : 'file', trigger, start: caret - query.length - 1, end: caret, query, activeIndex: 0 };
+}
+
+function buildSkillComposerOptions(skills: SkillOption[], query: string): ComposerOption[] {
+  const normalized = query.trim().toLowerCase();
+  return skills.filter((skill) => !normalized || skill.name.toLowerCase().includes(normalized) || skill.description.toLowerCase().includes(normalized)).slice(0, 20).map((skill) => ({ value: skill.name, label: skill.name, description: skill.description }));
+}
+
+function translateSkillShortcuts(value: string, skills: SkillOption[]) {
+  const names = new Map(skills.map((skill) => [skill.name.toLowerCase(), skill.name]));
+  return value.replace(/(^|\s)\$([A-Za-z0-9_.-]+)/g, (raw, prefix: string, name: string) => {
+    const skill = names.get(name.toLowerCase());
+    return skill ? `${prefix}${skill} skill` : raw;
   });
 }
 

@@ -2,6 +2,8 @@
 name: explore
 kind: subagent
 description: 只读文件搜索、代码定位和上下文探查专家。
+default_provider: deepseek
+default_model: deepseek-v4-pro
 tools:
   - bash_tool
   - read_file

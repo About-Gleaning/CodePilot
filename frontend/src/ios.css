@@ -1,0 +1,262 @@
+/* iOS 视觉层：不改变 Agent Studio 的信息架构，只重设层级、材质与交互反馈。 */
+:root,
+:root[data-theme="dark"] {
+  --ios-blue: #0a84ff;
+  --ios-fill: rgba(118, 118, 128, .24);
+  --ios-separator: rgba(84, 84, 88, .65);
+  --ios-grouped: #000;
+  --ios-card: rgba(28, 28, 30, .72);
+  --ios-card-solid: #1c1c1e;
+  --ios-secondary: #98989f;
+  --ios-tertiary: #636366;
+  --ios-label: #f5f5f7;
+  --ios-green: #30d158;
+  --bg: #000;
+  --bg-soft: #0b0b0d;
+  --panel: var(--ios-card-solid);
+  --panel-raised: #2c2c2e;
+  --line: var(--ios-separator);
+  --line-strong: rgba(142, 142, 147, .7);
+  --text: var(--ios-label);
+  --muted: var(--ios-secondary);
+  --quiet: var(--ios-tertiary);
+  --accent: var(--ios-blue);
+  --accent-ink: #fff;
+  --cyan: #64d2ff;
+  --warn: #ffd60a;
+  --danger: #ff453a;
+  --ok: var(--ios-green);
+  --rail-bg: rgba(28, 28, 30, .82);
+  --inspector-bg: rgba(28, 28, 30, .82);
+  --chat-bg: rgba(0, 0, 0, .7);
+  --panel-translucent: rgba(28, 28, 30, .74);
+  --input-bg: rgba(118, 118, 128, .24);
+  --button-bg: rgba(118, 118, 128, .24);
+  --message-bg: var(--ios-card);
+  --message-text: var(--ios-label);
+  --soft-text: #d1d1d6;
+  --grid-line: transparent;
+  --ambient-cyan: rgba(10, 132, 255, .18);
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", sans-serif;
+  --font-mono: "SF Mono", "PingFang SC", monospace;
+}
+
+:root[data-theme="light"] {
+  --ios-blue: #007aff;
+  --ios-fill: rgba(120, 120, 128, .16);
+  --ios-separator: rgba(60, 60, 67, .29);
+  --ios-grouped: #f2f2f7;
+  --ios-card: rgba(255, 255, 255, .78);
+  --ios-card-solid: #fff;
+  --ios-secondary: #6c6c70;
+  --ios-tertiary: #8e8e93;
+  --ios-label: #1c1c1e;
+  --ios-green: #34c759;
+  --bg: var(--ios-grouped);
+  --bg-soft: #e5e5ea;
+  --panel: var(--ios-card-solid);
+  --panel-raised: #fff;
+  --line: var(--ios-separator);
+  --line-strong: rgba(60, 60, 67, .35);
+  --text: var(--ios-label);
+  --muted: var(--ios-secondary);
+  --quiet: var(--ios-tertiary);
+  --accent: var(--ios-blue);
+  --accent-ink: #fff;
+  --cyan: #32ade6;
+  --warn: #ff9f0a;
+  --danger: #ff3b30;
+  --ok: var(--ios-green);
+  --rail-bg: rgba(246, 246, 246, .78);
+  --inspector-bg: rgba(246, 246, 246, .78);
+  --chat-bg: rgba(242, 242, 247, .72);
+  --panel-translucent: rgba(255, 255, 255, .76);
+  --input-bg: var(--ios-fill);
+  --button-bg: var(--ios-fill);
+  --message-bg: var(--ios-card);
+  --message-text: var(--ios-label);
+  --soft-text: #3a3a3c;
+  --grid-line: transparent;
+  --ambient-cyan: rgba(0, 122, 255, .16);
+}
+
+body {
+  background:
+    radial-gradient(ellipse 88% 52% at 50% -8%, var(--ambient-cyan), transparent 64%),
+    var(--bg);
+  font-family: var(--font-ui);
+  letter-spacing: -.01em;
+}
+
+.agent-studio-shell {
+  background:
+    radial-gradient(ellipse 70% 40% at 52% -10%, var(--ambient-cyan), transparent 72%),
+    var(--bg);
+}
+
+.studio-grain { display: none; }
+
+.studio-agent-rail,
+.studio-inspector {
+  border-color: var(--ios-separator);
+  box-shadow: none;
+  backdrop-filter: saturate(180%) blur(28px);
+}
+
+.studio-brand,
+.chat-command-bar,
+.context-strip,
+.inspector-tabs {
+  border-color: var(--ios-separator);
+}
+
+.studio-brand {
+  min-height: 82px;
+  padding: 18px 17px 14px;
+}
+
+.brand-mark {
+  border: 0;
+  border-radius: 12px;
+  color: #fff;
+  background: linear-gradient(145deg, #5ac8fa, var(--ios-blue) 58%, #5856d6);
+  box-shadow: 0 6px 16px rgba(10, 132, 255, .28);
+}
+
+.studio-brand span,
+.eyebrow,
+.studio-brand-actions small,
+.agent-filter button,
+.inspector-tabs button,
+.chat-command-bar .eyebrow {
+  font-family: var(--font-ui);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .02em;
+  text-transform: none;
+}
+
+.studio-brand strong { font-size: 17px; font-weight: 700; letter-spacing: -.03em; }
+.studio-brand-actions small { writing-mode: initial; }
+
+.theme-toggle {
+  min-width: 34px;
+  min-height: 34px;
+  border: 0;
+  border-radius: 50%;
+  color: var(--accent);
+  background: var(--ios-fill);
+  font-family: var(--font-ui);
+}
+
+.theme-toggle:hover { border: 0; background: color-mix(in srgb, var(--ios-fill) 72%, var(--accent)); }
+
+.agent-search,
+.studio-composer,
+.composer-question .question-fieldset,
+.autocomplete-menu {
+  border-color: transparent;
+  border-radius: 12px;
+  background: var(--ios-fill);
+  box-shadow: none;
+}
+
+.agent-search { margin: 14px 12px 8px; padding: 0 12px; }
+.agent-search:focus-within { border-color: transparent; box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent); }
+
+.agent-filter { margin: 0 12px 10px; border: 0; gap: 4px; }
+.agent-filter button,
+.inspector-tabs button { border: 0; border-radius: 8px; color: var(--muted); }
+.agent-filter button.is-active,
+.inspector-tabs button.is-active { border: 0; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+.agent-list { padding: 0 10px 16px; }
+.agent-nav-item { margin: 3px 0; padding: 12px 10px; border: 0; border-radius: 12px; }
+.agent-nav-item:hover { border: 0; background: var(--ios-fill); }
+.agent-nav-item.is-selected { border: 0; background: color-mix(in srgb, var(--accent) 15%, var(--ios-fill)); }
+.agent-nav-item.is-selected::before { display: none; }
+
+.runtime-dot { box-shadow: none; }
+.runtime-dot.state-running { box-shadow: 0 0 0 4px color-mix(in srgb, var(--cyan) 20%, transparent); }
+
+.chat-command-bar {
+  min-height: 64px;
+  padding: 13px 20px;
+  background: var(--panel-translucent);
+  backdrop-filter: saturate(180%) blur(28px);
+}
+
+.chat-command-bar h1,
+.chat-command-bar strong { letter-spacing: -.035em; }
+.command-button,
+.composer-send,
+.studio-interaction button,
+.agent-config-action {
+  border: 0;
+  border-radius: 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-family: var(--font-ui);
+  font-weight: 600;
+}
+
+.command-button:hover,
+.composer-send:hover,
+.studio-interaction button:hover,
+.agent-config-action:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+
+.context-strip { background: color-mix(in srgb, var(--panel-translucent) 84%, transparent); }
+.context-strip span { font-family: var(--font-ui); }
+
+.message-card,
+.event-card,
+.capability-section,
+.inspector-panel > section,
+.session-list > button {
+  border-color: var(--ios-separator);
+  border-radius: 14px;
+  background: var(--ios-card);
+  box-shadow: 0 1px 1px rgba(0, 0, 0, .04);
+}
+
+.message-card.user,
+.message-card.assistant,
+.message-card.subagent-card { background: var(--ios-card); }
+.message-card::before { width: 3px; border-radius: 3px; }
+.role-badge { border: 0; border-radius: 999px; background: var(--ios-fill); font-family: var(--font-ui); }
+.message-live-text,
+.message-text { font-size: 14px; line-height: 1.62; }
+
+.studio-composer {
+  margin-bottom: max(18px, env(safe-area-inset-bottom));
+  padding: 11px 12px;
+  backdrop-filter: saturate(180%) blur(22px);
+}
+
+.studio-composer > textarea { font-family: var(--font-ui); font-size: 15px; }
+.composer-send { color: #fff; background: var(--accent); }
+.composer-send:hover { background: color-mix(in srgb, var(--accent) 82%, #000); }
+.composer-send:disabled { background: var(--ios-fill); color: var(--quiet); }
+
+.studio-inspector { background: var(--inspector-bg); }
+.inspector-tabs { padding: 10px 12px; gap: 4px; }
+.capability-section,
+.inspector-panel > section { margin: 8px 12px; padding: 14px; }
+
+input,
+textarea,
+select { border-color: transparent; background: var(--ios-fill); font-family: var(--font-ui); }
+input:focus,
+textarea:focus,
+select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent); }
+
+.autocomplete-menu { border: 1px solid var(--ios-separator); box-shadow: 0 14px 38px rgba(0, 0, 0, .18); }
+.autocomplete-option { border-color: var(--ios-separator); }
+.autocomplete-option.is-active,
+.autocomplete-option:hover { background: color-mix(in srgb, var(--accent) 13%, transparent); }
+
+@media (max-width: 980px) {
+  .studio-mobile-header { background: var(--rail-bg); backdrop-filter: saturate(180%) blur(28px); }
+  .studio-mobile-header > button,
+  .studio-mobile-actions > button { color: var(--accent); }
+}

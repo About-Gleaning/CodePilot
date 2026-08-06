@@ -16,6 +16,7 @@ type Props = {
   renderStepFinish: (part: MessagePart, key: string) => ReactNode;
   formatTime: (timestamp: number) => string;
   formatTokenUsage: (tokens: TokenUsage) => string;
+  emptyContent?: ReactNode;
 };
 
 export function MessageStream({
@@ -28,12 +29,13 @@ export function MessageStream({
   renderStepFinish,
   formatTime,
   formatTokenUsage,
+  emptyContent,
 }: Props) {
   return (
     <MessageList
       messages={messages}
       hasLiveOutput={Boolean(liveDelta || liveReasoningDelta || Object.keys(subagentLiveDeltas).length || Object.keys(subagentLiveReasoningDeltas).length)}
-      renderEmpty={() => <div className="empty-state"><Sparkles size={20} /><p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p></div>}
+      renderEmpty={() => emptyContent || <div className="empty-state"><Sparkles size={20} /><p>选择 Agent、Provider 与 Model 后，在底部输入任务开始会话。</p></div>}
       renderMessage={(message, index) => <MessageItem key={String(message.info?.id || index)} message={message} index={index} renderParts={renderParts} renderStepFinish={renderStepFinish} formatTime={formatTime} formatTokenUsage={formatTokenUsage} />}
       renderLiveOutput={() => <>
         {liveDelta || liveReasoningDelta ? (

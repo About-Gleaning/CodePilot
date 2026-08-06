@@ -90,6 +90,7 @@ class RunExecutionHandle:
 class RunExecutionResult:
     status: RunStatus
     error_code: str | None = None
+    error_summary: str | None = None
     external_effect_uncertain: bool = False
 
 
@@ -881,6 +882,7 @@ class AgentRuntimeManager:
             )
             handle = self._sessions.get(session_key)
         live_snapshot = self._backend.get_session_snapshot(handle.execution) if handle else {}
+        last_run = _latest_session_run(self._runs.values(), agent_id, session_id)
         pending_request = (
             live_snapshot.get("pending_human_request")
             if pending
@@ -911,6 +913,7 @@ class AgentRuntimeManager:
                 if active_run
                 else None
             ),
+            "last_run": last_run.model_dump(mode="json") if last_run else None,
             "pending_interaction": (
                 {
                     "interaction_id": pending.ref.interaction_id,
@@ -967,6 +970,7 @@ class AgentRuntimeManager:
             result = await self._backend.wait_run(execution)
             status = result.status
             error_code = result.error_code
+            error_summary = result.error_summary
             if result.external_effect_uncertain:
                 state = self._runtimes.get(run.ref.agent_id)
                 if state:
@@ -975,11 +979,13 @@ class AgentRuntimeManager:
         except asyncio.CancelledError:
             status = RunStatus.CANCELLED
             error_code = None
+            error_summary = None
         except Exception:
             status = RunStatus.FAILED
             error_code = "backend_wait_failed"
+            error_summary = "后端在等待本次执行结果时失败。"
         run.run_seq = execution.event_scope.run_seq
-        await self._transition_terminal(run, status, error_code=error_code)
+        await self._transition_terminal(run, status, error_code=error_code, error_summary=error_summary)
 
     async def _transition_terminal(
         self,
@@ -987,6 +993,7 @@ class AgentRuntimeManager:
         status: RunStatus,
         *,
         error_code: str | None = None,
+        error_summary: str | None = None,
     ) -> RunState:
         key = _run_key(run.ref)
         run_lock = self._run_locks.setdefault(key, asyncio.Lock())
@@ -999,6 +1006,7 @@ class AgentRuntimeManager:
                     status = RunStatus.CANCELLED
                 run.status = status
                 run.error_code = error_code
+                run.error_summary = error_summary or _run_error_summary(error_code)
                 run.ended_at = utc_now_iso()
                 state = self._runtimes.get(run.ref.agent_id)
                 if state:
@@ -1230,3 +1238,19 @@ def _string_or_none(value: object) -> str | None:
 
 def _run_key(ref: RunRef) -> tuple[str, str, str]:
     return ref.agent_id, ref.session_id, ref.run_id
+
+
+def _latest_session_run(runs: Any, agent_id: str, session_id: str) -> RunState | None:
+    matches = [run for run in runs if run.ref.agent_id == agent_id and run.ref.session_id == session_id]
+    return max(matches, key=lambda run: run.created_at, default=None)
+
+
+def _run_error_summary(error_code: str | None) -> str | None:
+    summaries = {
+        "backend_start_failed": "后端未能启动本次执行。",
+        "backend_wait_failed": "后端在等待本次执行结果时失败。",
+        "cancellation_uncertain": "取消结果不确定，重启服务后再试。",
+        "runtime_state_persist_failed": "运行状态保存失败，已阻止继续执行。",
+        "service_restarted": "服务重启中断了本次执行。",
+    }
+    return summaries.get(error_code, "本次执行失败，请查看会话中的运行错误。" if error_code else None)

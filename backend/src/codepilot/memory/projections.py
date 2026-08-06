@@ -33,7 +33,8 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
     for record in records:
         if record["record_type"] == "message":
-            messages.append(record["data"])
+            # 人工交互恢复后会重新写入同一条 assistant 消息，新的快照已补齐工具结果。
+            upsert_message(messages, record["data"])
         if record["record_type"] == "human_interaction":
             apply_human_interaction(messages, record)
             pending_question = apply_pending_question(pending_question, record)
@@ -52,6 +53,21 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "records": records,
         "pending_question": pending_question,
     }
+
+
+def upsert_message(messages: list[dict[str, Any]], message: dict[str, Any]) -> None:
+    """按消息 ID 覆盖快照，避免回放旧 pending 工具调用。"""
+    info = message.get("info") if isinstance(message, dict) else None
+    message_id = info.get("id") if isinstance(info, dict) else None
+    if not message_id:
+        messages.append(message)
+        return
+    for index, current in enumerate(messages):
+        current_info = current.get("info") if isinstance(current, dict) else None
+        if isinstance(current_info, dict) and current_info.get("id") == message_id:
+            messages[index] = message
+            return
+    messages.append(message)
 
 
 def apply_pending_question(

@@ -45,6 +45,8 @@ HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner �
 
 Agent Studio 只能调用资源化 `/api/agents/*` 与 `/api/agent-runtimes*` 接口，不得重新依赖 `/api/session/*` 全局兼容指针。前端选择状态使用 `agent_id + session_id`；fetch、replay 和 SSE 必须用 generation、AbortController 与事件归属校验隔离快速切换。聚合 SSE 全局最多一条，高频 SSE 只为当前查看的 Session 保留一条，事件去重、消息列表和历史 DOM 都必须有固定上限。
 
+Agent Studio 的体验层统一放在 `frontend/src/features/agent-studio/agent-studio-refined.css`，视觉重构不得改动 API 请求与 SSE 协议。桌面与移动端必须复用同一业务 DOM；900px 以下的导航和检查器使用抽屉，抽屉层级必须高于带模糊效果的遮罩。交互元素需保留稳定的可访问名称，并支持 `prefers-reduced-motion`。
+
 Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；自定义 Agent 位于 `storage.codepilot_home/agents/*.md`，例如用户自定义 `life.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。自定义 Agent 不允许覆盖内置 Agent 名称；没有自定义 Agent 时只暴露三个内置 Agent。
 
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。

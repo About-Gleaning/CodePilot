@@ -148,6 +148,10 @@ export function useAgentSession(
       }
       return { ...current, events };
     });
+    if (event.event_type === 'error') {
+      const message = String(event.data.message || '本次执行发生错误。').slice(0, 800);
+      setError(message);
+    }
     if (event.event_type === 'human_approval_required' || event.event_type === 'human_question_required') {
       const interactionId = String(
         event.data.approval_id || event.data.question_id || event.data.interaction_id || '',
@@ -169,6 +173,7 @@ export function useAgentSession(
       onCatalogRefreshRef.current();
     }
     if (['session_finished', 'session_failed'].includes(event.event_type)) {
+      if (event.event_type === 'session_failed' && !event.data.message) setError((current) => current || '本次执行失败，请查看最近 Run 状态。');
       setRuntime((current) => current ? { ...current, status: event.event_type === 'session_failed' ? 'FAILED' : 'COMPLETED', active_run: null } : current);
       onCatalogRefreshRef.current();
     }

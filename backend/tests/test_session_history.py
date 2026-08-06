@@ -10,6 +10,7 @@ from codepilot.events import EventBus, HumanInteractionEvent, MessageCreatedEven
 from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.llm.client import LiteLLMClient
 from codepilot.memory import JsonlSessionMemory
+from codepilot.memory.projections import replay_records
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
 from codepilot.session.message import StepFinishPart, ToolPartState
 from codepilot.session.title import SessionTitleService
@@ -745,3 +746,22 @@ def test_session_runner_rejects_stale_question_reply_id() -> None:
                 )
             )
         )
+
+
+def test_replay_uses_latest_snapshot_for_resolved_tool_message() -> None:
+    session = build_session("session_1")
+    pending = build_question_message("session_1", "msg_question")
+    completed = pending.model_copy(deep=True)
+    completed.parts[0].state.status = "completed"
+    completed.parts[1].reason = "tool_completed"
+    completed.info.finish = "tool_completed"
+
+    replay = replay_records([
+        meta_record(session, "2026-08-06T00:00:00Z"),
+        session_record(session, "2026-08-06T00:00:00Z"),
+        message_record(pending, "2026-08-06T00:00:01Z"),
+        message_record(completed, "2026-08-06T00:00:02Z"),
+    ])
+
+    assert len(replay["messages"]) == 1
+    assert replay["messages"][0]["parts"][0]["state"]["status"] == "completed"

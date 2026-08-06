@@ -76,6 +76,12 @@ export type ActiveRun = {
   started_at: string | null;
 };
 
+export type RecentRun = ActiveRun & {
+  ended_at: string | null;
+  error_code: string | null;
+  error_summary: string | null;
+};
+
 export type PendingInteraction = {
   interaction_id: string;
   run_id: string;
@@ -89,7 +95,17 @@ export type SessionRuntime = {
   model: string | null;
   thinking_value: string | null;
   active_run: ActiveRun | null;
+  last_run?: RecentRun | null;
   pending_interaction: PendingInteraction | null;
+};
+
+export type ProviderConfig = {
+  provider: string;
+  label: string;
+  models: string[];
+  model_capabilities?: Record<string, {
+    thinking?: { allowed_values: string[]; default_value: string } | null;
+  }>;
 };
 
 export type ReplayResponse = {

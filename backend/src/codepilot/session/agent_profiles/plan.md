@@ -2,6 +2,8 @@
 name: plan
 kind: agent
 description: 制定只读执行计划，并在计划模式下沉淀方案。
+default_provider: deepseek
+default_model: deepseek-v4-pro
 tools:
   - bash_tool
   - read_file

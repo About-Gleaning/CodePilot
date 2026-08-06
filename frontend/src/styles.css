@@ -1,4 +1,5 @@
-:root {
+:root,
+:root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #080b0a;
   --bg-soft: #0d1210;
@@ -17,8 +18,55 @@
   --ok: #76dc91;
   --shadow: 0 16px 52px rgba(0, 0, 0, 0.3);
   --shadow-tight: 0 10px 28px rgba(0, 0, 0, 0.24);
+  --rail-bg: rgba(8, 12, 10, .93);
+  --inspector-bg: rgba(11, 16, 14, .94);
+  --chat-bg: rgba(8, 11, 10, .64);
+  --panel-translucent: rgba(13, 18, 16, .86);
+  --input-bg: #090e0c;
+  --button-bg: #111814;
+  --message-bg: rgba(12, 17, 15, .88);
+  --message-text: #edf7f0;
+  --soft-text: #cbd8d0;
+  --grid-line: rgba(212, 255, 98, .025);
+  --ambient-cyan: rgba(88, 199, 217, .06);
+  --danger-ink: #ffc3bc;
+  --cyan-ink: #bcecf4;
   --font-ui: "Avenir Next", "IBM Plex Sans", "Helvetica Neue", sans-serif;
   --font-mono: "JetBrains Mono", "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f2f0e8;
+  --bg-soft: #e7e5dc;
+  --panel: #fbfaf4;
+  --panel-raised: #ffffff;
+  --line: #d7d8cc;
+  --line-strong: #b9bcae;
+  --text: #172019;
+  --muted: #59645c;
+  --quiet: #788076;
+  --accent: #6d9200;
+  --accent-ink: #f8fbe9;
+  --cyan: #197f91;
+  --warn: #9a6500;
+  --danger: #bd3f35;
+  --ok: #287d46;
+  --shadow: 0 16px 52px rgba(39, 47, 37, .14);
+  --shadow-tight: 0 10px 28px rgba(39, 47, 37, .12);
+  --rail-bg: rgba(250, 249, 242, .94);
+  --inspector-bg: rgba(248, 247, 240, .95);
+  --chat-bg: rgba(242, 240, 232, .7);
+  --panel-translucent: rgba(251, 250, 244, .9);
+  --input-bg: #fffef9;
+  --button-bg: #f5f4ed;
+  --message-bg: rgba(255, 255, 251, .92);
+  --message-text: #202920;
+  --soft-text: #3d483f;
+  --grid-line: rgba(109, 146, 0, .08);
+  --ambient-cyan: rgba(25, 127, 145, .11);
+  --danger-ink: #8f2d25;
+  --cyan-ink: #116778;
 }
 
 /* CODE-52 Agent Studio
@@ -34,8 +82,8 @@
   min-height: 0;
   overflow: hidden;
   background:
-    linear-gradient(90deg, rgba(212, 255, 98, .025) 1px, transparent 1px),
-    radial-gradient(circle at 62% -10%, rgba(88, 199, 217, .06), transparent 34%);
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
+    radial-gradient(circle at 62% -10%, var(--ambient-cyan), transparent 34%);
   background-size: 36px 36px, auto;
 }
 
@@ -60,8 +108,8 @@
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--line);
-  background: rgba(8, 12, 10, .93);
-  box-shadow: 16px 0 50px rgba(0, 0, 0, .12);
+  background: var(--rail-bg);
+  box-shadow: 16px 0 50px var(--shadow-tight);
 }
 
 .studio-brand {
@@ -104,11 +152,39 @@
   letter-spacing: .02em;
 }
 
-.studio-brand > small {
+.studio-brand-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.studio-brand-actions small {
   writing-mode: vertical-rl;
   color: var(--quiet);
   font: 600 8px/1 var(--font-mono);
   letter-spacing: .12em;
+}
+
+.theme-toggle {
+  display: inline-flex;
+  min-width: 32px;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 7px;
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  background: var(--button-bg);
+  color: var(--accent);
+  cursor: pointer;
+  font: 700 8px/1 var(--font-mono);
+  letter-spacing: .06em;
+}
+
+.theme-toggle:hover {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 9%, var(--button-bg));
 }
 
 .agent-search {
@@ -118,7 +194,7 @@
   margin: 14px 14px 8px;
   padding: 0 10px;
   border: 1px solid var(--line);
-  background: #090e0c;
+  background: var(--input-bg);
 }
 
 .agent-search:focus-within {
@@ -364,7 +440,7 @@
   /* 错误提示是条件节点，纵向 Flex 可避免子节点数量改变消息区与输入区的行归属。 */
   display: flex;
   flex-direction: column;
-  background: rgba(8, 11, 10, .64);
+  background: var(--chat-bg);
 }
 
 .chat-command-bar {
@@ -376,7 +452,7 @@
   gap: 16px;
   padding: 12px 18px;
   border-bottom: 1px solid var(--line);
-  background: rgba(13, 18, 16, .86);
+  background: var(--panel-translucent);
   backdrop-filter: blur(16px);
 }
 
@@ -424,7 +500,7 @@
   padding: 0 11px;
   border: 1px solid var(--line-strong);
   border-radius: 3px;
-  background: #111814;
+  background: var(--button-bg);
   color: var(--text);
   cursor: pointer;
   font: 700 10px/1 var(--font-mono);
@@ -467,7 +543,7 @@
   overflow: hidden;
   padding: 0 18px;
   border-bottom: 1px solid var(--line);
-  background: rgba(5, 8, 7, .6);
+  background: color-mix(in srgb, var(--bg) 76%, transparent);
 }
 
 .context-strip span {
@@ -496,7 +572,7 @@
   padding: 9px 13px;
   border: 1px solid rgba(255, 111, 97, .28);
   background: rgba(255, 111, 97, .08);
-  color: #ffc3bc;
+  color: var(--danger-ink);
   font-size: 11px;
 }
 
@@ -530,7 +606,7 @@
 .studio-notice.tone-cyan {
   border-color: rgba(88, 199, 217, .25);
   background: rgba(88, 199, 217, .07);
-  color: #bcecf4;
+  color: var(--cyan-ink);
 }
 
 .studio-message-scroll {
@@ -553,14 +629,15 @@
   flex: 0 0 auto;
   max-height: min(48vh, 480px);
   max-height: min(48dvh, 480px);
-  overflow-y: auto;
+  /* 补全浮层位于输入框上方，不能被 composer 的滚动容器裁剪。 */
+  overflow: visible;
   overscroll-behavior: contain;
   margin: 0 clamp(12px, 2.5vw, 38px) 18px;
   padding: 10px;
   border: 1px solid var(--line-strong);
   border-radius: 6px;
-  background: rgba(13, 19, 16, .96);
-  box-shadow: 0 -18px 60px rgba(0, 0, 0, .25);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  box-shadow: 0 -18px 60px var(--shadow-tight);
 }
 
 .studio-composer > textarea {
@@ -666,7 +743,7 @@
   font-size: 10px;
 }
 
-.studio-interaction > div {
+.interaction-actions {
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -758,8 +835,8 @@
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--line);
-  background: rgba(11, 16, 14, .94);
-  box-shadow: -16px 0 50px rgba(0, 0, 0, .12);
+  background: var(--inspector-bg);
+  box-shadow: -16px 0 50px var(--shadow-tight);
 }
 
 .inspector-tabs {
@@ -1173,10 +1250,11 @@
     grid-template-columns: 42px minmax(0, 1fr) 42px;
     align-items: center;
     border-bottom: 1px solid var(--line);
-    background: rgba(8, 12, 10, .96);
+    background: var(--rail-bg);
   }
 
-  .studio-mobile-header button {
+  .studio-mobile-header > button,
+  .studio-mobile-actions > button {
     display: grid;
     height: 100%;
     place-items: center;
@@ -1185,12 +1263,30 @@
     color: var(--text);
   }
 
-  .studio-mobile-header div {
+  .studio-mobile-header > div:nth-child(2) {
     display: flex;
     min-width: 0;
     align-items: baseline;
     justify-content: center;
     gap: 8px;
+  }
+
+  .studio-mobile-actions {
+    display: flex;
+    height: 100%;
+    align-items: stretch;
+  }
+
+  .studio-mobile-actions .theme-toggle {
+    min-width: 0;
+    width: 32px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .studio-mobile-actions .theme-toggle span {
+    display: none;
   }
 
   .studio-mobile-header strong {
@@ -1323,6 +1419,60 @@
   }
 }
 
+/* 主题覆盖层：消息、输入与浮层在两种配色下共用同一层级关系。 */
+:root[data-theme="light"] .studio-grain {
+  opacity: .08;
+}
+
+:root[data-theme="light"] .agent-nav-item:hover,
+:root[data-theme="light"] .session-list > button:hover,
+:root[data-theme="light"] .session-list > button.is-active {
+  background: rgba(39, 56, 42, .045);
+}
+
+:root[data-theme="light"] .capability-section,
+:root[data-theme="light"] .message-copy-button,
+:root[data-theme="light"] .role-badge,
+:root[data-theme="light"] .markdown-body blockquote {
+  background: rgba(255, 255, 251, .7);
+}
+
+:root[data-theme="light"] .message-copy-button,
+:root[data-theme="light"] .role-badge {
+  color: var(--soft-text);
+  border-color: var(--line-strong);
+}
+
+:root[data-theme="light"] .message-copy-button:hover,
+:root[data-theme="light"] .message-copy-button:focus-visible {
+  color: var(--text);
+  background: var(--panel-raised);
+}
+
+:root[data-theme="light"] .markdown-body blockquote,
+:root[data-theme="light"] .markdown-body th {
+  color: var(--soft-text);
+}
+
+:root[data-theme="light"] .markdown-body th {
+  background: var(--bg-soft);
+}
+
+:root[data-theme="light"] .message-image-attachment img {
+  background: var(--bg-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
 * {
   box-sizing: border-box;
 }
@@ -1342,7 +1492,7 @@ body {
     linear-gradient(90deg, rgba(212, 255, 98, 0.012) 1px, transparent 1px),
     radial-gradient(circle at 18% 0%, rgba(88, 199, 217, 0.07), transparent 34%),
     radial-gradient(circle at 92% 12%, rgba(212, 255, 98, 0.045), transparent 24%),
-    #080b0b;
+    var(--bg);
   background-size: 28px 28px, 28px 28px, 100% 100%, auto;
   color: var(--text);
 }
@@ -1389,7 +1539,7 @@ select,
 input,
 textarea {
   width: 100%;
-  background: #090e0c;
+  background: var(--input-bg);
   border-radius: 6px;
   outline: none;
 }
@@ -2767,8 +2917,8 @@ pre {
   padding: 13px 14px 14px 17px;
   border: 1px solid rgba(33, 44, 39, 0.92);
   border-radius: 8px;
-  background: rgba(12, 17, 15, 0.86);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.16);
+  background: var(--message-bg);
+  box-shadow: 0 10px 28px var(--shadow-tight);
 }
 
 .message-card::before {
@@ -2787,7 +2937,7 @@ pre {
 .message-card.user {
   background:
     linear-gradient(90deg, rgba(88, 199, 217, 0.055), transparent 34%),
-    rgba(12, 17, 15, 0.88);
+    var(--message-bg);
 }
 
 .message-card.assistant::before {
@@ -2797,7 +2947,7 @@ pre {
 .message-card.assistant {
   background:
     linear-gradient(90deg, rgba(212, 255, 98, 0.05), transparent 32%),
-    rgba(12, 17, 15, 0.88);
+    var(--message-bg);
 }
 
 .message-card.subagent-card::before {
@@ -2807,13 +2957,13 @@ pre {
 .message-card.subagent-card {
   background:
     linear-gradient(90deg, rgba(88, 199, 217, 0.06), transparent 34%),
-    rgba(12, 17, 15, 0.88);
+    var(--message-bg);
 }
 
 .message-live-text,
 .message-text {
   margin-top: 11px;
-  color: #edf7f0;
+  color: var(--message-text);
   font-size: 13px;
   line-height: 1.68;
 }
@@ -3967,7 +4117,7 @@ pre {
   overflow: hidden;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
-  background: rgba(10, 15, 13, 0.98);
+  background: var(--panel-raised);
   box-shadow: var(--shadow);
 }
 
@@ -4036,7 +4186,7 @@ pre {
 
 .autocomplete-option.is-active,
 .autocomplete-option:hover {
-  background: rgba(212, 255, 98, 0.1);
+  background: color-mix(in srgb, var(--accent) 14%, var(--panel-raised));
 }
 
 .autocomplete-option span,
@@ -4172,18 +4322,19 @@ pre {
 
 .composer-question {
   padding: 11px;
-  border: 1px solid rgba(71, 183, 156, 0.45);
+  border: 1px solid color-mix(in srgb, var(--cyan) 54%, var(--line));
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(71, 183, 156, 0.09), rgba(9, 13, 12, 0.82)),
-    #090d0c;
+    linear-gradient(145deg, color-mix(in srgb, var(--cyan) 10%, transparent), transparent 46%),
+    var(--panel-raised);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--cyan) 13%, transparent);
 }
 
-.composer-question .approval-heading {
+.composer-question header {
   color: var(--cyan);
 }
 
-.composer-question .approval-heading svg {
+.composer-question header svg {
   color: var(--cyan);
 }
 
@@ -4243,19 +4394,23 @@ pre {
   margin-top: 10px;
 }
 
-.question-fieldset {
+.composer-question .question-fieldset {
   min-width: 0;
   margin: 0;
-  padding: 0;
-  border: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
 }
 
 .question-fieldset legend {
   display: grid;
   gap: 5px;
-  margin-bottom: 8px;
+  max-width: 100%;
+  margin: 0 0 10px;
+  padding: 0;
   color: var(--text);
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1.45;
 }
 
@@ -4274,6 +4429,7 @@ pre {
   display: flex;
   gap: 6px;
   align-items: center;
+  min-height: 26px;
 }
 
 .question-step {
@@ -4283,10 +4439,10 @@ pre {
   width: 30px;
   height: 24px;
   min-height: 24px;
-  border: 1px solid rgba(38, 48, 44, 0.9);
+  border: 1px solid var(--line);
   border-radius: 6px;
   color: var(--muted);
-  background: rgba(8, 13, 11, 0.72);
+  background: var(--button-bg);
   font-family: var(--font-mono);
   font-size: 11px;
   cursor: pointer;
@@ -4295,21 +4451,21 @@ pre {
 .question-step:hover,
 .question-step:focus-visible {
   outline: 0;
-  border-color: rgba(88, 199, 217, 0.58);
+  border-color: color-mix(in srgb, var(--cyan) 62%, var(--line));
   color: var(--text);
-  background: rgba(88, 199, 217, 0.08);
+  background: color-mix(in srgb, var(--cyan) 10%, var(--button-bg));
 }
 
 .question-step.is-done {
-  border-color: rgba(118, 220, 145, 0.5);
+  border-color: color-mix(in srgb, var(--ok) 58%, var(--line));
   color: var(--ok);
 }
 
 .question-step.is-active {
-  border-color: rgba(212, 255, 98, 0.66);
+  border-color: color-mix(in srgb, var(--accent) 70%, var(--line));
   color: var(--accent);
-  background: rgba(212, 255, 98, 0.08);
-  box-shadow: inset 0 0 0 1px rgba(212, 255, 98, 0.08);
+  background: color-mix(in srgb, var(--accent) 11%, var(--button-bg));
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .question-options {
@@ -4320,37 +4476,37 @@ pre {
 }
 
 .question-options:focus-visible {
-  box-shadow: 0 0 0 3px rgba(212, 255, 98, 0.12);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
-.question-option {
+.composer-question .question-option {
   display: flex;
   align-items: center;
   gap: 9px;
-  min-height: 34px;
-  padding: 7px 9px;
-  border: 1px solid rgba(38, 48, 44, 0.78);
+  min-height: 40px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
   border-radius: 7px;
-  color: #cedbd3;
+  color: var(--soft-text);
   font-size: 13px;
   line-height: 1.35;
-  background: rgba(8, 13, 11, 0.56);
+  background: var(--input-bg);
   cursor: pointer;
 }
 
 .question-option:hover,
 .question-option:focus-within {
-  border-color: rgba(88, 199, 217, 0.54);
+  border-color: color-mix(in srgb, var(--cyan) 62%, var(--line));
   color: var(--text);
-  background: rgba(88, 199, 217, 0.06);
+  background: color-mix(in srgb, var(--cyan) 7%, var(--input-bg));
 }
 
 .question-option.is-keyboard-active {
-  border-color: rgba(212, 255, 98, 0.58);
+  border-color: color-mix(in srgb, var(--accent) 66%, var(--line));
   color: var(--text);
   background:
-    linear-gradient(90deg, rgba(212, 255, 98, 0.08), transparent 46%),
-    rgba(8, 13, 11, 0.72);
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 10%, transparent), transparent 46%),
+    var(--input-bg);
 }
 
 .question-option input {
@@ -4360,8 +4516,8 @@ pre {
   min-height: 16px;
   margin: 0;
   padding: 0;
-  border: 1px solid rgba(140, 155, 148, 0.9);
-  background: rgba(4, 8, 7, 0.86);
+  border: 1px solid var(--line-strong);
+  background: var(--panel-raised);
   accent-color: var(--accent);
 }
 
@@ -4375,7 +4531,7 @@ pre {
 
 .question-option input:checked {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(212, 255, 98, 0.11);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 
 .question-option span {
@@ -4384,16 +4540,17 @@ pre {
 }
 
 .question-option:has(input:checked) {
-  border-color: rgba(212, 255, 98, 0.58);
+  border-color: color-mix(in srgb, var(--accent) 66%, var(--line));
   color: var(--text);
   background:
-    linear-gradient(90deg, rgba(212, 255, 98, 0.1), transparent 52%),
-    rgba(12, 19, 14, 0.78);
+    linear-gradient(90deg, color-mix(in srgb, var(--accent) 12%, transparent), transparent 52%),
+    color-mix(in srgb, var(--accent) 4%, var(--input-bg));
 }
 
 .question-fieldset textarea {
   margin-top: 8px;
   min-height: 58px;
+  background: var(--input-bg);
 }
 
 .question-error {
