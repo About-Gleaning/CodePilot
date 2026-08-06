@@ -28,6 +28,17 @@ const mocks = vi.hoisted(() => ({
         default_provider: 'test',
         default_model: 'model',
       },
+      {
+        agent_id: 'agent-c',
+        revision_id: 'revision-c',
+        name: 'custom',
+        description: '自定义',
+        source: 'custom',
+        archived: false,
+        validation_status: 'valid',
+        default_provider: 'test',
+        default_model: 'model',
+      },
     ],
     agentsById: {} as Record<string, unknown>,
     runtimes: {
@@ -44,6 +55,15 @@ const mocks = vi.hoisted(() => ({
         agent_id: 'agent-b',
         desired_state: 'RUNNING',
         lifecycle_state: 'RUNNING',
+        recent_session_id: null,
+        active_run_count: 0,
+        waiting_human_count: 0,
+        error_code: null,
+      },
+      'agent-c': {
+        agent_id: 'agent-c',
+        desired_state: 'STOPPED',
+        lifecycle_state: 'STOPPED',
         recent_session_id: null,
         active_run_count: 0,
         waiting_human_count: 0,
@@ -110,10 +130,101 @@ afterEach(() => {
   mocks.session.runtime.pending_interaction = null;
   mocks.session.replyInteraction.mockClear();
   mocks.session.send.mockClear();
+  mocks.catalog.refresh.mockReset().mockResolvedValue(undefined);
   vi.unstubAllGlobals();
 });
 
 describe('Agent Studio 底部交互区', () => {
+  it('新建 Agent 在主内容区打开，并从检查器移除配置页签', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      providers: [], tools: [], mcp_servers: [],
+    }), { status: 200 })));
+    const view = render(<AgentStudio />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
+
+    expect(await screen.findByRole('heading', { name: '创建 Agent' })).toBeInTheDocument();
+    expect(view.container.querySelector('.studio-config-workspace')).toBeInTheDocument();
+    expect(view.container.querySelector('.studio-chat')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '配置' })).not.toBeInTheDocument();
+  });
+
+  it('从会话命令栏进入当前 Agent 的主页面配置', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes('/api/agents/agent-a')
+        ? mocks.catalog.agents[0]
+        : { providers: [], tools: [], mcp_servers: [] };
+      return new Response(JSON.stringify(body), { status: 200 });
+    }));
+    const view = render(<AgentStudio />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置 build' }));
+
+    expect(await screen.findByRole('heading', { name: 'build' })).toBeInTheDocument();
+    expect(view.container.querySelector('.studio-config-workspace')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '返回会话' })).toBeInTheDocument();
+  });
+
+  it('未保存配置在返回和切换 Agent 前要求确认', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      providers: [], tools: [], mcp_servers: [],
+    }), { status: 200 })));
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<AgentStudio />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
+    const name = await screen.findByPlaceholderText('agent-name');
+    fireEvent.change(name, { target: { value: 'draft-agent' } });
+    fireEvent.click(screen.getByRole('button', { name: /plan/ }));
+
+    expect(confirm).toHaveBeenCalledWith('当前配置存在未保存修改，仍要切换 Agent 吗？');
+    expect(name).toHaveValue('draft-agent');
+    fireEvent.click(screen.getByRole('button', { name: '返回会话' }));
+    expect(confirm).toHaveBeenLastCalledWith('当前配置存在未保存修改，仍要返回会话吗？');
+    expect(screen.getByPlaceholderText('agent-name')).toHaveValue('draft-agent');
+  });
+
+  it('新建保存后进入新 Agent 会话，编辑保存后留在配置页', async () => {
+    const created = {
+      ...mocks.catalog.agents[2],
+      agent_id: 'agent-new',
+      revision_id: 'revision-new',
+      name: 'new-agent',
+    };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (init?.method === 'POST') return new Response(JSON.stringify(created), { status: 200 });
+      if (init?.method === 'PUT') return new Response(JSON.stringify({ ...mocks.catalog.agents[2], revision_id: 'revision-c2' }), { status: 200 });
+      if (url.includes('/api/agents/agent-c')) return new Response(JSON.stringify(mocks.catalog.agents[2]), { status: 200 });
+      return new Response(JSON.stringify({ providers: [], tools: [], mcp_servers: [] }), { status: 200 });
+    }));
+    mocks.catalog.refresh.mockImplementation(async () => {
+      mocks.catalog.agentsById[created.agent_id] = created;
+    });
+    render(<AgentStudio />);
+
+    fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
+    fireEvent.change(await screen.findByPlaceholderText('agent-name'), { target: { value: 'new-agent' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存 Agent' }));
+    await waitFor(() => expect(document.querySelector('.studio-chat')).toBeInTheDocument());
+    expect(screen.getAllByText('new-agent').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('heading', { name: '创建 Agent' })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /custom/ }));
+    fireEvent.click(await screen.findByRole('button', { name: '配置 custom' }));
+    fireEvent.change(await screen.findByLabelText('描述'), { target: { value: '新的描述' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存 revision' }));
+    expect(await screen.findByRole('heading', { name: 'custom' })).toBeInTheDocument();
+    expect(screen.getByText('revision-c2')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '复制为新 Agent' }));
+    expect(screen.getByPlaceholderText('agent-name')).toHaveValue('');
+    fireEvent.change(screen.getByPlaceholderText('agent-name'), { target: { value: 'fork-agent' } });
+    fireEvent.click(screen.getByRole('button', { name: '保存 Agent' }));
+    await waitFor(() => expect(document.querySelector('.studio-chat')).toBeInTheDocument());
+  });
+
   it('无错误提示时消息区与底部输入区保持稳定顺序', async () => {
     const view = render(<AgentStudio />);
 

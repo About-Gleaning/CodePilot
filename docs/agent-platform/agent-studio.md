@@ -8,11 +8,13 @@ Agent Studio 将 Agent 配置、启停、Session 历史、聊天和 Scheduler �
 
 ## 页面结构
 
-桌面以对话为中心：左侧 Agent 导航默认展开但可收起；会话、配置和自动化检查器按需从右侧展开，避免长期占用对话宽度。
+桌面以对话为中心：左侧 Agent 导航默认展开但可收起；会话和自动化检查器按需从右侧展开，避免长期占用主工作区宽度。Agent 配置作为主工作区的独立页面，与会话视图互斥显示。
 
 - 左栏：Agent 搜索、活动/归档/异常筛选、运行状态、容量和新建入口。
-- 中栏：当前 Agent/Session、启动、取消当前 Run、关闭 Agent、消息流、人工交互、附件和输入区。
-- 右栏：Session 历史、Agent 配置和 Scheduler 自动化。
+- 主工作区：在会话视图中展示当前 Agent/Session、运行控制、消息流、人工交互、附件和输入区；在配置视图中展示 Agent 身份、模型、Prompt 和能力边界。
+- 右栏：Session 历史和 Scheduler 自动化。
+
+新建、复制和编辑 Agent 统一进入配置主页面。新建或复制保存成功后切换到新 Agent 的会话视图；编辑 revision 或归档状态后留在配置页面。进入配置页不会清空原会话选择、消息草稿或附件草稿，返回和切换 Agent 时统一执行未保存修改确认。
 
 视觉层使用独立的 `agent-studio-refined.css`，只覆盖展示令牌和响应式布局，不改变 API、SSE、持久化或状态隔离。当前采用“信号台”设计语言：深色设备栏、黑白工作画布和高对比橙色运行信号；亮色主题保持相同信息层级，不复用旧版米白绿色卡片语言。空 Session 提供本地草稿建议，点击仅填充 Composer，不会自动发送或产生后端请求。
 
@@ -48,7 +50,7 @@ Session 恢复顺序为：
 
 ## 配置与安全
 
-Agent 列表只返回默认 Provider、Model 和思考参数，不返回 Prompt。只有进入“配置”页签时才调用详情接口。活动 Run 期间允许保存新 revision，当前 Run 保持旧 revision，下一 Run 获取新 revision。
+Agent 列表只返回默认 Provider、Model 和思考参数，不返回 Prompt。只有进入配置主页面时才调用详情接口；新建空白配置只读取能力目录。活动 Run 期间允许保存新 revision，当前 Run 保持旧 revision，下一 Run 获取新 revision。
 
 聚合流只携带 Agent、Run 和 interaction 状态，不携带 Prompt、token、附件、Tool 参数或人工交互正文。API client 只展示结构化 `code/message`，不直接渲染原始响应或堆栈。
 
@@ -65,7 +67,8 @@ Agent 列表只返回默认 Provider、Model 和思考参数，不返回 Prompt�
 
 - `pnpm test --run`：覆盖 Agent 选择、会话与输入交互、主题以及 hooks 回归。
 - `pnpm build`：通过 TypeScript 检查和 Vite 生产构建。
-- 浏览器视觉检查：覆盖桌面亮色、桌面暗色、右侧检查器、390px 窄屏主界面与移动端 Agent 抽屉。
+- 浏览器视觉检查：覆盖桌面亮色、桌面暗色、配置主页面、右侧检查器、390px 窄屏主界面与移动端 Agent 抽屉。
+- 配置交互检查：覆盖新建、编辑、复制、保存去向、未保存离开确认，以及检查器只保留会话和自动化两个页签。
 - 体验层仅增加本地 UI 状态（侧栏展开与收起、空态草稿填充）；不新增网络请求，空态建议不会自动发送任务。
 
 ## 错误恢复

@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { Archive, Copy, RotateCcw, Save, Sparkles } from 'lucide-react';
+import { Archive, ArrowLeft, Copy, RotateCcw, Save, Sparkles } from 'lucide-react';
 
 import { apiJson, apiRequest } from '../../api/client';
 import type { AgentCapabilities, AgentDetail, AgentSummary } from './types';
@@ -29,12 +29,14 @@ const EMPTY_FORM: FormState = {
 export function AgentConfigPanel({
   agent,
   activeRunCount,
-  onChanged,
+  onBack,
+  onSaved,
   onDirtyChange,
 }: {
   agent: AgentSummary | null;
   activeRunCount: number;
-  onChanged: (agent?: AgentSummary) => void;
+  onBack: () => void;
+  onSaved: (agent: AgentSummary, created: boolean) => void;
   onDirtyChange: (dirty: boolean) => void;
 }) {
   const [detail, setDetail] = useState<AgentDetail | null>(null);
@@ -141,7 +143,7 @@ export function AgentConfigPanel({
       setForm(toForm(result));
       setMode('edit');
       setDirty(false);
-      onChanged(result);
+      onSaved(result, !editing);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '保存失败');
     } finally {
@@ -162,7 +164,7 @@ export function AgentConfigPanel({
       setDetail(result);
       setForm(toForm(result));
       setDirty(false);
-      onChanged(result);
+      onSaved(result, false);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : '操作失败');
     } finally {
@@ -173,104 +175,124 @@ export function AgentConfigPanel({
   if (loading) return <PanelNotice title="载入配置" detail="正在读取能力目录和 Agent revision…" />;
   return (
     <form className="studio-config" onSubmit={save}>
-      <div className="studio-config-heading">
-        <div>
-          <span className="eyebrow">{mode === 'create' ? 'NEW PROFILE' : mode === 'copy' ? 'FORK PROFILE' : 'PROFILE REVISION'}</span>
-          <strong>{detail?.name || '创建 Agent'}</strong>
-          {detail?.revision_id ? <code>{detail.revision_id.slice(0, 12)}</code> : null}
+      <header className="studio-config-heading">
+        <div className="config-heading-copy">
+          <button type="button" className="studio-icon-button config-back-button" onClick={onBack} aria-label="返回会话" title="返回会话">
+            <ArrowLeft size={17} />
+          </button>
+          <div>
+            <span className="eyebrow">{mode === 'create' ? 'NEW PROFILE' : mode === 'copy' ? 'FORK PROFILE' : 'PROFILE REVISION'}</span>
+            <h1>{detail?.name || '创建 Agent'}</h1>
+            {detail?.revision_id ? <code>{detail.revision_id.slice(0, 12)}</code> : null}
+          </div>
         </div>
         <div className="inline-actions">
-          {detail ? <button type="button" className="studio-icon-button" onClick={copy} title="复制为新 Agent"><Copy size={15} /></button> : null}
+          {detail ? <button type="button" className="studio-icon-button" onClick={copy} aria-label="复制为新 Agent" title="复制为新 Agent"><Copy size={15} /></button> : null}
           {detail?.source === 'custom' ? (
-            <button type="button" className="studio-icon-button" onClick={() => void archiveOrRestore()} title={detail.archived ? '恢复' : '归档'}>
+            <button type="button" className="studio-icon-button" onClick={() => void archiveOrRestore()} aria-label={detail.archived ? '恢复 Agent' : '归档 Agent'} title={detail.archived ? '恢复' : '归档'}>
               {detail.archived ? <RotateCcw size={15} /> : <Archive size={15} />}
             </button>
           ) : null}
         </div>
-      </div>
-      {activeRunCount > 0 ? (
-        <div className="studio-notice tone-cyan">
-          <Sparkles size={14} />
-          <span>当前有 {activeRunCount} 个 Run。保存后仅下一轮使用新 revision，正在执行的 Run 保持不变。</span>
-        </div>
-      ) : null}
-      {error ? <div className="studio-notice tone-danger" role="alert">{error}</div> : null}
-      <label className="studio-field">
-        <span>名称</span>
-        <input value={form.name} disabled={mode === 'edit'} placeholder="agent-name" onChange={(event) => patch('name', event.target.value)} />
-      </label>
-      <label className="studio-field">
-        <span>描述</span>
-        <input value={form.description} disabled={readonly} onChange={(event) => patch('description', event.target.value)} />
-      </label>
-      <label className="studio-field">
-        <span>System Prompt</span>
-        <textarea rows={10} value={form.system_prompt} disabled={readonly} onChange={(event) => patch('system_prompt', event.target.value)} />
-      </label>
-      <div className="studio-field-grid">
-        <label className="studio-field">
-          <span>Provider</span>
-          <select value={form.default_provider} disabled={readonly} onChange={(event) => {
-            patch('default_provider', event.target.value);
-            setForm((current) => ({ ...current, default_model: '', default_thinking_value: '' }));
-          }}>
-            <option value="">选择 Provider</option>
-            {capabilities?.providers.map((item) => <option value={item.provider} key={item.provider}>{item.label}</option>)}
-          </select>
-        </label>
-        <label className="studio-field">
-          <span>Model</span>
-          <select value={form.default_model} disabled={readonly || !form.default_provider} onChange={(event) => patch('default_model', event.target.value)}>
-            <option value="">选择 Model</option>
-            {models.map((model) => <option value={model} key={model}>{model}</option>)}
-          </select>
-        </label>
-      </div>
-      {thinking ? (
-        <label className="studio-field">
-          <span>默认思考参数</span>
-          <select value={form.default_thinking_value} disabled={readonly} onChange={(event) => patch('default_thinking_value', event.target.value)}>
-            <option value="">使用模型默认值</option>
-            {thinking.allowed_values.map((value) => <option value={value} key={value}>{value}</option>)}
-          </select>
-        </label>
-      ) : null}
-      <section className="capability-section">
-        <header><strong>本地 Tools</strong><small>按副作用分组</small></header>
-        {toolGroups.map(([group, tools]) => (
-          <details key={group} open={group === 'read_only'}>
-            <summary>{sideEffectLabel(group)} <small>{tools.length}</small></summary>
-            <div className="capability-list">
-              {tools.map((tool) => (
-                <label className={`capability-item ${tool.assignable ? '' : 'is-disabled'}`} key={tool.name}>
-                  <input type="checkbox" checked={form.tool_names.includes(tool.name)} disabled={readonly || !tool.assignable} onChange={() => toggle('tool_names', tool.name)} />
-                  <span><strong>{tool.name}</strong><small>{tool.assignable ? tool.description : tool.reason || '不可分配'}</small></span>
-                  {tool.requires_approval ? <em>审批</em> : null}
-                </label>
-              ))}
+      </header>
+      <div className="studio-config-scroll">
+        <div className="studio-config-content">
+          {activeRunCount > 0 ? (
+            <div className="studio-notice tone-cyan">
+              <Sparkles size={14} />
+              <span>当前有 {activeRunCount} 个 Run。保存后仅下一轮使用新 revision，正在执行的 Run 保持不变。</span>
             </div>
-          </details>
-        ))}
-      </section>
-      <section className="capability-section">
-        <header><strong>MCP 服务</strong><small>外部副作用</small></header>
-        <div className="capability-list">
-          {capabilities?.mcp_servers.length ? capabilities.mcp_servers.map((mcp) => {
-            const selected = form.mcp_server_names.includes(mcp.name);
-            return (
-              <label className={`capability-item mcp-${mcp.status}`} key={mcp.name}>
-                <input type="checkbox" checked={selected} disabled={readonly || (mcp.status === 'disabled' && !selected)} onChange={() => toggle('mcp_server_names', mcp.name)} />
-                <span><strong>{mcp.name}</strong><small>{mcp.description || mcp.status}</small></span>
-                <em>{mcp.status}{mcp.requires_approval ? ' · 审批' : ''}</em>
+          ) : null}
+          {error ? <div className="studio-notice tone-danger" role="alert">{error}</div> : null}
+          <section className="studio-config-section identity-section">
+            <header><span className="eyebrow">01 / IDENTITY</span><strong>身份与运行模型</strong></header>
+            <div className="studio-config-fields">
+              <label className="studio-field">
+                <span>名称</span>
+                <input value={form.name} disabled={mode === 'edit'} placeholder="agent-name" onChange={(event) => patch('name', event.target.value)} />
               </label>
-            );
-          }) : <p className="studio-empty-copy">尚未配置 MCP 服务。</p>}
+              <label className="studio-field field-wide">
+                <span>描述</span>
+                <input value={form.description} disabled={readonly} onChange={(event) => patch('description', event.target.value)} />
+              </label>
+              <label className="studio-field">
+                <span>Provider</span>
+                <select value={form.default_provider} disabled={readonly} onChange={(event) => {
+                  patch('default_provider', event.target.value);
+                  setForm((current) => ({ ...current, default_model: '', default_thinking_value: '' }));
+                }}>
+                  <option value="">选择 Provider</option>
+                  {capabilities?.providers.map((item) => <option value={item.provider} key={item.provider}>{item.label}</option>)}
+                </select>
+              </label>
+              <label className="studio-field">
+                <span>Model</span>
+                <select value={form.default_model} disabled={readonly || !form.default_provider} onChange={(event) => patch('default_model', event.target.value)}>
+                  <option value="">选择 Model</option>
+                  {models.map((model) => <option value={model} key={model}>{model}</option>)}
+                </select>
+              </label>
+              {thinking ? (
+                <label className="studio-field">
+                  <span>默认思考参数</span>
+                  <select value={form.default_thinking_value} disabled={readonly} onChange={(event) => patch('default_thinking_value', event.target.value)}>
+                    <option value="">使用模型默认值</option>
+                    {thinking.allowed_values.map((value) => <option value={value} key={value}>{value}</option>)}
+                  </select>
+                </label>
+              ) : null}
+            </div>
+          </section>
+          <section className="studio-config-section prompt-section">
+            <header><span className="eyebrow">02 / INSTRUCTIONS</span><strong>System Prompt</strong></header>
+            <label className="studio-field">
+              <span>System Prompt</span>
+              <textarea rows={14} value={form.system_prompt} disabled={readonly} onChange={(event) => patch('system_prompt', event.target.value)} />
+            </label>
+          </section>
+          <section className="studio-config-section capability-workbench">
+            <header><span className="eyebrow">03 / CAPABILITIES</span><strong>能力边界</strong></header>
+            <div className="studio-capability-grid">
+              <section className="capability-section">
+                <header><strong>本地 Tools</strong><small>按副作用分组</small></header>
+                {toolGroups.map(([group, tools]) => (
+                  <details key={group} open={group === 'read_only'}>
+                    <summary>{sideEffectLabel(group)} <small>{tools.length}</small></summary>
+                    <div className="capability-list">
+                      {tools.map((tool) => (
+                        <label className={`capability-item ${tool.assignable ? '' : 'is-disabled'}`} key={tool.name}>
+                          <input type="checkbox" checked={form.tool_names.includes(tool.name)} disabled={readonly || !tool.assignable} onChange={() => toggle('tool_names', tool.name)} />
+                          <span><strong>{tool.name}</strong><small>{tool.assignable ? tool.description : tool.reason || '不可分配'}</small></span>
+                          {tool.requires_approval ? <em>审批</em> : null}
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                ))}
+              </section>
+              <section className="capability-section">
+                <header><strong>MCP 服务</strong><small>外部副作用</small></header>
+                <div className="capability-list">
+                  {capabilities?.mcp_servers.length ? capabilities.mcp_servers.map((mcp) => {
+                    const selected = form.mcp_server_names.includes(mcp.name);
+                    return (
+                      <label className={`capability-item mcp-${mcp.status}`} key={mcp.name}>
+                        <input type="checkbox" checked={selected} disabled={readonly || (mcp.status === 'disabled' && !selected)} onChange={() => toggle('mcp_server_names', mcp.name)} />
+                        <span><strong>{mcp.name}</strong><small>{mcp.description || mcp.status}</small></span>
+                        <em>{mcp.status}{mcp.requires_approval ? ' · 审批' : ''}</em>
+                      </label>
+                    );
+                  }) : <p className="studio-empty-copy">尚未配置 MCP 服务。</p>}
+                </div>
+              </section>
+            </div>
+          </section>
         </div>
-      </section>
+      </div>
       <div className="studio-config-footer">
         <span>{dirty ? '存在未保存修改' : '配置已同步'}</span>
         <button type="submit" className="studio-button primary" disabled={readonly || saving || !dirty}>
-          <Save size={15} />{saving ? '保存中…' : '保存 revision'}
+          <Save size={15} />{saving ? '保存中…' : mode === 'edit' ? '保存 revision' : '保存 Agent'}
         </button>
       </div>
     </form>

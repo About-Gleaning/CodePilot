@@ -19,7 +19,8 @@ import type { AgentRuntime, AgentSummary, PendingInteraction, ProviderConfig } f
 import { useAgentCatalog } from './useAgentCatalog';
 import { isUnknownRequest, useAgentSession } from './useAgentSession';
 
-type InspectorTab = 'sessions' | 'config' | 'automation';
+type InspectorTab = 'sessions' | 'automation';
+type StudioView = 'conversation' | 'agent-config';
 type MobilePanel = 'agents' | 'inspector' | null;
 type Draft = {
   content: string;
@@ -57,7 +58,8 @@ export default function AgentStudio() {
   const { theme, toggleTheme } = useTheme();
   const catalog = useAgentCatalog();
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
-  const [creatingAgent, setCreatingAgent] = useState(false);
+  const [studioView, setStudioView] = useState<StudioView>('conversation');
+  const [configAgentId, setConfigAgentId] = useState<string | null>(null);
   const [sessionByAgent, setSessionByAgent] = useState<Record<string, string | null>>({});
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [inspectorTab, setInspectorTab] = useState<InspectorTab>('sessions');
@@ -82,6 +84,8 @@ export default function AgentStudio() {
 
   const selectedAgent = selectedAgentId ? catalog.agentsById[selectedAgentId] || null : null;
   const selectedRuntime = selectedAgentId ? catalog.runtimes[selectedAgentId] || stoppedRuntime(selectedAgentId) : null;
+  const configAgent = configAgentId ? catalog.agentsById[configAgentId] || null : null;
+  const configRuntime = configAgentId ? catalog.runtimes[configAgentId] || stoppedRuntime(configAgentId) : null;
   const selectedSessionId = selectedAgentId ? sessionByAgent[selectedAgentId] ?? null : null;
   const draft = selectedAgentId ? drafts[selectedAgentId] || EMPTY_DRAFT : EMPTY_DRAFT;
   const session = useAgentSession(
@@ -95,12 +99,12 @@ export default function AgentStudio() {
   );
 
   useEffect(() => {
-    if (selectedAgentId || creatingAgent || !catalog.agents.length) return;
+    if (selectedAgentId || !catalog.agents.length) return;
     const preferred = catalog.agents.find((agent) => agent.name === 'build' && !agent.archived)
       || catalog.agents.find((agent) => !agent.archived)
       || catalog.agents[0];
     setSelectedAgentId(preferred.agent_id);
-  }, [catalog.agents, creatingAgent, selectedAgentId]);
+  }, [catalog.agents, selectedAgentId]);
 
   useEffect(() => {
     if (
@@ -205,8 +209,9 @@ export default function AgentStudio() {
   };
 
   const selectAgent = (agentId: string) => {
-    if (configDirty && !window.confirm('当前配置存在未保存修改，仍要切换 Agent 吗？')) return;
-    setCreatingAgent(false);
+    if (studioView === 'agent-config' && configDirty && !window.confirm('当前配置存在未保存修改，仍要切换 Agent 吗？')) return;
+    setStudioView('conversation');
+    setConfigAgentId(null);
     setSelectedAgentId(agentId);
     setHistoryLimit(50);
     setConfigDirty(false);
@@ -215,8 +220,24 @@ export default function AgentStudio() {
   };
 
   const changeInspectorTab = (tab: InspectorTab) => {
-    if (inspectorTab === 'config' && configDirty && tab !== 'config' && !window.confirm('配置尚未保存，仍要离开吗？')) return;
     setInspectorTab(tab);
+  };
+
+  const openAgentConfig = (agentId: string | null) => {
+    if (studioView === 'agent-config' && configDirty && !window.confirm('当前配置存在未保存修改，仍要打开其他配置吗？')) return;
+    setConfigDirty(false);
+    setConfigAgentId(agentId);
+    setStudioView('agent-config');
+    setInspectorOpen(false);
+    setMobilePanel(null);
+    setLocalError('');
+  };
+
+  const closeAgentConfig = () => {
+    if (configDirty && !window.confirm('当前配置存在未保存修改，仍要返回会话吗？')) return;
+    setConfigDirty(false);
+    setConfigAgentId(null);
+    setStudioView('conversation');
   };
 
   const newSession = () => {
@@ -323,10 +344,13 @@ export default function AgentStudio() {
       ) : null}
       <header className="studio-mobile-header">
         <button type="button" onClick={() => setMobilePanel('agents')} aria-label="打开 Agent 导航"><Menu size={18} /></button>
-        <div><strong>{selectedAgent?.name || 'Agent Studio'}</strong><span>{selectedSessionId ? shortId(selectedSessionId) : '新会话'}</span></div>
+        <div>
+          <strong>{studioView === 'agent-config' ? configAgent?.name || '创建 Agent' : selectedAgent?.name || 'Agent Studio'}</strong>
+          <span>{studioView === 'agent-config' ? 'Agent 配置' : selectedSessionId ? shortId(selectedSessionId) : '新会话'}</span>
+        </div>
         <div className="studio-mobile-actions">
           <ThemeToggle theme={theme} onToggle={toggleTheme} />
-          <button type="button" onClick={() => setMobilePanel('inspector')} aria-label="打开检查器"><PanelRight size={18} /></button>
+          {studioView === 'conversation' ? <button type="button" onClick={() => setMobilePanel('inspector')} aria-label="打开检查器"><PanelRight size={18} /></button> : null}
         </div>
       </header>
 
@@ -363,11 +387,7 @@ export default function AgentStudio() {
           {!filteredAgents.length ? <p className="studio-empty-copy">没有符合条件的 Agent。</p> : null}
         </div>
         <button type="button" className="new-agent-button" onClick={() => {
-          if (configDirty && !window.confirm('配置尚未保存，仍要新建 Agent 吗？')) return;
-          setCreatingAgent(true);
-          setSelectedAgentId(null);
-          setInspectorTab('config');
-          setMobilePanel('inspector');
+          openAgentConfig(null);
         }}>
           <Plus size={15} />新建 Agent
         </button>
@@ -379,6 +399,29 @@ export default function AgentStudio() {
         </div>
       </aside>
 
+      {studioView === 'agent-config' ? (
+        <main className="studio-config-workspace">
+          <AgentConfigPanel
+            key={configAgentId || 'create'}
+            agent={configAgent}
+            activeRunCount={configRuntime?.active_run_count || 0}
+            onBack={closeAgentConfig}
+            onDirtyChange={setConfigDirty}
+            onSaved={(changed, created) => {
+              setConfigDirty(false);
+              void catalog.refresh().then(() => {
+                if (created) {
+                  setSelectedAgentId(changed.agent_id);
+                  setConfigAgentId(null);
+                  setStudioView('conversation');
+                  return;
+                }
+                setConfigAgentId(changed.agent_id);
+              });
+            }}
+          />
+        </main>
+      ) : (
       <main className="studio-chat">
         <header className="chat-command-bar">
           <div className="chat-identity">
@@ -390,7 +433,8 @@ export default function AgentStudio() {
             {selectedAgent?.revision_id ? <code>rev {selectedAgent.revision_id.slice(0, 8)}</code> : null}
           </div>
           <div className="chat-runtime-actions">
-            <button type="button" className="studio-icon-button inspector-toggle" onClick={() => setInspectorOpen((value) => !value)} aria-label={inspectorOpen ? '收起会话与设置面板' : '打开会话与设置面板'} title={inspectorOpen ? '收起侧栏' : '会话与设置'}><PanelRight size={15} /></button>
+            <button type="button" className="studio-icon-button" disabled={!selectedAgent} onClick={() => openAgentConfig(selectedAgentId)} aria-label={`配置 ${selectedAgent?.name || 'Agent'}`} title="配置 Agent"><Settings2 size={15} /></button>
+            <button type="button" className="studio-icon-button inspector-toggle" onClick={() => setInspectorOpen((value) => !value)} aria-label={inspectorOpen ? '收起会话与自动化面板' : '打开会话与自动化面板'} title={inspectorOpen ? '收起侧栏' : '会话与自动化'}><PanelRight size={15} /></button>
             {selectedRuntime?.lifecycle_state !== 'RUNNING' ? (
               <button type="button" className="studio-button primary" disabled={!selectedAgent || selectedAgent.archived || catalog.mutating.has(selectedAgent.agent_id)} onClick={() => selectedAgent && void catalog.startAgent(selectedAgent.agent_id).catch(showError(setLocalError))}>
                 <Play size={14} />启动 Agent
@@ -545,11 +589,11 @@ export default function AgentStudio() {
           ) : null}
         </form>
       </main>
+      )}
 
       <aside className={`studio-inspector ${mobilePanel === 'inspector' ? 'is-mobile-open' : ''}`}>
         <nav className="inspector-tabs">
           <button type="button" className={inspectorTab === 'sessions' ? 'is-active' : ''} onClick={() => changeInspectorTab('sessions')}><History size={14} />会话</button>
-          <button type="button" className={inspectorTab === 'config' ? 'is-active' : ''} onClick={() => changeInspectorTab('config')}><Settings2 size={14} />配置</button>
           <button type="button" className={inspectorTab === 'automation' ? 'is-active' : ''} onClick={() => changeInspectorTab('automation')}><CalendarClock size={14} />自动化</button>
         </nav>
         <div className="inspector-content">
@@ -581,28 +625,12 @@ export default function AgentStudio() {
               </div>
             </>
           ) : null}
-          {inspectorTab === 'config' ? (
-            <AgentConfigPanel
-              key={selectedAgent?.agent_id || 'create'}
-              agent={selectedAgent}
-              activeRunCount={selectedRuntime?.active_run_count || 0}
-              onDirtyChange={setConfigDirty}
-              onChanged={(changed) => {
-                setConfigDirty(false);
-                void catalog.refresh().then(() => {
-                  if (changed?.agent_id) {
-                    setCreatingAgent(false);
-                    setSelectedAgentId(changed.agent_id);
-                  }
-                });
-              }}
-            />
-          ) : null}
           <AutomationPanel
             active={inspectorTab === 'automation'}
             agents={catalog.agents}
             onOpenSession={(agentId, sessionId) => {
-              setCreatingAgent(false);
+              setStudioView('conversation');
+              setConfigAgentId(null);
               setSelectedAgentId(agentId);
               setSessionByAgent((current) => ({ ...current, [agentId]: sessionId }));
               setInspectorTab('sessions');
