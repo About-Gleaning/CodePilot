@@ -1389,6 +1389,69 @@ def test_agent_loop_only_emits_one_human_approval_required_for_tool() -> None:
     assert interactions[1].data["call_id"] == "call_1"
 
 
+def test_agent_loop_does_not_emit_approved_tool_completion_when_snapshot_persistence_fails() -> None:
+    settings = build_settings()
+    session = build_session()
+    workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+    event_bus = EventBus()
+    runtime = RuntimeHandles(event_bus=event_bus)
+    hook_manager = HookManager()
+    tool_registry = ToolRegistry()
+    tool_registry.register(ApprovalTool())
+    dispatcher = ToolDispatcher(tool_registry, hook_manager)
+    loop = AgentLoop(
+        llm_client=ToolCallLiteLLMClient(),
+        tool_registry=tool_registry,
+        tool_dispatcher=dispatcher,
+        hook_manager=hook_manager,
+    )
+    approval_event = asyncio.Event()
+    approval_result_holder = {"result": None}
+    stream_events: list[Any] = []
+    event_bus.subscribe_stream(stream_events.append)
+
+    def fail_completed_tool_snapshot(event: Any) -> None:
+        if event.event_type.value != "message_created" or event.message.info.finish != "tool_completed":
+            return
+        raise RuntimeError("消息快照写入失败")
+
+    event_bus.subscribe_domain(fail_completed_tool_snapshot, critical=True)
+
+    async def resolve_approval() -> None:
+        task = asyncio.create_task(
+            loop.run(
+                session=session,
+                workspace=workspace,
+                agent_profile=AgentProfile(name="build", system_prompt="test", allowed_tools=["approval_tool"], max_iterations=3),
+                runtime=runtime,
+                config=settings,
+                approval_event=approval_event,
+                approval_result_holder=approval_result_holder,
+                stop_event=asyncio.Event(),
+            )
+        )
+        await asyncio.sleep(0)
+        approval_result_holder["result"] = ApprovalResult(
+            approval_id="approval_tool_call_1",
+            approved=True,
+            created_at="2026-04-30T00:00:01Z",
+        )
+        approval_event.set()
+        await task
+
+    try:
+        asyncio.run(resolve_approval())
+    except RuntimeError as exc:
+        assert str(exc) == "消息快照写入失败"
+    else:
+        raise AssertionError("快照持久化失败必须中断审批恢复")
+
+    assert not any(
+        event.event_type == "assistant_message_completed" and event.data["message"]["info"]["finish"] == "tool_completed"
+        for event in stream_events
+    )
+
+
 def test_agent_loop_auto_approves_tool_when_manual_approval_disabled() -> None:
     settings = build_settings()
     session = build_session()

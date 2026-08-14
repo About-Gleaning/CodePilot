@@ -17,7 +17,7 @@
 - `parallel-agent-runtime-validation-results.json`：CODE-51 的脱敏并发与性能结果。
 - `agent-studio.md`：CODE-52 的多 Agent 工作台、独立配置主页面、响应式状态、C 端体验层与 replay/SSE 一致性设计。
 - `agent-studio-validation-results.json`：CODE-52 的后端、前端与浏览器脱敏验证结果。
-- `agent-studio-replay-status.md`：Agent Studio 的重复消息回放、Run 错误摘要与新会话模型选择契约。
+- `agent-studio-replay-status.md`：Agent Studio 的重复消息回放、审批恢复快照先于完成 SSE、Run 错误摘要与新会话模型选择契约。
 - `release-readiness.md`：CODE-53 的本机安全边界、健康探针、源码发布门禁与回滚手册。
 - `release-validation-results.json`：CODE-53 的确定性、真实 DeepSeek、依赖审计和脱敏扫描结果。
 

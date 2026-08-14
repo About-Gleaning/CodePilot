@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from codepilot.session.message import AssistantMessageError, AssistantMessageInfo, Message, ToolPart, ToolPartState
+from codepilot.session.message import AssistantMessageError, AssistantMessageInfo, Message, StepFinishPart, ToolPart, ToolPartState
 from codepilot.session.state import ApprovalResult, PendingApproval, PendingQuestion, QuestionResult, SessionState
 from codepilot.utils import utc_now_millis
 
@@ -34,7 +34,7 @@ def merge_approved_tool_results(session: SessionState, approved_tool_parts: list
         if tool_part.call_id not in replaced_ids:
             merged_parts.append(tool_part)
     latest_message.parts = merged_parts
-    _mark_assistant_tool_completed(latest_message)
+    _update_approved_tool_completion(latest_message)
 
 
 def merge_question_result(session: SessionState, question: PendingQuestion, result: QuestionResult) -> None:
@@ -208,6 +208,19 @@ def _mark_assistant_tool_completed(message: Message) -> None:
     assert isinstance(message.info, AssistantMessageInfo)
     message.info.time.completed = utc_now_millis()
     message.info.finish = "tool_completed"
+
+
+def _update_approved_tool_completion(message: Message) -> None:
+    """仅在同一消息的所有工具片段终态后关闭整批工具调用。"""
+    tool_parts = [part for part in message.parts if isinstance(part, ToolPart)]
+    if not tool_parts or any(part.state.status not in {"completed", "error"} for part in tool_parts):
+        message.info.finish = "tool_pending"
+        return
+
+    _mark_assistant_tool_completed(message)
+    for part in message.parts:
+        if isinstance(part, StepFinishPart) and part.reason == "tool_pending":
+            part.reason = "tool_completed"
 
 
 def _resolve_question_option_labels(question: dict[str, Any], selected_values: list[str]) -> list[str]:

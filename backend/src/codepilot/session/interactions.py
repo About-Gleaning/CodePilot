@@ -40,6 +40,10 @@ class SessionMessageAppender:
 
     async def append(self, session: SessionState, message: Message, runtime: RuntimeHandles) -> None:
         session.messages.append(message)
+        await self._persist_snapshot(session, message, runtime)
+
+    async def _persist_snapshot(self, session: SessionState, message: Message, runtime: RuntimeHandles) -> None:
+        """追加既有消息的最新快照，供回放按消息 ID 覆盖旧状态。"""
         session.updated_at = utc_now_iso()
         await runtime.event_bus.publish_domain_event(
             MessageCreatedEvent(

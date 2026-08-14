@@ -603,6 +603,7 @@ class AgentLoop:
             stop_event=ctx.stop_event,
         )
         merge_approved_tool_result(ctx.session, approved_tool_part)
+        await self._message_appender._persist_snapshot(ctx.session, ctx.session.messages[-1], ctx.runtime)
         await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
         return ToolExecutionBatch(tool_parts=[approved_tool_part])
 
@@ -618,6 +619,7 @@ class AgentLoop:
         )
         if batch.tool_parts:
             merge_approved_tool_results(ctx.session, batch.tool_parts)
+            await self._message_appender._persist_snapshot(ctx.session, ctx.session.messages[-1], ctx.runtime)
             await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
         return batch
 

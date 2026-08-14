@@ -8,11 +8,14 @@ import pytest
 
 from codepilot.events import EventBus, HumanInteractionEvent, MessageCreatedEvent, SessionCompactedEvent, SessionLifecycleEvent, SessionMetaEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
+from codepilot.hooks import RuntimeHandles
 from codepilot.llm.client import LiteLLMClient
 from codepilot.memory import JsonlSessionMemory
 from codepilot.memory.projections import replay_records
 from codepilot.session import Message, SessionRunner, SessionState, SessionStatus, TextPart, ToolPart, build_assistant_message_info, build_user_message_info
+from codepilot.session.interactions import SessionMessageAppender
 from codepilot.session.message import StepFinishPart, ToolPartState
+from codepilot.session.message_ops import merge_approved_tool_results
 from codepilot.session.title import SessionTitleService
 from codepilot.utils import utc_now_iso
 
@@ -479,6 +482,92 @@ def test_human_interaction_question_declined_closes_pending_tool_on_replay(tmp_p
         LiteLLMClient().build_provider_messages([Message.model_validate(replayed_message)])
 
     asyncio.run(run_case())
+
+
+def test_approved_tool_completion_snapshot_overwrites_pending_message_on_replay(tmp_path) -> None:
+    async def run_case() -> None:
+        memory = JsonlSessionMemory(tmp_path)
+        event_bus = EventBus()
+        event_bus.subscribe_domain(memory.handle_domain_event, critical=True)
+        session = build_session("session_1", status=SessionStatus.COMPLETED)
+        message = build_approval_message(session.session_id, "msg_approval_1")
+        session.messages.append(message)
+
+        await persist_session(memory, session, [message])
+        merge_approved_tool_results(
+            session,
+            [
+                ToolPart(
+                    call_id="call_approval_1",
+                    tool="bash_tool",
+                    state=ToolPartState(
+                        status="completed",
+                        input={"command": "rm -rf x"},
+                        output={"status": "ok", "tool_name": "bash_tool"},
+                    ),
+                )
+            ],
+        )
+
+        await SessionMessageAppender()._persist_snapshot(session, message, RuntimeHandles(event_bus=event_bus))
+
+        replay = await memory.replay(session.session_id)
+        replayed_message = replay["messages"][0]
+        records = [json.loads(line) for line in next(tmp_path.glob("*.jsonl")).read_text(encoding="utf-8").splitlines()]
+
+        assert len([record for record in records if record["record_type"] == "message"]) == 2
+        assert replayed_message["parts"][0]["state"]["status"] == "completed"
+        assert replayed_message["parts"][1]["reason"] == "tool_completed"
+        assert replayed_message["info"]["finish"] == "tool_completed"
+        LiteLLMClient().build_provider_messages([Message.model_validate(replayed_message)])
+
+    asyncio.run(run_case())
+
+
+def test_approved_tool_batch_only_completes_after_all_tool_parts_are_terminal() -> None:
+    session = build_session("session_1")
+    message = build_approval_message(session.session_id, "msg_approval_1")
+    message.parts.insert(
+        1,
+        ToolPart(
+            call_id="call_approval_2",
+            tool="bash_tool",
+            state=ToolPartState(status="pending", input={"command": "pwd"}),
+        ),
+    )
+    session.messages.append(message)
+
+    merge_approved_tool_results(
+        session,
+        [
+            ToolPart(
+                call_id="call_approval_1",
+                tool="bash_tool",
+                state=ToolPartState(status="completed", input={"command": "rm -rf x"}, output={"status": "ok"}),
+            )
+        ],
+    )
+
+    assert message.tool_parts()[0].state.status == "completed"
+    assert message.tool_parts()[1].state.status == "pending"
+    assert message.info.finish == "tool_pending"
+    assert isinstance(message.parts[2], StepFinishPart)
+    assert message.parts[2].reason == "tool_pending"
+
+    merge_approved_tool_results(
+        session,
+        [
+            ToolPart(
+                call_id="call_approval_2",
+                tool="bash_tool",
+                state=ToolPartState(status="completed", input={"command": "pwd"}, output={"status": "ok"}),
+            )
+        ],
+    )
+
+    assert [part.state.status for part in message.tool_parts()] == ["completed", "completed"]
+    assert message.info.finish == "tool_completed"
+    assert message.parts[2].reason == "tool_completed"
 
 
 def test_session_title_service_updates_jsonl_session_meta_title(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -8,11 +8,11 @@ Agent Studio 将 Agent 配置、启停、Session 历史、聊天和 Scheduler �
 
 ## 页面结构
 
-桌面以对话为中心：左侧 Agent 导航默认展开但可收起；会话和自动化检查器按需从右侧展开，避免长期占用主工作区宽度。Agent 配置作为主工作区的独立页面，与会话视图互斥显示。
+桌面以任务看板为中心：左侧 Agent 导航默认展开但可收起；主工作区按等待处理、执行中、空闲、异常/已停止分组显示多个 Agent 工作卡。会话详情以右侧抽屉按需展开，Agent 配置仍是独立主页面。
 
 - 左栏：Agent 搜索、活动/归档/异常筛选、运行状态、容量和新建入口。
-- 主工作区：在会话视图中展示当前 Agent/Session、运行控制、消息流、人工交互、附件和输入区；在配置视图中展示 Agent 身份、模型、Prompt 和能力边界。
-- 右栏：Session 历史和 Scheduler 自动化。
+- 主工作区：展示所有 Agent 的运行状态、最近已持久化结果摘要、最后工具摘要和独立任务派发入口；在配置视图中展示 Agent 身份、模型、Prompt 和能力边界。
+- 右侧详情抽屉：当前聚焦 Agent/Session 的消息流、运行控制、人工交互、附件、输入区、Session 历史和 Scheduler 自动化。
 
 新建、复制和编辑 Agent 统一进入配置主页面。新建或复制保存成功后切换到新 Agent 的会话视图；编辑 revision 或归档状态后留在配置页面。进入配置页不会清空原会话选择、消息草稿或附件草稿，返回和切换 Agent 时统一执行未保存修改确认。
 
@@ -29,11 +29,11 @@ Agent Studio 将 Agent 配置、启停、Session 历史、聊天和 Scheduler �
 页面选择键为 `agent_id + session_id`。切换 Agent 或 Session 只改变查看上下文，不触发取消或关闭。
 
 - `useAgentCatalog` 维护 Agent 目录、运行态容量和唯一一条低频控制 SSE。
-- `useAgentSession` 只为当前查看的 Session 建立高频 SSE。
+- `useAgentSession` 只为详情抽屉当前聚焦的 Session 建立高频 SSE。
 - `useAgentConfig` 按需加载 Prompt 和能力目录。
 - `useScheduleManagement` 只在“自动化”页签可见时加载和轮询。
 
-每次 Session 切换都递增 generation 并取消旧请求。回调通过 ref 保持稳定，避免父组件重渲染重复请求 replay。Session 列表还记录其所属 Agent ID，异步切换期间不会把前一个 Agent 的 Session 误配给新 Agent。
+每次 Session 切换都递增 generation 并取消旧请求。回调通过 ref 保持稳定，避免父组件重渲染重复请求 replay。工作卡通过既有低频运行态流更新状态；最近 Session 变更、完成、失败或等待人工处理时，卡片按需 replay 该 Session，提取最终结果与已持久化的最后工具摘要。后台卡片不会建立会话级 SSE。
 
 ## Replay 与 SSE 一致性
 
@@ -60,7 +60,7 @@ Agent 列表只返回默认 Provider、Model 和思考参数，不返回 Prompt�
 
 - Agent/runtime 合并使用按 ID 字典，查询为 `O(1)`，整体刷新为 `O(n)`。
 - Session 历史默认只渲染 50 条，每次“加载更多”增加 50 条。
-- 只有当前 Session 消费高频事件，避免后台 Agent token 占用渲染带宽。
+- 只有详情抽屉当前 Session 消费高频事件，避免后台 Agent token 占用渲染带宽；卡片摘要刷新只发生在低频运行态变更后。
 - 运行态 mutation 使用 Agent ID 级同步 guard，重复点击不会发出第二个启停请求。
 
 ## C 端体验层验证

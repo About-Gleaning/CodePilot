@@ -5,7 +5,7 @@ import {
   Search, Send, Settings2, ShieldCheck, Square, Terminal, X,
 } from 'lucide-react';
 
-import { ApiError, apiRequest } from '../../api/client';
+import { ApiError, apiJson, apiRequest } from '../../api/client';
 import { AttachmentPicker, AttachmentTray } from '../../components/Attachments';
 import { MessageStream } from '../../components/MessageStream';
 import { ReasoningBlock, TextBlock } from '../../components/MessageContent';
@@ -15,6 +15,7 @@ import { useTheme } from '../../hooks/useTheme';
 import type { MessagePart, PendingAttachment, TokenUsage } from '../../types';
 import { AgentConfigPanel } from './AgentConfigPanel';
 import { AutomationPanel } from './AutomationPanel';
+import { AgentTaskBoard, useCardSnapshots } from './AgentTaskBoard';
 import type { AgentRuntime, AgentSummary, PendingInteraction, ProviderConfig } from './types';
 import { useAgentCatalog } from './useAgentCatalog';
 import { isUnknownRequest, useAgentSession } from './useAgentSession';
@@ -66,6 +67,9 @@ export default function AgentStudio() {
   const [mobilePanel, setMobilePanel] = useState<MobilePanel>(null);
   const [agentRailCollapsed, setAgentRailCollapsed] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [detailOpen, setDetailOpen] = useState(false);
+  const [pinnedAgentIds, setPinnedAgentIds] = useState<string[]>([]);
+  const [sendingAgentIds, setSendingAgentIds] = useState<Set<string>>(new Set());
   const [agentSearch, setAgentSearch] = useState('');
   const [agentFilter, setAgentFilter] = useState<'active' | 'archived' | 'error'>('active');
   const [historyLimit, setHistoryLimit] = useState(50);
@@ -88,6 +92,7 @@ export default function AgentStudio() {
   const configRuntime = configAgentId ? catalog.runtimes[configAgentId] || stoppedRuntime(configAgentId) : null;
   const selectedSessionId = selectedAgentId ? sessionByAgent[selectedAgentId] ?? null : null;
   const draft = selectedAgentId ? drafts[selectedAgentId] || EMPTY_DRAFT : EMPTY_DRAFT;
+  const cardSnapshots = useCardSnapshots(catalog.agents, catalog.runtimes);
   const session = useAgentSession(
     selectedAgentId,
     selectedSessionId,
@@ -216,7 +221,48 @@ export default function AgentStudio() {
     setHistoryLimit(50);
     setConfigDirty(false);
     setLocalError('');
+    setDetailOpen(true);
     setMobilePanel(null);
+  };
+
+  const openDetail = (agentId: string, sessionId: string | null) => {
+    setSelectedAgentId(agentId);
+    if (sessionId) setSessionByAgent((current) => ({ ...current, [agentId]: sessionId }));
+    setHistoryLimit(50);
+    setLocalError('');
+    setDetailOpen(true);
+  };
+
+  const togglePinnedAgent = (agentId: string) => {
+    setPinnedAgentIds((current) => {
+      if (current.includes(agentId)) return current.filter((id) => id !== agentId);
+      return [...current.slice(-1), agentId];
+    });
+  };
+
+  const sendCardTask = async (agentId: string, content: string) => {
+    const agent = catalog.agentsById[agentId];
+    const runtime = catalog.runtimes[agentId];
+    if (!agent || !runtime || runtime.lifecycle_state !== 'RUNNING' || agent.archived) throw new Error('该 Agent 当前不可接收任务。');
+    const clientRequestId = `web_${crypto.randomUUID().replace(/-/g, '')}`;
+    setSendingAgentIds((current) => new Set(current).add(agentId));
+    try {
+      const run = await apiJson<{ ref: { session_id: string } }>(`/api/agents/${encodeURIComponent(agentId)}/runs`, 'POST', {
+        session_id: sessionByAgent[agentId] || runtime.recent_session_id || null,
+        content: translateSkillShortcuts(content, skills),
+        client_request_id: clientRequestId,
+        attachments: [],
+        metadata: {},
+      });
+      setSessionByAgent((current) => ({ ...current, [agentId]: run.ref.session_id }));
+      await catalog.refresh();
+    } finally {
+      setSendingAgentIds((current) => {
+        const next = new Set(current);
+        next.delete(agentId);
+        return next;
+      });
+    }
   };
 
   const changeInspectorTab = (tab: InspectorTab) => {
@@ -246,6 +292,7 @@ export default function AgentStudio() {
     setInspectorTab('sessions');
     setLocalError('');
     setMobilePanel(null);
+    window.requestAnimationFrame(() => composerRef.current?.focus());
   };
 
   const startSuggestedTask = (content: string) => {
@@ -422,7 +469,26 @@ export default function AgentStudio() {
           />
         </main>
       ) : (
-      <main className="studio-chat">
+      <>
+      <main className="studio-board-workspace">
+        <AgentTaskBoard
+          agents={filteredAgents}
+          runtimes={catalog.runtimes}
+          snapshots={cardSnapshots}
+          pinnedAgentIds={pinnedAgentIds}
+          sendingAgentIds={sendingAgentIds}
+          onOpen={openDetail}
+          onTogglePin={togglePinnedAgent}
+          onSend={sendCardTask}
+          onStart={(agentId) => void catalog.startAgent(agentId).catch(showError(setLocalError))}
+          onStop={(agent) => {
+            if (window.confirm(`关闭 ${agent.name}？将取消该 Agent 的 ${catalog.runtimes[agent.agent_id]?.active_run_count || 0} 个活动 Run。`)) {
+              void catalog.stopAgent(agent.agent_id).catch(showError(setLocalError));
+            }
+          }}
+        />
+      </main>
+      <main className={`studio-chat studio-detail-drawer ${detailOpen ? 'is-detail-open' : ''}`}>
         <header className="chat-command-bar">
           <div className="chat-identity">
             <span className={`runtime-dot state-${statusTone(selectedRuntime)}`} />
@@ -433,6 +499,8 @@ export default function AgentStudio() {
             {selectedAgent?.revision_id ? <code>rev {selectedAgent.revision_id.slice(0, 8)}</code> : null}
           </div>
           <div className="chat-runtime-actions">
+            <button type="button" className="studio-icon-button" onClick={() => setDetailOpen(false)} aria-label="关闭详情" title="关闭详情"><X size={15} /></button>
+            <button type="button" className="studio-button" disabled={!selectedAgent} onClick={newSession} aria-label="新建会话" title="新建会话"><Plus size={14} />新会话</button>
             <button type="button" className="studio-icon-button" disabled={!selectedAgent} onClick={() => openAgentConfig(selectedAgentId)} aria-label={`配置 ${selectedAgent?.name || 'Agent'}`} title="配置 Agent"><Settings2 size={15} /></button>
             <button type="button" className="studio-icon-button inspector-toggle" onClick={() => setInspectorOpen((value) => !value)} aria-label={inspectorOpen ? '收起会话与自动化面板' : '打开会话与自动化面板'} title={inspectorOpen ? '收起侧栏' : '会话与自动化'}><PanelRight size={15} /></button>
             {selectedRuntime?.lifecycle_state !== 'RUNNING' ? (
@@ -589,6 +657,7 @@ export default function AgentStudio() {
           ) : null}
         </form>
       </main>
+      </>
       )}
 
       <aside className={`studio-inspector ${mobilePanel === 'inspector' ? 'is-mobile-open' : ''}`}>

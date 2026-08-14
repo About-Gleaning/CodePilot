@@ -107,6 +107,7 @@ const mocks = vi.hoisted(() => ({
     cancel: vi.fn(async () => undefined),
     replyInteraction: vi.fn(async () => undefined),
   },
+  sessionHook: vi.fn(),
 }));
 
 mocks.catalog.agentsById = Object.fromEntries(
@@ -119,7 +120,10 @@ vi.mock('./useAgentCatalog', () => ({
 
 vi.mock('./useAgentSession', () => ({
   isUnknownRequest: () => false,
-  useAgentSession: () => mocks.session,
+  useAgentSession: (...args: unknown[]) => {
+    mocks.sessionHook(...args);
+    return mocks.session;
+  },
 }));
 
 import AgentStudio from './AgentStudio';
@@ -130,6 +134,7 @@ afterEach(() => {
   mocks.session.runtime.pending_interaction = null;
   mocks.session.replyInteraction.mockClear();
   mocks.session.send.mockClear();
+  mocks.sessionHook.mockClear();
   mocks.catalog.refresh.mockReset().mockResolvedValue(undefined);
   vi.unstubAllGlobals();
 });
@@ -231,6 +236,20 @@ describe('Agent Studio 底部交互区', () => {
     expect(await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。')).toBeInTheDocument();
     expect(view.container.querySelector('.studio-message-scroll')?.nextElementSibling).toHaveClass('studio-composer');
     expect(view.container.querySelector('.studio-chat > .chat-local-error')).not.toBeInTheDocument();
+  });
+
+  it('详情顶部可切换到新会话草稿并聚焦输入框', async () => {
+    const view = render(<AgentStudio />);
+    const detailButton = screen.getAllByRole('button', { name: '查看详情' })[0];
+
+    fireEvent.click(detailButton);
+    await waitFor(() => expect(view.container.querySelector('.studio-detail-drawer')).toHaveClass('is-detail-open'));
+    fireEvent.click(screen.getByRole('button', { name: '新建会话' }));
+
+    const input = screen.getByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。');
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(screen.getByText('草稿 / 首条消息后创建 Session')).toBeInTheDocument();
+    expect(mocks.sessionHook.mock.calls[mocks.sessionHook.mock.calls.length - 1]?.[1]).toBeNull();
   });
 
   it('错误提示和 Agent 切换都不会移除普通输入框', async () => {

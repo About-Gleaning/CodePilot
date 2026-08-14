@@ -1,5 +1,5 @@
 import { StrictMode } from 'react';
-import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MockEventSource } from '../../test/setup';
@@ -71,6 +71,39 @@ describe('useAgentCatalog', () => {
 });
 
 describe('useAgentSession', () => {
+  it('首条消息以空 session_id 创建会话，并回传服务端 Session ID', async () => {
+    const onSessionCreated = vi.fn();
+    const fetchMock = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/sessions')) return json({ sessions: [] });
+      if (url.endsWith('/runs')) {
+        return json({
+          ref: { agent_id: 'agent-a', session_id: 'session-created', run_id: 'run-a', revision_id: 'revision-a' },
+          status: 'RUNNING',
+        });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    function Probe() {
+      const value = useAgentSession('agent-a', null, onSessionCreated, () => undefined);
+      return <button type="button" onClick={() => void value.send({
+        content: '创建新会话', attachments: [], clientRequestId: 'request-a',
+      })}>发送首条消息</button>;
+    }
+
+    render(<Probe />);
+    fireEvent.click(screen.getByRole('button', { name: '发送首条消息' }));
+
+    await waitFor(() => expect(onSessionCreated).toHaveBeenCalledWith('session-created'));
+    const runCall = fetchMock.mock.calls.find(([input]) => String(input).endsWith('/runs'));
+    expect(JSON.parse(String((runCall?.[1] as RequestInit | undefined)?.body))).toMatchObject({
+      session_id: null,
+      content: '创建新会话',
+    });
+  });
+
   it('父组件回调引用变化时不会重复加载同一 replay', async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
