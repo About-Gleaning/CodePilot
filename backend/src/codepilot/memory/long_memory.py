@@ -32,25 +32,49 @@ def long_memory_path(codepilot_home: Path) -> Path:
     return path
 
 
+def user_long_memory_path(user_home: Path, agent_id: str) -> Path:
+    """按用户和稳定 Agent ID 定位长期记忆，路径不能由名称或模型输出决定。"""
+    root = user_home.expanduser().resolve()
+    safe_id = "_global" if agent_id == "_global" else agent_id
+    if not safe_id or "/" in safe_id or "\\" in safe_id or safe_id in {".", ".."}:
+        raise LongMemoryError("Agent ID 格式无效。", error_type="LongMemoryPathForbidden")
+    path = (root / "memory" / f"{safe_id}.md").resolve()
+    if not path.is_relative_to(root):
+        raise LongMemoryError("长期记忆文件路径越界。", error_type="LongMemoryPathForbidden")
+    return path
+
+
+def read_user_long_memory(user_home: Path, *, agent_id: str) -> str | None:
+    """先读取用户全局记忆，再读取当前 Agent 专属记忆。"""
+    sections = []
+    for memory_id in ("_global", agent_id):
+        content = _read_user_memory_file(user_long_memory_path(user_home, memory_id))
+        if content:
+            sections.append(content)
+    return "\n\n".join(sections) or None
+
+
+def append_user_long_memory(user_home: Path, agent_id: str, content: str) -> tuple[Path, int]:
+    return _append_memory_file(user_long_memory_path(user_home, agent_id), content)
+
+
+def replace_user_long_memory(user_home: Path, agent_id: str, old_string: str, new_string: str) -> tuple[Path, str, str]:
+    return _replace_memory_file(user_long_memory_path(user_home, agent_id), old_string, new_string)
+
+
 def read_long_memory(codepilot_home: Path, *, agent_name: str) -> str | None:
     """读取匹配当前 Agent 的长期记忆正文；文件头不注入模型。"""
     path = long_memory_path(codepilot_home)
-    if not path.is_file():
-        return None
-    try:
-        raw_content = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    header, content = _split_frontmatter(raw_content)
-    if not _matches_apply_to(header, agent_name):
-        return None
-    return content.strip() or None
+    return _read_memory_file(path, agent_name)
 
 
 def append_long_memory(codepilot_home: Path, content: str) -> tuple[Path, int]:
     """追加一条 Markdown bullet 形式的长期记忆。"""
+    return _append_memory_file(long_memory_path(codepilot_home), content)
+
+
+def _append_memory_file(path: Path, content: str) -> tuple[Path, int]:
     normalized = _normalize_memory_content(content)
-    path = long_memory_path(codepilot_home)
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = f"- {normalized}\n"
     needs_header = not path.exists() or not path.read_text(encoding="utf-8").strip()
@@ -66,11 +90,14 @@ def append_long_memory(codepilot_home: Path, content: str) -> tuple[Path, int]:
 
 def replace_long_memory(codepilot_home: Path, old_string: str, new_string: str) -> tuple[Path, str, str]:
     """用普通字符串替换修改长期记忆文件中的唯一匹配内容。"""
+    return _replace_memory_file(long_memory_path(codepilot_home), old_string, new_string)
+
+
+def _replace_memory_file(path: Path, old_string: str, new_string: str) -> tuple[Path, str, str]:
     normalized_new = _normalize_memory_content(new_string)
     if old_string == normalized_new:
         raise LongMemoryError("new_string 必须与 old_string 不同。", error_type="LongMemoryContentUnchanged")
 
-    path = long_memory_path(codepilot_home)
     if not path.is_file():
         raise LongMemoryError("长期记忆文件不存在，无法替换 old_string。", error_type="LongMemoryTextNotFound")
 
@@ -87,6 +114,31 @@ def replace_long_memory(codepilot_home: Path, old_string: str, new_string: str) 
     after = before.replace(old_string, normalized_new, 1)
     path.write_text(after, encoding="utf-8")
     return path, before, after
+
+
+def _read_memory_file(path: Path, agent_name: str) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        raw_content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    header, content = _split_frontmatter(raw_content)
+    if not _matches_apply_to(header, agent_name):
+        return None
+    return content.strip() or None
+
+
+def _read_user_memory_file(path: Path) -> str | None:
+    """用户分区已由路径和 Agent ID 隔离，只剥离 frontmatter。"""
+    if not path.is_file():
+        return None
+    try:
+        raw_content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    _, content = _split_frontmatter(raw_content)
+    return content.strip() or None
 
 
 def _normalize_memory_content(content: str) -> str:

@@ -6,6 +6,7 @@ export type AgentSummary = {
   name: string;
   description?: string;
   source: 'builtin' | 'custom';
+  visibility?: 'builtin' | 'shared' | 'private';
   archived: boolean;
   readonly?: boolean;
   validation_status: 'valid' | 'legacy_warning' | 'invalid';

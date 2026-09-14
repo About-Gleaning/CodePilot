@@ -17,6 +17,8 @@ from codepilot.events import (
 def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
     """把不同类型的领域事件映射成统一可落盘的记录结构。"""
     ownership = {
+        "schema_version": 2,
+        "user_id": event.user_id,
         "agent_id": event.agent_id,
         "run_id": event.run_id,
         "revision_id": event.revision_id,
@@ -27,7 +29,7 @@ def domain_event_to_record(event: DomainEvent) -> dict[str, Any]:
             "session_id": event.session_id,
             "created_at": event.created_at,
             "updated_at": event.data.get("updated_at") or event.created_at,
-            "data": event.data,
+            "data": {**event.data, "user_id": event.user_id},
             **ownership,
         }
     if isinstance(event, MessageCreatedEvent):

@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
+from codepilot.memory import read_user_long_memory
 from codepilot.session.agents import build_agent_profiles
 from codepilot.session.state import AgentState, LLMState, SessionState, SessionStatus
 from codepilot.session.system_prompt import build_system_prompt
@@ -129,6 +130,20 @@ def test_long_memory_write_rejects_non_life_agent(tmp_path: Path) -> None:
 
     assert result["status"] == "error"
     assert result["error_type"] == "LongMemoryAgentForbidden"
+
+
+def test_user_long_memory_merges_partitioned_files_without_apply_to_filter(tmp_path: Path) -> None:
+    user_home = tmp_path / "user"
+    memory_dir = user_home / "memory"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "_global.md").write_text(MEMORY_HEADER + "\n- 全局偏好\n", encoding="utf-8")
+    (memory_dir / "build-agent.md").write_text(MEMORY_HEADER + "\n- build 专属偏好\n", encoding="utf-8")
+
+    content = read_user_long_memory(user_home, agent_id="build-agent")
+
+    assert content == "- 全局偏好\n\n- build 专属偏好"
+    assert "type: memory_instruction" not in content
+    assert "applyTo:" not in content
 
 
 def test_long_memory_write_requires_context() -> None:

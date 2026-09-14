@@ -17,6 +17,7 @@ class AgentProfile(BaseModel):
     agent_id: str = ""
     revision_id: str = ""
     source: Literal["builtin", "custom"] = "custom"
+    visibility: Literal["builtin", "shared", "private"] = "private"
     description: str = ""
     system_prompt: str
     kind: Literal["agent", "subagent"] = "agent"

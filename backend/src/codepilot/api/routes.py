@@ -5,6 +5,7 @@ from typing import Any
 from fastapi import APIRouter
 
 from .schedule_routes import register_schedule_routes
+from .auth_routes import register_auth_routes
 from .agent_routes import register_agent_routes
 from .health_routes import register_health_routes
 from .session_routes import register_session_routes
@@ -15,6 +16,7 @@ def build_api_router(app_state: Any) -> APIRouter:
     """按既有领域顺序装配公开 API，保持路径与注册顺序兼容。"""
     router = APIRouter(prefix="/api")
     register_health_routes(router, app_state)
+    register_auth_routes(router, app_state)
     register_session_routes(router, app_state)
     register_agent_routes(router, app_state)
     register_workspace_routes(router, app_state)

@@ -19,6 +19,37 @@ class StorageSettings(BaseModel):
     codepilot_home: str = "~/codepilot"
 
 
+class AuthSettings(BaseModel):
+    enabled: Literal[True] = True
+    mode: Literal["local_dev", "lan_https"] = "local_dev"
+    public_origin: str | None = None
+    trusted_proxy_addresses: list[str] = Field(default_factory=lambda: ["127.0.0.1", "::1"])
+    idle_timeout_seconds: int = Field(default=12 * 60 * 60, ge=300)
+    absolute_timeout_seconds: int = Field(default=7 * 24 * 60 * 60, ge=3600)
+    max_active_runs_per_user: int = Field(default=2, ge=1, le=5)
+    max_started_agents_per_user: int = Field(default=3, ge=1, le=5)
+
+    @model_validator(mode="after")
+    def validate_public_origin(self) -> "AuthSettings":
+        import ipaddress
+
+        for address in self.trusted_proxy_addresses:
+            try:
+                ipaddress.ip_address(address)
+            except ValueError as exc:
+                raise ValueError("auth.trusted_proxy_addresses 只能包含 IP 地址") from exc
+        if self.mode == "local_dev":
+            return self
+        if not self.public_origin:
+            raise ValueError("auth.mode=lan_https 时必须配置 auth.public_origin")
+        parsed = urlsplit(self.public_origin)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"}:
+            raise ValueError("auth.public_origin 必须是无路径的 HTTPS Origin")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("auth.public_origin 不能包含认证信息、查询或 fragment")
+        return self
+
+
 ReasoningEffortValue = Literal["none", "minimal", "low", "medium", "high", "xhigh"]
 ThinkingBooleanValue = Literal["on", "off"]
 ThinkingValue = ReasoningEffortValue | ThinkingBooleanValue
@@ -191,6 +222,7 @@ class McpServerBaseSettings(BaseModel):
     requires_approval: bool = True
     timeout_seconds: int = Field(default=120, gt=0)
     max_output_chars: int = Field(default=50_000, gt=0)
+    assignable_to_private_agents: bool = False
 
 
 class McpStdioServerSettings(McpServerBaseSettings):
@@ -279,6 +311,7 @@ class LoggingSettings(BaseModel):
 class AppSettings(BaseModel):
     server: ServerSettings = Field(default_factory=ServerSettings)
     storage: StorageSettings = Field(default_factory=StorageSettings)
+    auth: AuthSettings = Field(default_factory=AuthSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
     llm_runtime: LLMRuntimeSettings = Field(default_factory=LLMRuntimeSettings)
     agent: AgentSettings = Field(default_factory=AgentSettings)
@@ -411,6 +444,14 @@ def load_settings(
         if "\x00" in codepilot_home:
             raise ValueError("CODEPILOT_HOME 包含非法字符")
         merged["storage"] = {**merged.get("storage", {}), "codepilot_home": codepilot_home}
+    auth_mode = source_env.get("CODEPILOT_AUTH_MODE")
+    public_origin = source_env.get("CODEPILOT_PUBLIC_ORIGIN")
+    if auth_mode or public_origin:
+        merged["auth"] = {
+            **merged.get("auth", {}),
+            **({"mode": auth_mode} if auth_mode else {}),
+            **({"public_origin": public_origin} if public_origin else {}),
+        }
     resolved_settings = AppSettings.model_validate(merged)
     runtime = build_llm_runtime_settings(resolved_settings.llm, environ=source_env)
     return resolved_settings.model_copy(update={"llm_runtime": runtime})

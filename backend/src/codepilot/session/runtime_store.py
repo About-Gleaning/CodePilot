@@ -50,6 +50,8 @@ class JsonlRunStore:
 
     async def append(self, state: RunState) -> None:
         record = {
+            "schema_version": 2,
+            "user_id": state.ref.user_id,
             "record_type": "run_state",
             "run": state.model_dump(mode="json"),
         }
@@ -100,6 +102,8 @@ class RuntimeControlEventStore:
         async with self._lock:
             self._seq = max(self._seq + 1, event.seq)
             record = {
+                "schema_version": 2,
+                "user_id": event.user_id,
                 "record_type": "runtime_control_event",
                 "control_seq": self._seq,
                 "event": event.model_dump(mode="json"),
@@ -120,6 +124,38 @@ class RuntimeControlEventStore:
                 continue
             events.append((seq, encode_runtime_cursor(seq), StreamEvent.model_validate(record["event"])))
         return events
+
+
+class UserRuntimeStoreRegistry:
+    """按用户延迟构造低频状态、Run 与控制事件存储。"""
+
+    def __init__(self, workspace_dir: Path) -> None:
+        self.workspace_dir = Path(workspace_dir).resolve()
+        self._state: dict[str, RuntimeStateStore] = {}
+        self._runs: dict[str, JsonlRunStore] = {}
+        self._control: dict[str, RuntimeControlEventStore] = {}
+
+    def known_user_ids(self) -> list[str]:
+        users_dir = self.workspace_dir / "users"
+        if not users_dir.is_dir():
+            return []
+        return sorted(path.name for path in users_dir.iterdir() if path.is_dir())
+
+    def state(self, user_id: str) -> RuntimeStateStore:
+        return self._state.setdefault(user_id, RuntimeStateStore(self._user_dir(user_id)))
+
+    def runs(self, user_id: str) -> JsonlRunStore:
+        return self._runs.setdefault(user_id, JsonlRunStore(self._user_dir(user_id)))
+
+    def control(self, user_id: str) -> RuntimeControlEventStore:
+        return self._control.setdefault(user_id, RuntimeControlEventStore(self._user_dir(user_id)))
+
+    def _user_dir(self, user_id: str) -> Path:
+        target = (self.workspace_dir / "users" / user_id).resolve()
+        if not target.is_relative_to(self.workspace_dir) or not user_id or "/" in user_id or "\\" in user_id:
+            raise ValueError("用户运行目录越界")
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return target
 
 
 def encode_runtime_cursor(seq: int) -> str:

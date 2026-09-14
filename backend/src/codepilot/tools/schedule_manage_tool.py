@@ -53,7 +53,7 @@ class ScheduleManageTool(BaseTool):
                     "task_id": {"type": "string", "description": "要修改、启停或删除的定时任务 ID。"},
                     "name": {"type": "string", "description": "任务名称。"},
                     "prompt": {"type": "string", "description": "定时执行时发送给 Agent 的固定 prompt。"},
-                    "agent_name": {"type": "string", "description": "执行任务的 Agent 名称。"},
+                    "agent_id": {"type": "string", "description": "执行任务的 Agent 稳定 ID。"},
                     "provider": {"type": "string", "description": "已激活的模型 provider。"},
                     "model": {"type": "string", "description": "provider 下可用的模型 ID。"},
                     "working_dir": {"type": "string", "description": "worker 执行任务时使用的本机目录。"},
@@ -104,19 +104,21 @@ class ScheduleManageTool(BaseTool):
             if action not in SCHEDULE_ACTIONS:
                 raise FileToolError(f"不支持的 action：{action}", error_type="ScheduleActionInvalid")
 
+            store, runner, user_id = self._resources(context)
+
             if action == "list_tasks":
-                return self._list_tasks()
+                return self._list_tasks(store)
             if action == "create_task":
-                return self._create_task(args)
+                return await self._create_task(args, runner, user_id)
             if action == "update_task":
-                return self._update_task(args)
+                return await self._update_task(args, store, runner, user_id)
             if action == "enable_task":
-                return self._set_enabled(args, enabled=True)
+                return await self._set_enabled(args, store, runner, user_id, enabled=True)
             if action == "disable_task":
-                return self._set_enabled(args, enabled=False)
+                return await self._set_enabled(args, store, runner, user_id, enabled=False)
             if action == "delete_task":
-                return self._delete_task(args)
-            return self._list_runs(args)
+                return self._delete_task(args, store, runner)
+            return self._list_runs(args, store)
         except Exception as exc:  # noqa: BLE001
             return build_tool_failure(self.spec.name, exc)
 
@@ -127,26 +129,36 @@ class ScheduleManageTool(BaseTool):
         if self.spec.name not in allowed_tools:
             raise FileToolError("当前 Agent 不允许管理定时任务。", error_type="ScheduleToolAgentForbidden")
 
-    def _list_tasks(self) -> dict[str, Any]:
-        tasks = [task.model_dump() for task in self._store.list_tasks()]
+    def _resources(self, context: ToolExecutionContext) -> tuple[Any, Any, str]:
+        user_id = str(getattr(context.run_ref, "user_id", "") or "")
+        if hasattr(self._runner, "runner") and hasattr(self._runner, "store"):
+            if not user_id:
+                raise FileToolError("调度操作缺少用户身份。", error_type="ScheduleUserMissing")
+            return self._runner.store(user_id), self._runner.runner(user_id), user_id
+        return self._store, self._runner, user_id
+
+    def _list_tasks(self, store: Any) -> dict[str, Any]:
+        tasks = [task.model_dump() for task in store.list_tasks()]
         return build_tool_success(
             self.spec.name,
             tasks=tasks,
             output=f"当前共有 {len(tasks)} 个定时任务。",
         )
 
-    def _create_task(self, args: dict[str, Any]) -> dict[str, Any]:
-        validated = self._validate(args)
-        task = self._runner.create_task(**validated)
+    async def _create_task(self, args: dict[str, Any], runner: Any, user_id: str) -> dict[str, Any]:
+        validated = self._validate(args, user_id)
+        if validated["enabled"]:
+            await self._ensure_started(user_id)
+        task = runner.create_task(**validated)
         return build_tool_success(
             self.spec.name,
             schedule=task.model_dump(),
             output=f"定时任务已创建：{task.name}（{task.id}）。",
         )
 
-    def _update_task(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def _update_task(self, args: dict[str, Any], store: Any, runner: Any, user_id: str) -> dict[str, Any]:
         task_id = self._require_task_id(args)
-        current = self._store.get_task(task_id)
+        current = store.get_task(task_id)
         if current is None:
             raise FileToolError(f"定时任务不存在：{task_id}", error_type="ScheduleTaskNotFound")
 
@@ -156,13 +168,15 @@ class ScheduleManageTool(BaseTool):
 
         merged = current.model_dump()
         merged.update(raw_updates)
-        validated = self._validate(merged)
+        validated = self._validate(merged, user_id)
+        if validated["enabled"]:
+            await self._ensure_started(user_id)
         updates = {key: validated[key] for key in raw_updates if key in validated}
         if "trigger" in raw_updates:
             updates["trigger"] = validated["trigger"]
             updates["next_run_at"] = compute_next_run_at(validated["trigger"]) if merged.get("enabled", current.enabled) else None
 
-        task = self._runner.update_task(task_id, updates)
+        task = runner.update_task(task_id, updates)
         if task is None:
             raise FileToolError(f"定时任务不存在：{task_id}", error_type="ScheduleTaskNotFound")
         return build_tool_success(
@@ -171,9 +185,21 @@ class ScheduleManageTool(BaseTool):
             output=f"定时任务已更新：{task.name}（{task.id}）。",
         )
 
-    def _set_enabled(self, args: dict[str, Any], *, enabled: bool) -> dict[str, Any]:
+    async def _set_enabled(
+        self,
+        args: dict[str, Any],
+        store: Any,
+        runner: Any,
+        user_id: str,
+        *,
+        enabled: bool,
+    ) -> dict[str, Any]:
         task_id = self._require_task_id(args)
-        task = self._runner.update_task(task_id, {"enabled": enabled})
+        if store.get_task(task_id) is None:
+            raise FileToolError(f"定时任务不存在：{task_id}", error_type="ScheduleTaskNotFound")
+        if enabled:
+            await self._ensure_started(user_id)
+        task = runner.update_task(task_id, {"enabled": enabled})
         if task is None:
             raise FileToolError(f"定时任务不存在：{task_id}", error_type="ScheduleTaskNotFound")
         state = "开启" if enabled else "关闭"
@@ -183,19 +209,23 @@ class ScheduleManageTool(BaseTool):
             output=f"定时任务已{state}：{task.name}（{task.id}）。",
         )
 
-    def _delete_task(self, args: dict[str, Any]) -> dict[str, Any]:
+    async def _ensure_started(self, user_id: str) -> None:
+        if user_id and hasattr(self._runner, "ensure_started"):
+            await self._runner.ensure_started(user_id)
+
+    def _delete_task(self, args: dict[str, Any], store: Any, runner: Any) -> dict[str, Any]:
         task_id = self._require_task_id(args)
         cancelled_before = {
             run.id
-            for run in self._store.list_runs()
+            for run in store.list_runs()
             if run.task_id == task_id and run.status == ScheduleRunStatus.PENDING
         }
-        deleted = self._runner.delete_task(task_id)
+        deleted = runner.delete_task(task_id)
         if not deleted:
             raise FileToolError(f"定时任务不存在：{task_id}", error_type="ScheduleTaskNotFound")
         cancelled_after = {
             run.id
-            for run in self._store.list_runs()
+            for run in store.list_runs()
             if run.task_id == task_id and run.status == ScheduleRunStatus.CANCELLED
         }
         cancelled_count = len(cancelled_before & cancelled_after)
@@ -206,11 +236,11 @@ class ScheduleManageTool(BaseTool):
             output=f"定时任务已删除：{task_id}，取消未启动运行 {cancelled_count} 个。",
         )
 
-    def _list_runs(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _list_runs(self, args: dict[str, Any], store: Any) -> dict[str, Any]:
         limit = int(args.get("recent_limit") or 20)
         limit = max(1, min(limit, 50))
-        active = [run.model_dump() for run in self._store.active_runs()]
-        recent = [run.model_dump() for run in self._store.recent_runs(limit=limit)]
+        active = [run.model_dump() for run in store.active_runs()]
+        recent = [run.model_dump() for run in store.recent_runs(limit=limit)]
         return build_tool_success(
             self.spec.name,
             active=active,
@@ -218,12 +248,14 @@ class ScheduleManageTool(BaseTool):
             output=f"当前 active run {len(active)} 个，最近 run 返回 {len(recent)} 个。",
         )
 
-    def _validate(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validate(self, payload: dict[str, Any], user_id: str) -> dict[str, Any]:
         try:
             return validate_schedule_task_payload(
                 settings=self._settings,
                 agent_profiles=self._agent_profiles,
                 payload=payload,
+                profile_resolver=(self._runner.profile_provider.get_active_profile_snapshot if hasattr(self._runner, "profile_provider") else None),
+                user_id=user_id,
             )
         except ScheduleValidationError as exc:
             raise FileToolError(exc.message, error_type=exc.error_type) from exc
@@ -238,7 +270,7 @@ class ScheduleManageTool(BaseTool):
 _UPDATABLE_FIELDS = {
     "name",
     "prompt",
-    "agent_name",
+    "agent_id",
     "provider",
     "model",
     "trigger",

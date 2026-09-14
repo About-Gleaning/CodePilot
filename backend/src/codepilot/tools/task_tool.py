@@ -24,16 +24,17 @@ class TaskTool(BaseTool):
     ) -> None:
         self._agent_loop = agent_loop
         self._agent_profiles = agent_profiles
+        self._profile_provider: Any | None = None
         self.spec = ToolSpec(
             name="task",
             description=load_tool_description("task"),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "agent": {"type": "string", "description": "目标 subagent 名称，必须从工具描述的可用 subagent 列表中选择。"},
+                    "agent_id": {"type": "string", "description": "目标 subagent 的稳定 ID。"},
                     "task": {"type": "string", "description": "交给 subagent 的自包含任务描述。"},
                 },
-                "required": ["agent", "task"],
+                "required": ["agent_id", "task"],
             },
             can_parallel=False,
             requires_approval=False,
@@ -49,13 +50,26 @@ class TaskTool(BaseTool):
 
     def _available_subagents_description(self) -> str:
         subagent_lines = [
-            f"- {profile.name}: {profile.description or '未提供用途说明。'}"
+            (
+                f"- {profile.agent_id}: {profile.name}，{profile.description or '未提供用途说明。'}"
+                if profile.agent_id
+                else f"- {profile.name}: {profile.description or '未提供用途说明。'}"
+            )
             for profile in self._agent_profiles.values()
             if profile.kind == "subagent"
         ]
         if not subagent_lines:
             return "当前没有可用 subagent。"
         return "\n".join(subagent_lines)
+
+    def set_profile_provider(self, provider: Any) -> None:
+        """主装配完成后注入用户级 Agent 解析器，避免工具按名称查询。"""
+        self._profile_provider = provider
+        shared = getattr(provider, "shared", None)
+        if shared is not None:
+            self._agent_profiles = {
+                profile.agent_id: profile for profile in shared.list_active_subagent_profile_snapshots()
+            }
 
     async def execute(
         self,
@@ -70,16 +84,21 @@ class TaskTool(BaseTool):
             if getattr(context.agent, "kind", "agent") != "agent" or not getattr(context.agent, "can_call_subagent", False):
                 raise FileToolError("当前 Agent 不允许分派 subagent。", error_type="TaskAgentForbidden")
 
-            target_name = str(args.get("agent") or "").strip()
+            target_id = str(args.get("agent_id") or "").strip()
+            if not target_id and context.run_ref is None:
+                # 仅兼容未进入资源化运行时的旧单元测试。
+                target_name = str(args.get("agent") or "").strip()
+                target_profile = self._agent_profiles.get(target_name)
+            else:
+                target_profile = self._resolve_target(context, target_id)
             task_text = str(args.get("task") or "").strip()
-            if not target_name or not task_text:
-                raise FileToolError("agent 和 task 均不能为空。", error_type="TaskInputInvalid")
+            if not target_id and context.run_ref is not None or not task_text:
+                raise FileToolError("agent_id 和 task 均不能为空。", error_type="TaskInputInvalid")
 
-            target_profile = self._agent_profiles.get(target_name)
             if target_profile is None:
-                raise FileToolError(f"subagent 不存在：{target_name}", error_type="TaskTargetNotFound")
+                raise FileToolError(f"subagent 不存在：{target_id}", error_type="TaskTargetNotFound")
             if target_profile.kind != "subagent":
-                raise FileToolError(f"task 只能调用 subagent，不能调用：{target_name}", error_type="TaskTargetForbidden")
+                raise FileToolError(f"task 只能调用 subagent，不能调用：{target_id}", error_type="TaskTargetForbidden")
 
             scoped_runtime = RuntimeHandles(
                 event_bus=_SubagentEventBus(
@@ -118,6 +137,14 @@ class TaskTool(BaseTool):
             )
         except Exception as exc:  # noqa: BLE001
             return build_tool_failure(self.spec.name, exc)
+
+    def _resolve_target(self, context: ToolExecutionContext, agent_id: str) -> AgentProfile | None:
+        if self._profile_provider is not None and context.run_ref is not None:
+            try:
+                return self._profile_provider.get_active_profile_snapshot(context.run_ref.user_id, agent_id)
+            except Exception:
+                return None
+        return next((profile for profile in self._agent_profiles.values() if profile.agent_id == agent_id), None)
 
 
 class _SubagentEventBus:

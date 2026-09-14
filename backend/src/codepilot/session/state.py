@@ -43,6 +43,7 @@ class RunStatus(str, Enum):
 class RunRef(BaseModel):
     """所有运行时控制操作必须携带的完整资源归属。"""
 
+    user_id: str = ""
     agent_id: str
     session_id: str
     run_id: str
@@ -57,6 +58,7 @@ class InteractionStatus(str, Enum):
 
 
 class HumanInteractionRef(BaseModel):
+    user_id: str = ""
     agent_id: str
     session_id: str
     run_id: str
@@ -89,6 +91,7 @@ class RunState(BaseModel):
 
 
 class AgentRuntimeState(BaseModel):
+    user_id: str = ""
     agent_id: str
     desired_state: AgentLifecycleState = AgentLifecycleState.STOPPED
     lifecycle_state: AgentLifecycleState = AgentLifecycleState.STOPPED
@@ -99,6 +102,7 @@ class AgentRuntimeState(BaseModel):
 
 
 class SessionState(BaseModel):
+    user_id: str = ""
     session_id: str
     agent_id: str = ""
     title: str | None = None
@@ -115,6 +119,8 @@ class SessionState(BaseModel):
 
 
 class AgentState(BaseModel):
+    agent_id: str = ""
+    visibility: Literal["builtin", "shared", "private"] = "private"
     name: str
     role: str = "agent"
     kind: Literal["agent", "subagent"] = "agent"

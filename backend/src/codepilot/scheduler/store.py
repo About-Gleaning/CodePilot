@@ -16,12 +16,13 @@ from codepilot.scheduler.models import ScheduleRun, ScheduleRunStatus, ScheduleT
 
 
 class ScheduleStore:
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(self, workspace_dir: Path, *, token_file: Path | None = None, owner_user_id: str | None = None) -> None:
         self.workspace_dir = workspace_dir
         self.schedules_file = workspace_dir / "schedules.json"
-        self.runs_file = workspace_dir / "schedule_runs.jsonl"
-        self.token_file = workspace_dir / "schedule_worker_token"
-        self.run_logs_dir = workspace_dir / "logs" / "schedule_runs"
+        self.runs_file = workspace_dir / "schedule-runs.jsonl"
+        self.token_file = token_file or workspace_dir / "schedule_worker_token"
+        self.run_logs_dir = workspace_dir / "schedule-logs"
+        self.owner_user_id = owner_user_id
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
         self.run_logs_dir.mkdir(parents=True, exist_ok=True)
         self._ensure_token_file()
@@ -32,13 +33,14 @@ class ScheduleStore:
         payload = json.loads(self.schedules_file.read_text(encoding="utf-8") or "[]")
         if not isinstance(payload, list):
             raise ValueError("schedules.json 必须是数组")
-        return [ScheduleTask.model_validate(item) for item in payload]
+        tasks = [ScheduleTask.model_validate(item) for item in payload]
+        if self.owner_user_id and any(task.user_id != self.owner_user_id for task in tasks):
+            raise ValueError("Schedule owner 与用户分区不一致")
+        return tasks
 
     def save_tasks(self, tasks: list[ScheduleTask]) -> None:
         data = [task.model_dump() for task in tasks]
-        temp_path = self.schedules_file.with_suffix(".json.tmp")
-        temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        temp_path.replace(self.schedules_file)
+        _atomic_write(self.schedules_file, json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
     def upsert_task(self, task: ScheduleTask) -> None:
         tasks = [item for item in self.list_tasks() if item.id != task.id]
@@ -58,8 +60,11 @@ class ScheduleStore:
 
     def append_run(self, run: ScheduleRun) -> None:
         self.runs_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.runs_file.open("a", encoding="utf-8") as file:
+        fd = os.open(self.runs_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as file:
             file.write(json.dumps(run.model_dump(), ensure_ascii=False) + "\n")
+            file.flush()
+            os.fsync(file.fileno())
 
     def list_run_snapshots(self) -> list[ScheduleRun]:
         if not self.runs_file.exists():
@@ -67,7 +72,10 @@ class ScheduleStore:
         runs: list[ScheduleRun] = []
         for line in self.runs_file.read_text(encoding="utf-8").splitlines():
             if line.strip():
-                runs.append(ScheduleRun.model_validate(json.loads(line)))
+                run = ScheduleRun.model_validate(json.loads(line))
+                if self.owner_user_id and run.user_id != self.owner_user_id:
+                    raise ValueError("ScheduleRun owner 与用户分区不一致")
+                runs.append(run)
         return runs
 
     def list_runs(self) -> list[ScheduleRun]:
@@ -150,6 +158,17 @@ def _is_matching_schedule_worker(pid: int, run_id: str) -> bool:
     except ValueError:
         return False
     return run_id_index < len(argv) and argv[run_id_index] == run_id
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp, path)
 
 
 def _process_command_line(pid: int) -> list[str] | None:

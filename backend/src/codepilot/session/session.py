@@ -164,6 +164,7 @@ class AgentLoop:
         """执行一次独立 subagent loop，只沉淀消息和工具事件，不发布父会话生命周期。"""
         context_id = new_context_id()
         child_session = SessionState(
+            user_id=parent_session.user_id,
             session_id=parent_session.session_id,
             title=parent_session.title,
             workspace_id=parent_session.workspace_id,
@@ -229,6 +230,8 @@ class AgentLoop:
     ) -> AgentState:
         resolved_context_id = context_id or str(session.metadata.get("agent_context_id") or "main")
         return AgentState(
+            agent_id=agent_profile.agent_id,
+            visibility=agent_profile.visibility,
             name=agent_profile.name,
             role=agent_profile.kind,
             kind=agent_profile.kind,

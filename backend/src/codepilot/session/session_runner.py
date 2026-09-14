@@ -201,7 +201,8 @@ class SessionRunner:
                 raise ValueError(f"session `{gateway_input.session_id}` 不存在或未加载")
             if self._session.session_id != gateway_input.session_id:
                 raise ValueError(f"session `{gateway_input.session_id}` 不是当前可用会话")
-            self._ensure_agent_supported(gateway_input.agent_name)
+            if profile_override is None:
+                self._ensure_agent_supported(gateway_input.agent_name)
             activated_provider, selected_model = resolve_llm_selection(
                 settings=self._config,
                 requested_provider=gateway_input.provider,
@@ -210,7 +211,7 @@ class SessionRunner:
             user_metadata = self._build_user_metadata(activated_provider.provider, selected_model, gateway_input)
             # 同一 session 继续执行时，允许显式切换 agent/provider/model；
             # session 顶层仅保存“当前最新执行配置”，历史配置仍由消息元数据承载。
-            self._session.agent_name = gateway_input.agent_name
+            self._session.agent_name = profile_override.name if profile_override else gateway_input.agent_name
             self._session.provider = activated_provider.provider
             self._session.model = selected_model
             self._apply_user_metadata(user_metadata)
@@ -221,11 +222,13 @@ class SessionRunner:
                 gateway_input,
                 session_id=run_ref.session_id if run_ref else None,
                 agent_id=run_ref.agent_id if run_ref else "",
+                profile_override=profile_override,
             )
 
         binding_upgrade = run_ref is not None and not self._session.agent_id
         if run_ref is not None:
             self._session.agent_id = run_ref.agent_id
+            self._session.user_id = run_ref.user_id
             self._session.metadata.update(
                 {
                     "agent_id": run_ref.agent_id,
@@ -261,6 +264,7 @@ class SessionRunner:
                         "title": self._session.title,
                         "workspace_id": self._session.workspace_id,
                         "workspace_path": self._session.workspace_path,
+                        "user_id": self._session.user_id,
                         "agent_id": self._session.agent_id,
                         "initial_user_message_id": message.info.id,
                         "updated_at": self._session.updated_at,
@@ -367,7 +371,8 @@ class SessionRunner:
             raise
         finally:
             if runtime.run_ref is not None:
-                await get_workspace_write_lease_manager(self._workspace.workspace_dir).release(runtime.run_ref)
+                lease_root = getattr(self._workspace, "shared_runtime_dir", self._workspace.workspace_dir)
+                await get_workspace_write_lease_manager(lease_root).release(runtime.run_ref)
         return session
 
     async def _handle_stop(self) -> SessionState | None:
@@ -471,21 +476,24 @@ class SessionRunner:
         *,
         session_id: str | None = None,
         agent_id: str = "",
+        profile_override: AgentProfile | None = None,
     ) -> SessionState:
         """基于当前输入创建新的 session，并解析本次会话使用的 LLM 选择。"""
         now = utc_now_iso()
-        self._ensure_agent_supported(gateway_input.agent_name)
+        if profile_override is None:
+            self._ensure_agent_supported(gateway_input.agent_name)
         activated_provider, selected_model = resolve_llm_selection(
             settings=self._config,
             requested_provider=gateway_input.provider,
             requested_model=gateway_input.model,
         )
         return SessionState(
+            user_id=getattr(self._workspace, "user_id", ""),
             session_id=session_id or new_session_id(),
             agent_id=agent_id,
             workspace_id=self._workspace.workspace_id,
             workspace_path=str(self._workspace.workspace_path),
-            agent_name=gateway_input.agent_name or self._default_agent_name(),
+            agent_name=profile_override.name if profile_override else gateway_input.agent_name or self._default_agent_name(),
             provider=activated_provider.provider,
             model=selected_model,
             status=SessionStatus.RUNNING,

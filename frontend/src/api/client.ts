@@ -16,8 +16,16 @@ type ErrorBody = {
   detail?: string | { code?: string; message?: string };
 };
 
+export const AUTH_EXPIRED_EVENT = 'codepilot:auth-expired';
+
 export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(url, init);
+  const method = (init?.method || 'GET').toUpperCase();
+  const headers = new Headers(init?.headers);
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    const csrf = readCookie('__Host-codepilot_csrf') || readCookie('codepilot_dev_csrf');
+    if (csrf) headers.set('X-CodePilot-CSRF', csrf);
+  }
+  const response = await fetch(url, { ...init, headers, credentials: 'same-origin' });
   if (!response.ok) {
     const body = await response.json().catch(() => null) as ErrorBody | null;
     const detail = body?.detail;
@@ -29,12 +37,19 @@ export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T>
         : friendlyStatusMessage(response.status);
     const retryAfterRaw = response.headers.get('Retry-After');
     const retryAfter = retryAfterRaw && Number.isFinite(Number(retryAfterRaw)) ? Number(retryAfterRaw) : null;
+    if (response.status === 401) window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
     throw new ApiError(message, response.status, code, retryAfter);
   }
   if (response.status === 204) {
     return undefined as T;
   }
   return response.json() as Promise<T>;
+}
+
+function readCookie(name: string): string {
+  const prefix = `${name}=`;
+  const item = document.cookie.split(';').map((value) => value.trim()).find((value) => value.startsWith(prefix));
+  return item ? decodeURIComponent(item.slice(prefix.length)) : '';
 }
 
 export function apiJson<T>(url: string, method: string, body?: unknown, signal?: AbortSignal): Promise<T> {

@@ -90,6 +90,7 @@ class McpClientManager:
             else:
                 status = "unavailable"
             capabilities.append({"name": name, "status": status, "requires_approval": config.requires_approval,
+                                 "assignable_to_private_agents": config.assignable_to_private_agents,
                                  "description": "MCP 服务权限按服务整体授予，不展示连接配置或凭证。"})
         return capabilities
 
@@ -226,6 +227,19 @@ class McpToolAdapter(BaseTool):
                 "tool_name": self.spec.name,
                 "error_type": "McpPermissionError",
                 "error_message": f"当前 Agent 未通过 `{permission}` 授权此 MCP server",
+                "recoverable": False,
+            }
+        server_policy = self.manager._settings.servers.get(self.mcp_server_name)
+        visibility = getattr(getattr(context, "agent", None), "visibility", "private")
+        authenticated_run = bool(getattr(getattr(context, "run_ref", None), "user_id", ""))
+        if server_policy is None or not server_policy.enabled or authenticated_run and (
+            visibility == "private" and not server_policy.assignable_to_private_agents
+        ):
+            return {
+                "status": "error",
+                "tool_name": self.spec.name,
+                "error_type": "McpPolicyDenied",
+                "error_message": "当前服务安全策略已禁止此 MCP 调用",
                 "recoverable": False,
             }
         try:

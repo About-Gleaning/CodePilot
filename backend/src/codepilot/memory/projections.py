@@ -17,6 +17,7 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     session_meta = require_session_meta(records)
     session_data: dict[str, Any] = {
         "session_id": session_meta["session_id"],
+        "user_id": session_meta["data"].get("user_id") or session_meta.get("user_id") or "",
         "agent_id": session_meta["data"].get("agent_id") or session_meta.get("agent_id") or "",
         "title": session_meta["data"].get("title"),
         "workspace_id": session_meta["data"].get("workspace_id"),
@@ -28,6 +29,8 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     session_snapshot: dict[str, Any] | None = {
         "record_type": "session_meta",
         "session_id": session_meta["session_id"],
+        "user_id": session_meta.get("user_id"),
+        "agent_id": session_meta.get("agent_id"),
         "created_at": session_meta.get("created_at"),
         "data": session_data,
     }

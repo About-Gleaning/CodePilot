@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useState } from 'react';
 import { CalendarClock, Pause, Play, Plus, Trash2 } from 'lucide-react';
 
 import { apiJson, apiRequest } from '../../api/client';
@@ -8,6 +8,7 @@ type Schedule = {
   id: string;
   name: string;
   prompt: string;
+  agent_id: string;
   agent_name: string;
   provider: string;
   model: string;
@@ -20,6 +21,7 @@ type Schedule = {
 type ScheduleRun = {
   id: string;
   task_name: string;
+  agent_id: string;
   status: string;
   session_id?: string | null;
   scheduled_at: string;
@@ -39,7 +41,7 @@ export function AutomationPanel({
   const [providers, setProviders] = useState<ProviderCapability[]>([]);
   const [showForm, setShowForm] = useState(false);
   const [error, setError] = useState('');
-  const [form, setForm] = useState({ name: '', prompt: '', agent_name: '', provider: '', model: '', interval: '3600' });
+  const [form, setForm] = useState({ name: '', prompt: '', agent_id: '', provider: '', model: '', interval: '3600' });
 
   const refresh = async () => {
     const [tasks, nextRuns] = await Promise.all([
@@ -69,10 +71,6 @@ export function AutomationPanel({
   const selectedProvider = providers.find((item) => item.provider === form.provider);
   const models = selectedProvider?.models || [];
   const activeAgents = agents.filter((agent) => !agent.archived && agent.validation_status !== 'invalid');
-  const agentIdByName = useMemo(
-    () => Object.fromEntries(agents.map((agent) => [agent.name, agent.agent_id])),
-    [agents],
-  );
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -81,14 +79,14 @@ export function AutomationPanel({
       await apiJson('/api/schedules', 'POST', {
         name: form.name,
         prompt: form.prompt,
-        agent_name: form.agent_name,
+        agent_id: form.agent_id,
         provider: form.provider,
         model: form.model,
         working_dir: '.',
         enabled: true,
         trigger: { kind: 'interval', interval_seconds: Number(form.interval) },
       });
-      setForm({ name: '', prompt: '', agent_name: '', provider: '', model: '', interval: '3600' });
+      setForm({ name: '', prompt: '', agent_id: '', provider: '', model: '', interval: '3600' });
       setShowForm(false);
       await refresh();
     } catch (reason) {
@@ -108,7 +106,7 @@ export function AutomationPanel({
         <form className="automation-form" onSubmit={submit}>
           <label className="studio-field"><span>任务名</span><input required value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
           <label className="studio-field"><span>Prompt</span><textarea required rows={4} value={form.prompt} onChange={(event) => setForm({ ...form, prompt: event.target.value })} /></label>
-          <label className="studio-field"><span>Agent</span><select required value={form.agent_name} onChange={(event) => setForm({ ...form, agent_name: event.target.value })}><option value="">选择</option>{activeAgents.map((agent) => <option key={agent.agent_id} value={agent.name}>{agent.name}</option>)}</select></label>
+          <label className="studio-field"><span>Agent</span><select required value={form.agent_id} onChange={(event) => setForm({ ...form, agent_id: event.target.value })}><option value="">选择</option>{activeAgents.map((agent) => <option key={agent.agent_id} value={agent.agent_id}>{agent.name} · {agent.visibility === 'private' ? '私有' : agent.visibility === 'shared' ? '共享' : '内置'}</option>)}</select></label>
           <label className="studio-field"><span>Provider</span><select required value={form.provider} onChange={(event) => setForm({ ...form, provider: event.target.value, model: '' })}><option value="">选择</option>{providers.map((provider) => <option key={provider.provider} value={provider.provider}>{provider.label}</option>)}</select></label>
           <label className="studio-field"><span>Model</span><select required value={form.model} onChange={(event) => setForm({ ...form, model: event.target.value })}><option value="">选择</option>{models.map((model) => <option key={model}>{model}</option>)}</select></label>
           <label className="studio-field"><span>间隔（秒）</span><input type="number" min="60" value={form.interval} onChange={(event) => setForm({ ...form, interval: event.target.value })} /></label>
@@ -136,9 +134,7 @@ export function AutomationPanel({
         <header><strong>最近运行</strong><small>{runs.active.length} 活动</small></header>
         {[...runs.active, ...runs.recent].slice(0, 12).map((run) => (
           <button type="button" key={run.id} disabled={!run.session_id} onClick={() => {
-            const task = schedules.find((item) => item.name === run.task_name);
-            const agentId = task ? agentIdByName[task.agent_name] : '';
-            if (agentId && run.session_id) onOpenSession(agentId, run.session_id);
+            if (run.agent_id && run.session_id) onOpenSession(run.agent_id, run.session_id);
           }}>
             <span className={`runtime-dot state-${run.status.toLowerCase()}`} />
             <span><strong>{run.task_name}</strong><small>{formatDate(run.scheduled_at)}</small></span>

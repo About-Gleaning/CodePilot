@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from codepilot.session.attachments import AttachmentError, SUPPORTED_IMAGE_MIMES, attachment_message_dir, detect_image_mime, sanitize_attachment_filename
@@ -15,22 +15,33 @@ _SKIPPED_FILE_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".v
 
 def register_workspace_routes(router: APIRouter, app_state: Any) -> None:
     @router.get("/config")
-    async def get_config() -> JSONResponse:
+    async def get_config(request: Request) -> JSONResponse:
         settings = app_state.settings
+        principal = getattr(request.state, "principal", None)
+        if principal is not None and hasattr(app_state, "agent_config_service"):
+            agents = app_state.agent_config_service.list(principal.user_id, "active")
+            agent_view: Any = [{"agent_id": item["agent_id"], "name": item["name"], "visibility": item["visibility"]} for item in agents]
+        else:
+            # 仅兼容不挂认证中间件的旧路由单元测试。
+            agent_view = [name for name, profile in app_state.agent_profiles.items() if getattr(profile, "kind", "agent") == "agent"]
         providers = [{"provider": item.provider, "label": item.label, "models": item.models, "model_capabilities": {model: {"thinking": config.thinking.model_dump() if config.thinking else None} for model, config in item.model_settings.items()}} for item in settings.llm_runtime.activated_providers.values()]
-        return JSONResponse({"workspace_id": app_state.workspace.workspace_id, "activated_providers": providers, "agents": [name for name, profile in app_state.agent_profiles.items() if getattr(profile, "kind", "agent") == "agent"], "skills": app_state.skill_registry.list_briefs() if hasattr(app_state, "skill_registry") else [], "sse": settings.sse.model_dump()})
+        return JSONResponse({"workspace_id": app_state.workspace.workspace_id, "activated_providers": providers, "agents": agent_view, "skills": app_state.skill_registry.list_briefs() if hasattr(app_state, "skill_registry") else [], "sse": settings.sse.model_dump()})
 
     @router.get("/workspace/files")
     async def get_workspace_files(q: str = "", limit: int = Query(default=40, ge=1, le=80)) -> JSONResponse:
         return JSONResponse({"files": await asyncio.to_thread(list_workspace_files, app_state.workspace.workspace_path, q, limit)})
 
     @router.get("/attachments/{session_id}/{message_id}/{filename}")
-    async def get_attachment(session_id: str, message_id: str, filename: str) -> FileResponse:
+    async def get_attachment(session_id: str, message_id: str, filename: str, request: Request) -> FileResponse:
         try:
+            user_id = request.state.principal.user_id
             safe_filename = sanitize_attachment_filename(filename)
             if safe_filename != filename:
                 raise AttachmentError("附件文件名非法。")
-            target_dir = attachment_message_dir(app_state.workspace, session_id, message_id).resolve()
+            replay = await app_state.session_memory.replay(user_id, session_id)
+            if not _replay_owns_attachment(replay, message_id, safe_filename):
+                raise AttachmentError("附件不存在。")
+            target_dir = attachment_message_dir(app_state.workspace.for_user(user_id), session_id, message_id).resolve()
             target = (target_dir / safe_filename).resolve(strict=False)
             if not target.is_relative_to(target_dir) or not target.is_file():
                 raise AttachmentError("附件不存在。")
@@ -41,6 +52,17 @@ def register_workspace_routes(router: APIRouter, app_state: Any) -> None:
         if media_type not in SUPPORTED_IMAGE_MIMES:
             raise HTTPException(status_code=415, detail="附件类型不支持预览")
         return FileResponse(target, media_type=media_type, filename=target.name)
+
+
+def _replay_owns_attachment(replay: dict[str, Any], message_id: str, filename: str) -> bool:
+    for message in replay.get("messages", []):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("id") != message_id:
+            continue
+        for part in message.get("parts", []):
+            if isinstance(part, dict) and part.get("type") == "file" and part.get("filename") == filename:
+                return True
+    return False
 
 
 def list_workspace_files(workspace_path: Path, query: str, limit: int) -> list[dict[str, str]]:

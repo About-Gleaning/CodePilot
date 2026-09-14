@@ -262,6 +262,7 @@ class ToolDispatcher:
             stop_event=stop_event,
             skip_approval=skip_approval,
             run_ref=runtime.run_ref,
+            principal=getattr(workspace, "principal", None),
         )
         preflight_part, preflight_approval = await self._run_preflight(
             session, runtime, agent, tool, tool_context, tool_name, tool_args, tool_call_id, skip_approval
@@ -282,7 +283,8 @@ class ToolDispatcher:
 
         if tool.spec.side_effect == "workspace_mutation" and runtime.run_ref is not None:
             try:
-                await get_workspace_write_lease_manager(workspace.workspace_dir).acquire(runtime.run_ref)
+                lease_root = getattr(workspace, "shared_runtime_dir", workspace.workspace_dir)
+                await get_workspace_write_lease_manager(lease_root).acquire(runtime.run_ref)
             except WorkspaceWriteBusy:
                 result = self._result_builder.error_result(
                     tool_name,

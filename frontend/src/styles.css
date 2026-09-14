@@ -5682,3 +5682,18 @@ pre {
     margin-left: 48px;
   }
 }
+/* 登录态是整个 Studio 的生命周期边界，退出后不保留业务 DOM。 */
+.authenticated-app { min-height: 100vh; }
+.identity-bar { height: 34px; display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 0 14px; border-bottom: 1px solid var(--border, #d9dde3); background: var(--surface, #fff); color: var(--text-secondary, #525866); font-size: 12px; }
+.identity-bar > span:first-child { display: inline-flex; align-items: center; gap: 6px; }
+.identity-role { color: var(--text-tertiary, #737984); }
+.identity-logout { width: 28px; height: 28px; display: inline-grid; place-items: center; border: 0; background: transparent; color: inherit; cursor: pointer; }
+.auth-shell { min-height: 100vh; display: grid; place-items: center; background: #f3f5f7; color: #20242b; }
+.login-panel { width: min(360px, calc(100vw - 32px)); display: grid; gap: 16px; padding: 28px; background: #fff; border: 1px solid #d9dde3; border-radius: 8px; box-shadow: 0 12px 36px rgb(24 31 42 / 10%); }
+.login-panel h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0; }
+.login-mark { width: 36px; height: 36px; display: grid; place-items: center; color: #176b4d; background: #e8f4ee; border-radius: 6px; }
+.login-panel label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
+.login-panel input { min-width: 0; height: 40px; padding: 0 10px; border: 1px solid #bbc1ca; border-radius: 5px; font: inherit; }
+.login-panel button[type='submit'] { height: 40px; border: 0; border-radius: 5px; background: #176b4d; color: #fff; font: inherit; font-weight: 700; cursor: pointer; }
+.login-panel button:disabled { opacity: .6; cursor: wait; }
+.login-error { margin: 0; color: #b42318; font-size: 13px; }

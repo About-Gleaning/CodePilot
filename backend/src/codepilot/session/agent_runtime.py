@@ -18,14 +18,13 @@ from uuid import uuid4
 from codepilot.config.settings import resolve_llm_selection, resolve_thinking_value
 from codepilot.events import DomainEvent, EventBus, HumanInteractionEvent, RunEventScope, StreamEvent
 from codepilot.gateway import GatewayInput, GatewayInputType
-from codepilot.memory import JsonlSessionMemory
+from codepilot.memory import UserPartitionedSessionMemory
 from codepilot.session.agents import AgentProfile
 from codepilot.session.attachments import decode_image_attachment, sanitize_attachment_filename
 from codepilot.session.runtime_store import (
-    JsonlRunStore,
-    RuntimeControlEventStore,
     RuntimeStateStore,
     RuntimeStoreCorrupt,
+    UserRuntimeStoreRegistry,
     encode_runtime_cursor,
 )
 from codepilot.session.session_runner import SessionRunner
@@ -53,22 +52,31 @@ class RuntimeConflict(ValueError):
         self.retry_after = retry_after
 
 
+UserAgentKey = tuple[str, str]
+SessionKey = tuple[str, str, str]
+RunKey = tuple[str, str, str, str]
+
+
 class AgentProfileProvider(Protocol):
-    def get_active_profile_snapshot(self, agent_id: str) -> AgentProfile: ...
+    def get_active_profile_snapshot(self, user_id: str, agent_id: str) -> AgentProfile: ...
 
-    def get_record_snapshot(self, agent_id: str) -> dict[str, Any]: ...
+    def get_record_snapshot(self, user_id: str, agent_id: str) -> dict[str, Any]: ...
 
-    def list_active_profile_snapshots(self) -> list[AgentProfile]: ...
+    def list_active_profile_snapshots(self, user_id: str) -> list[AgentProfile]: ...
 
 
 class SessionRunnerFactory:
     """为每个 Session 创建不共享可变状态的 Runner。"""
 
-    def __init__(self, create: Callable[[], SessionRunner]) -> None:
+    def __init__(self, create: Callable[..., SessionRunner]) -> None:
         self._create = create
 
-    def create_runner(self) -> SessionRunner:
-        return self._create()
+    def create_runner(self, user_id: str) -> SessionRunner:
+        try:
+            return self._create(user_id)
+        except TypeError:
+            # 兼容只接收零参数的测试 Factory；正式运行时始终传入用户视图。
+            return self._create()
 
 
 @dataclass(slots=True)
@@ -76,6 +84,7 @@ class SessionExecutionHandle:
     agent_id: str
     session_id: str
     runner: SessionRunner
+    user_id: str = ""
 
 
 @dataclass(slots=True)
@@ -102,12 +111,13 @@ class CancellationResult:
 
 
 class AgentRuntimeBackend(Protocol):
-    async def start_agent(self, agent_id: str) -> None: ...
+    async def start_agent(self, user_id: str, agent_id: str) -> None: ...
 
-    async def stop_agent(self, agent_id: str) -> None: ...
+    async def stop_agent(self, user_id: str, agent_id: str) -> None: ...
 
     async def load_session(
         self,
+        user_id: str,
         agent_id: str,
         session_id: str,
         replay: dict[str, Any] | None,
@@ -148,29 +158,30 @@ class InProcessAgentRuntimeBackend:
 
     def __init__(self, runner_factory: SessionRunnerFactory) -> None:
         self._runner_factory = runner_factory
-        self._sessions: dict[tuple[str, str], SessionExecutionHandle] = {}
+        self._sessions: dict[tuple[str, str, str], SessionExecutionHandle] = {}
 
-    async def start_agent(self, agent_id: str) -> None:
+    async def start_agent(self, user_id: str, agent_id: str) -> None:
         return None
 
-    async def stop_agent(self, agent_id: str) -> None:
-        handles = [handle for key, handle in self._sessions.items() if key[0] == agent_id]
+    async def stop_agent(self, user_id: str, agent_id: str) -> None:
+        handles = [handle for key, handle in self._sessions.items() if key[:2] == (user_id, agent_id)]
         await asyncio.gather(*(self.close_session(handle) for handle in handles), return_exceptions=True)
 
     async def load_session(
         self,
+        user_id: str,
         agent_id: str,
         session_id: str,
         replay: dict[str, Any] | None,
         profile_snapshot: AgentProfile,
     ) -> SessionExecutionHandle:
-        key = (agent_id, session_id)
+        key = (user_id, agent_id, session_id)
         if key in self._sessions:
             return self._sessions[key]
-        runner = self._runner_factory.create_runner()
+        runner = self._runner_factory.create_runner(user_id)
         if replay is not None:
             runner.load_session(session_id, replay)
-        handle = SessionExecutionHandle(agent_id=agent_id, session_id=session_id, runner=runner)
+        handle = SessionExecutionHandle(user_id=user_id, agent_id=agent_id, session_id=session_id, runner=runner)
         self._sessions[key] = handle
         return handle
 
@@ -234,7 +245,7 @@ class InProcessAgentRuntimeBackend:
 
     async def close_session(self, session_handle: SessionExecutionHandle) -> None:
         await session_handle.runner.shutdown()
-        self._sessions.pop((session_handle.agent_id, session_handle.session_id), None)
+        self._sessions.pop((session_handle.user_id, session_handle.agent_id, session_handle.session_id), None)
 
     async def shutdown(self) -> None:
         await asyncio.gather(*(self.close_session(handle) for handle in list(self._sessions.values())), return_exceptions=True)
@@ -263,55 +274,72 @@ class AgentRuntimeManager:
         workspace: Any,
         config: Any,
         event_bus: EventBus,
-        session_memory: JsonlSessionMemory,
+        session_memory: UserPartitionedSessionMemory,
         profile_provider: AgentProfileProvider,
         backend: AgentRuntimeBackend,
         max_active_runs: int = 1,
         max_started_agents: int = 5,
+        max_active_runs_per_user: int = 2,
+        max_started_agents_per_user: int = 3,
     ) -> None:
         self._config = config
         self._event_bus = event_bus
         self._session_memory = session_memory
+        self._legacy_mode = not isinstance(session_memory, UserPartitionedSessionMemory)
         self._profile_provider = profile_provider
         self._backend = backend
         self._max_active_runs = max_active_runs
         self._max_started_agents = max_started_agents
-        self._runtimes: dict[str, AgentRuntimeState] = {}
-        self._sessions: dict[tuple[str, str], SessionRuntimeHandle] = {}
-        self._runs: dict[tuple[str, str, str], RunState] = {}
-        self._idempotency: dict[str, tuple[str, tuple[str, str, str]]] = {}
-        self._request_reservations: dict[str, _RequestReservation] = {}
-        self._active_sessions: dict[tuple[str, str], str] = {}
+        self._max_active_runs_per_user = max_active_runs_per_user
+        self._max_started_agents_per_user = max_started_agents_per_user
+        self._runtimes: dict[UserAgentKey, AgentRuntimeState] = {}
+        self._sessions: dict[SessionKey, SessionRuntimeHandle] = {}
+        self._runs: dict[RunKey, RunState] = {}
+        self._idempotency: dict[tuple[str, str], tuple[str, RunKey]] = {}
+        self._request_reservations: dict[tuple[str, str], _RequestReservation] = {}
+        self._active_sessions: dict[SessionKey, str] = {}
         self._active_run_total = 0
-        self._executions: dict[tuple[str, str, str], RunExecutionHandle] = {}
-        self._run_locks: dict[tuple[str, str, str], asyncio.Lock] = {}
-        self._terminal_events: dict[tuple[str, str, str], asyncio.Event] = {}
-        self._interactions: dict[tuple[str, str, str, str], HumanInteractionState] = {}
+        self._executions: dict[RunKey, RunExecutionHandle] = {}
+        self._run_locks: dict[RunKey, asyncio.Lock] = {}
+        self._terminal_events: dict[RunKey, asyncio.Event] = {}
+        self._interactions: dict[tuple[str, str, str, str, str], HumanInteractionState] = {}
         self._watchers: set[asyncio.Task[Any]] = set()
         self._lock = asyncio.Lock()
         self._state_persist_lock = asyncio.Lock()
-        self._state_generation = 0
-        self._persisted_state_generation = 0
-        self._state_store = RuntimeStateStore(workspace.workspace_dir)
-        self._run_store = JsonlRunStore(workspace.workspace_dir)
-        self._control_store = RuntimeControlEventStore(workspace.workspace_dir)
-        self._control_bus = EventBus()
-        self._control_bus.subscribe_stream(self._control_store.append)
+        self._state_generation: dict[str, int] = {}
+        self._persisted_state_generation: dict[str, int] = {}
+        self._stores = UserRuntimeStoreRegistry(workspace.workspace_dir)
+        self._control_buses: dict[str, EventBus] = {}
         self._recovery_error: str | None = None
         self._recovered = False
 
-    async def recover(self) -> None:
+    async def recover(self, enabled_user_ids: set[str]) -> None:
         """恢复期望启动状态与幂等索引，不重放任何旧副作用。"""
         # lifespan 完成前不会接收请求；该标记表示恢复流程已经被执行过。
         self._recovered = True
+        payloads: dict[str, dict[str, Any]] = {}
         try:
-            payload, recovered = await asyncio.gather(self._state_store.read(), self._run_store.recover())
-            await self._control_store.recover()
-            self._control_bus.set_initial_seq(self._control_store.current_seq)
+            for user_id in self._stores.known_user_ids():
+                payload, recovered = await asyncio.gather(
+                    self._stores.state(user_id).read(),
+                    self._stores.runs(user_id).recover(),
+                )
+                control = self._stores.control(user_id)
+                await control.recover()
+                self._control_bus(user_id).set_initial_seq(control.current_seq)
+                payloads[user_id] = payload
+                runs, idempotency = recovered
+                for old_key, run in runs.items():
+                    run.ref.user_id = run.ref.user_id or user_id
+                    key = _run_key(run.ref)
+                    self._runs[key] = run
+                for client_request_id, (fingerprint, old_key) in idempotency.items():
+                    run = runs[old_key]
+                    self._idempotency[(user_id, client_request_id)] = (fingerprint, _run_key(run.ref))
         except RuntimeStoreCorrupt:
             self._recovery_error = "runtime_recovery_incomplete"
             return
-        self._runs, self._idempotency = recovered
+
         self._run_locks = {key: asyncio.Lock() for key in self._runs}
         self._terminal_events = {key: asyncio.Event() for key in self._runs}
         for key, run in self._runs.items():
@@ -320,33 +348,80 @@ class AgentRuntimeManager:
         for run in list(self._runs.values()):
             if run.status in _ACTIVE_RUN_STATUSES:
                 await self._transition_terminal(run, RunStatus.CANCELLED, error_code="service_restarted")
-        agents = payload.get("agents") if isinstance(payload, dict) else {}
-        if not isinstance(agents, dict):
-            self._recovery_error = "runtime_recovery_incomplete"
-            return
-        for agent_id, item in agents.items():
-            if not isinstance(item, dict) or item.get("desired_state") != AgentLifecycleState.RUNNING.value:
-                continue
-            if self._started_count() >= self._max_started_agents:
-                break
-            try:
-                self._profile_provider.get_record_snapshot(agent_id)
-                await self._backend.start_agent(agent_id)
-            except Exception:  # 配置可能已删除或损坏，保留 ERROR 供用户处理。
-                self._runtimes[agent_id] = AgentRuntimeState(
+
+        for user_id, payload in payloads.items():
+            agents = payload.get("agents") if isinstance(payload, dict) else {}
+            if not isinstance(agents, dict):
+                self._recovery_error = "runtime_recovery_incomplete"
+                return
+            for agent_id, item in agents.items():
+                if not isinstance(item, dict):
+                    continue
+                recent_session_id = _string_or_none(item.get("recent_session_id"))
+                if user_id not in enabled_user_ids:
+                    self._runtimes[(user_id, agent_id)] = AgentRuntimeState(
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        desired_state=AgentLifecycleState.STOPPED,
+                        lifecycle_state=AgentLifecycleState.STOPPED,
+                        recent_session_id=recent_session_id,
+                    )
+                    continue
+                if item.get("desired_state") != AgentLifecycleState.RUNNING.value:
+                    continue
+                capacity_error: str | None = None
+                if self._started_count() >= self._max_started_agents:
+                    capacity_error = (
+                        "started_agent_capacity_exceeded"
+                        if self._legacy_mode
+                        else "service_started_agent_capacity_exceeded"
+                    )
+                elif user_id != "legacy" and self._started_count(user_id) >= self._max_started_agents_per_user:
+                    capacity_error = "user_started_agent_capacity_exceeded"
+                if capacity_error is not None:
+                    self._runtimes[(user_id, agent_id)] = AgentRuntimeState(
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        desired_state=AgentLifecycleState.STOPPED,
+                        lifecycle_state=AgentLifecycleState.STOPPED,
+                        recent_session_id=recent_session_id,
+                        error_code=capacity_error,
+                    )
+                    continue
+                try:
+                    self._profile_provider.get_record_snapshot(user_id, agent_id)
+                    await self._backend_start_agent(user_id, agent_id)
+                except Exception:  # 配置可能已删除或损坏，保留 ERROR 供用户处理。
+                    lifecycle, error = AgentLifecycleState.ERROR, "agent_recovery_failed"
+                else:
+                    lifecycle, error = AgentLifecycleState.RUNNING, None
+                self._runtimes[(user_id, agent_id)] = AgentRuntimeState(
+                    user_id=user_id,
                     agent_id=agent_id,
                     desired_state=AgentLifecycleState.RUNNING,
-                    lifecycle_state=AgentLifecycleState.ERROR,
-                    recent_session_id=_string_or_none(item.get("recent_session_id")),
-                    error_code="agent_recovery_failed",
+                    lifecycle_state=lifecycle,
+                    recent_session_id=recent_session_id,
+                    error_code=error,
                 )
-            else:
-                self._runtimes[agent_id] = AgentRuntimeState(
-                    agent_id=agent_id,
-                    desired_state=AgentLifecycleState.RUNNING,
-                    lifecycle_state=AgentLifecycleState.RUNNING,
-                    recent_session_id=_string_or_none(item.get("recent_session_id")),
-                )
+            if agents:
+                await self._persist_states(user_id)
+
+    async def disable_user(self, user_id: str) -> None:
+        """撤销用户的进程内活动；已经发生的外部副作用不做补偿回滚。"""
+        self._event_bus.close_user_subscriptions(user_id)
+        control_bus = self._control_buses.get(user_id)
+        if control_bus is not None:
+            control_bus.close_user_subscriptions(user_id)
+        agent_ids = [agent_id for owner, agent_id in self._runtimes if owner == user_id]
+        await asyncio.gather(
+            *(self.stop_agent(user_id, agent_id, persist_desired=True) for agent_id in agent_ids),
+            return_exceptions=True,
+        )
+        async with self._lock:
+            for interaction in self._interactions.values():
+                if interaction.ref.user_id == user_id and interaction.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}:
+                    interaction.status = InteractionStatus.CANCELLED
+                    interaction.ended_at = utc_now_iso()
 
     async def shutdown(self) -> None:
         targets = [run.ref for run in self._runs.values() if run.status in _ACTIVE_RUN_STATUSES]
@@ -358,12 +433,14 @@ class AgentRuntimeManager:
         except TimeoutError:
             self._recovery_error = "runtime_recovery_incomplete"
 
-    async def start_agent(self, agent_id: str) -> AgentRuntimeState:
-        profile = self._active_profile(agent_id)
+    async def start_agent(self, user_id: str, agent_id: str | None = None) -> AgentRuntimeState:
+        user_id, agent_id = _normalize_user_agent(user_id, agent_id)
+        profile = self._active_profile(user_id, agent_id)
         if profile.kind != "agent":
             raise RuntimeConflict("agent_not_runnable", "subagent 不能直接启动")
         async with self._lock:
-            current = self._runtimes.get(agent_id)
+            key = (user_id, agent_id)
+            current = self._runtimes.get(key)
             if current and current.desired_state == AgentLifecycleState.RUNNING:
                 return current
             if current and current.lifecycle_state == AgentLifecycleState.STOPPING:
@@ -371,22 +448,27 @@ class AgentRuntimeManager:
             if current and current.error_code == "cancellation_uncertain":
                 raise RuntimeConflict("cancellation_uncertain", "上次取消结果不确定，需重启服务后再启动")
             if self._started_count() >= self._max_started_agents:
-                raise RuntimeConflict("started_agent_capacity_exceeded", "已启动 Agent 数量已达上限")
+                code = "started_agent_capacity_exceeded" if self._legacy_mode else "service_started_agent_capacity_exceeded"
+                raise RuntimeConflict(code, "服务已启动 Agent 数量已达上限")
+            if user_id != "legacy" and self._started_count(user_id) >= self._max_started_agents_per_user:
+                raise RuntimeConflict("user_started_agent_capacity_exceeded", "当前用户已启动 Agent 数量已达上限")
             state = AgentRuntimeState(
+                user_id=user_id,
                 agent_id=agent_id,
                 desired_state=AgentLifecycleState.RUNNING,
                 lifecycle_state=AgentLifecycleState.STARTING,
             )
-            self._runtimes[agent_id] = state
-        await self._persist_states()
-        await self._publish_control("agent_starting", agent_id=agent_id)
+            self._runtimes[key] = state
+        await self._persist_states(user_id)
+        await self._publish_control(user_id, "agent_starting", agent_id=agent_id)
         try:
-            await self._backend.start_agent(agent_id)
+            await self._backend_start_agent(user_id, agent_id)
         except Exception as exc:
             async with self._lock:
                 state.lifecycle_state = AgentLifecycleState.ERROR
                 state.error_code = "agent_start_failed"
             await self._publish_control(
+                user_id,
                 "agent_error",
                 agent_id=agent_id,
                 data={"error_code": "agent_start_failed"},
@@ -394,13 +476,15 @@ class AgentRuntimeManager:
             raise RuntimeConflict("agent_start_failed", "Agent 启动失败") from exc
         async with self._lock:
             state.lifecycle_state = AgentLifecycleState.RUNNING
-        await self._publish_control("agent_running", agent_id=agent_id)
+        await self._publish_control(user_id, "agent_running", agent_id=agent_id)
         return state
 
-    async def stop_agent(self, agent_id: str, *, persist_desired: bool = True) -> AgentRuntimeState:
-        self._record(agent_id)
+    async def stop_agent(self, user_id: str, agent_id: str | None = None, *, persist_desired: bool = True) -> AgentRuntimeState:
+        user_id, agent_id = _normalize_user_agent(user_id, agent_id)
+        self._record(user_id, agent_id)
         async with self._lock:
-            state = self._runtimes.setdefault(agent_id, AgentRuntimeState(agent_id=agent_id))
+            runtime_key = (user_id, agent_id)
+            state = self._runtimes.setdefault(runtime_key, AgentRuntimeState(user_id=user_id, agent_id=agent_id))
             if persist_desired:
                 state.desired_state = AgentLifecycleState.STOPPED
             already_stopped = state.lifecycle_state == AgentLifecycleState.STOPPED
@@ -409,13 +493,13 @@ class AgentRuntimeManager:
             targets = [] if already_stopped else [
                 run.ref
                 for run in self._runs.values()
-                if run.ref.agent_id == agent_id and run.status in _ACTIVE_RUN_STATUSES
+                if run.ref.user_id == user_id and run.ref.agent_id == agent_id and run.status in _ACTIVE_RUN_STATUSES
             ]
         if persist_desired:
-            await self._persist_states()
+            await self._persist_states(user_id)
         if already_stopped:
             return state
-        await self._publish_control("agent_stopping", agent_id=agent_id)
+        await self._publish_control(user_id, "agent_stopping", agent_id=agent_id)
         uncertain = False
         try:
             async with asyncio.timeout(10):
@@ -425,25 +509,33 @@ class AgentRuntimeManager:
                     for result in results
                 )
                 if not uncertain:
-                    await self._backend.stop_agent(agent_id)
+                    await self._backend_stop_agent(user_id, agent_id)
         except TimeoutError:
             uncertain = True
         async with self._lock:
             if not uncertain:
-                for key in [key for key in self._sessions if key[0] == agent_id]:
+                for key in [key for key in self._sessions if key[:2] == (user_id, agent_id)]:
                     self._sessions.pop(key, None)
             state.lifecycle_state = AgentLifecycleState.ERROR if uncertain else AgentLifecycleState.STOPPED
             state.error_code = "cancellation_uncertain" if uncertain else None
-        await self._publish_control("agent_error" if uncertain else "agent_stopped", agent_id=agent_id)
+        await self._publish_control(user_id, "agent_error" if uncertain else "agent_stopped", agent_id=agent_id)
         return state
 
     async def start_run(
         self,
-        agent_id: str,
-        request: GatewayInput,
+        user_id: str,
+        agent_id: str | GatewayInput,
+        request: GatewayInput | str | None = None,
         session_id: str | None = None,
         client_request_id: str = "",
     ) -> RunState:
+        if isinstance(agent_id, GatewayInput):
+            # 旧单用户调用形态：(agent_id, request, session_id, client_request_id)。
+            old_request, old_session, old_client_id = agent_id, request, session_id
+            user_id, agent_id, request = "legacy", user_id, old_request
+            session_id = old_session if isinstance(old_session, str) else None
+            client_request_id = old_client_id or client_request_id
+        assert isinstance(agent_id, str) and isinstance(request, GatewayInput)
         self._ensure_recovered()
         if request.type != GatewayInputType.USER_MESSAGE:
             raise ValueError("仅 user_message 可以创建 Run")
@@ -451,24 +543,25 @@ class AgentRuntimeManager:
         target_session = session_id or request.session_id
         if target_session:
             _validate_resource_id(target_session, "session_id")
-        fingerprint = _request_fingerprint(agent_id, target_session, request)
+        fingerprint = _request_fingerprint(user_id, agent_id, target_session, request)
+        request_key = (user_id, client_request_id)
 
         leader = False
         async with self._lock:
-            reservation = self._request_reservations.get(client_request_id)
+            reservation = self._request_reservations.get(request_key)
             if reservation is not None:
                 if reservation.fingerprint != fingerprint:
                     raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
                 future = reservation.future
             else:
-                existing = self._idempotency.get(client_request_id)
+                existing = self._idempotency.get(request_key)
                 if existing:
                     old_fingerprint, key = existing
                     if old_fingerprint != fingerprint:
                         raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
                     return self._runs[key]
                 future = asyncio.get_running_loop().create_future()
-                self._request_reservations[client_request_id] = _RequestReservation(
+                self._request_reservations[request_key] = _RequestReservation(
                     fingerprint=fingerprint,
                     future=future,
                 )
@@ -484,6 +577,7 @@ class AgentRuntimeManager:
         try:
             run = await self._start_run_reserved(
                 agent_id=agent_id,
+                user_id=user_id,
                 request=request,
                 target_session=target_session,
                 client_request_id=client_request_id,
@@ -491,12 +585,12 @@ class AgentRuntimeManager:
             )
         except BaseException as exc:
             async with self._lock:
-                self._request_reservations.pop(client_request_id, None)
+                self._request_reservations.pop(request_key, None)
                 if not future.done():
                     future.set_result((None, exc))
             raise
         async with self._lock:
-            self._request_reservations.pop(client_request_id, None)
+            self._request_reservations.pop(request_key, None)
             if not future.done():
                 future.set_result((run, None))
         return run
@@ -504,6 +598,7 @@ class AgentRuntimeManager:
     async def _start_run_reserved(
         self,
         *,
+        user_id: str,
         agent_id: str,
         request: GatewayInput,
         target_session: str | None,
@@ -511,23 +606,24 @@ class AgentRuntimeManager:
         fingerprint: str,
     ) -> RunState:
         """执行首个幂等请求；调用方已持有 workspace 级请求预留。"""
-        profile = self._active_profile(agent_id)
-        state = self._runtimes.get(agent_id)
+        profile = self._active_profile(user_id, agent_id)
+        runtime_key = (user_id, agent_id)
+        state = self._runtimes.get(runtime_key)
         if state is None or state.lifecycle_state != AgentLifecycleState.RUNNING:
             raise RuntimeConflict("agent_not_running", "Agent 尚未启动")
 
         if target_session:
-            replay = await self._session_memory.replay(target_session)
-            provider, model, thinking = self._locked_session_llm(agent_id, profile, replay, request)
+            replay = await self._memory_replay(user_id, target_session)
+            provider, model, thinking = self._locked_session_llm(user_id, agent_id, profile, replay, request)
             session_id_value = target_session
         else:
             replay = None
             provider, model, thinking = self._resolve_new_session_llm(profile, request)
             session_id_value = f"sess_{uuid4().hex}"
-        key_base = (agent_id, session_id_value)
+        key_base = (user_id, agent_id, session_id_value)
         run_id = f"run_{uuid4().hex}"
         run = RunState(
-            ref=RunRef(agent_id=agent_id, session_id=session_id_value, run_id=run_id, revision_id=profile.revision_id),
+            ref=RunRef(user_id=user_id, agent_id=agent_id, session_id=session_id_value, run_id=run_id, revision_id=profile.revision_id),
             client_request_id=client_request_id,
             status=RunStatus.STARTING,
             created_at=utc_now_iso(),
@@ -539,7 +635,7 @@ class AgentRuntimeManager:
         key = (*key_base, run_id)
         async with self._lock:
             # stop 与容量/Session 预留共享同一线性化点，STOPPING 后不会漏启动 Run。
-            state = self._runtimes.get(agent_id)
+            state = self._runtimes.get(runtime_key)
             if (
                 state is None
                 or state.desired_state != AgentLifecycleState.RUNNING
@@ -547,25 +643,28 @@ class AgentRuntimeManager:
             ):
                 raise RuntimeConflict("agent_not_running", "Agent 尚未启动或正在关闭")
             if self._active_run_total >= self._max_active_runs:
-                raise RuntimeConflict("run_capacity_exceeded", "活动 Run 容量已满", retry_after=1)
+                code = "run_capacity_exceeded" if self._legacy_mode else "service_run_capacity_exceeded"
+                raise RuntimeConflict(code, "服务活动 Run 容量已满", retry_after=1)
+            if user_id != "legacy" and self._active_run_count(user_id) >= self._max_active_runs_per_user:
+                raise RuntimeConflict("user_run_capacity_exceeded", "当前用户活动 Run 容量已满", retry_after=1)
             if key_base in self._active_sessions:
                 raise RuntimeConflict("session_run_conflict", "目标 Session 已有活动 Run")
             self._runs[key] = run
             self._run_locks[key] = asyncio.Lock()
             self._terminal_events[key] = asyncio.Event()
-            self._idempotency[client_request_id] = (fingerprint, key)
+            self._idempotency[(user_id, client_request_id)] = (fingerprint, key)
             self._active_sessions[key_base] = run_id
             self._active_run_total += 1
             state.active_run_count += 1
             session_handle = self._sessions.get(key_base)
         try:
-            await self._run_store.append(run)
+            await self._stores.runs(user_id).append(run)
         except Exception:
             async with self._lock:
                 self._runs.pop(key, None)
                 self._run_locks.pop(key, None)
                 self._terminal_events.pop(key, None)
-                self._idempotency.pop(client_request_id, None)
+                self._idempotency.pop((user_id, client_request_id), None)
                 self._active_sessions.pop(key_base, None)
                 self._active_run_total = max(0, self._active_run_total - 1)
                 state.active_run_count = max(0, state.active_run_count - 1)
@@ -573,7 +672,7 @@ class AgentRuntimeManager:
 
         try:
             if session_handle is None:
-                execution = await self._backend.load_session(agent_id, session_id_value, replay, profile)
+                execution = await self._backend_load_session(user_id, agent_id, session_id_value, replay, profile)
                 session_handle = SessionRuntimeHandle(
                     execution=execution,
                     profile_revision_id=profile.revision_id,
@@ -587,8 +686,9 @@ class AgentRuntimeManager:
                     "provider": provider,
                     "model": model,
                     "metadata": {
-                        **request.metadata,
+                        "user_metadata": request.metadata.get("user_metadata", {}),
                         "thinking_value": thinking,
+                        "user_id": user_id,
                         "agent_id": agent_id,
                         "revision_id": profile.revision_id,
                         "run_id": run_id,
@@ -607,9 +707,9 @@ class AgentRuntimeManager:
             state.recent_session_id = session_id_value
             self._executions[key] = execution
         try:
-            await self._run_store.append(run)
-            await self._persist_states()
-            await self._publish_control("run_running", run=run)
+            await self._stores.runs(user_id).append(run)
+            await self._persist_states(user_id)
+            await self._publish_control(user_id, "run_running", run=run)
         except Exception as exc:
             await asyncio.gather(
                 self._backend.cancel_run(session_handle.execution, run.ref),
@@ -645,12 +745,13 @@ class AgentRuntimeManager:
             else:
                 wait_for_terminal = False
                 run.status = RunStatus.CANCELLING
-                await self._run_store.append(run)
+                await self._stores.runs(ref.user_id).append(run)
             async with self._lock:
-                handle = self._sessions.get((ref.agent_id, ref.session_id))
+                handle = self._sessions.get((ref.user_id, ref.agent_id, ref.session_id))
                 for interaction in self._interactions.values():
                     if (
-                        interaction.ref.agent_id == ref.agent_id
+                        interaction.ref.user_id == ref.user_id
+                        and interaction.ref.agent_id == ref.agent_id
                         and interaction.ref.session_id == ref.session_id
                         and interaction.ref.run_id == ref.run_id
                         and interaction.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}
@@ -671,7 +772,7 @@ class AgentRuntimeManager:
                 error_code="cancellation_uncertain",
             )
         if not result.confirmed:
-            state = self._runtimes.get(ref.agent_id)
+            state = self._runtimes.get((ref.user_id, ref.agent_id))
             if state:
                 state.lifecycle_state = AgentLifecycleState.ERROR
                 state.error_code = "cancellation_uncertain"
@@ -686,7 +787,7 @@ class AgentRuntimeManager:
         ).hexdigest()
         async with self._lock:
             run = self._require_run(ref)
-            handle = self._sessions.get((ref.agent_id, ref.session_id))
+            handle = self._sessions.get((ref.user_id, ref.agent_id, ref.session_id))
             if handle is None or handle.active_run_id != ref.run_id:
                 raise RuntimeConflict("resource_ownership_mismatch", "interaction 不属于目标 Run")
             key = (*_run_key(ref), interaction_id)
@@ -701,6 +802,7 @@ class AgentRuntimeManager:
                 raise RuntimeConflict("interaction_result_conflict", "interaction 正在处理或已经失效")
             interaction.status = InteractionStatus.RESOLVING
         interaction_ref = HumanInteractionRef(
+            user_id=ref.user_id,
             agent_id=ref.agent_id,
             session_id=ref.session_id,
             run_id=ref.run_id,
@@ -726,17 +828,20 @@ class AgentRuntimeManager:
         """把 Runner 的人工交互事件投影为四级资源索引。"""
         if not isinstance(event, HumanInteractionEvent):
             return
-        if not event.agent_id or not event.session_id or not event.run_id:
+        if self._legacy_mode and not event.user_id:
+            event.user_id = "legacy"
+        if not event.user_id or not event.agent_id or not event.session_id or not event.run_id:
             return
         kind = event.data.get("kind")
         if kind not in {"approval", "question"}:
             return
-        key = (event.agent_id, event.session_id, event.run_id, event.interaction_id)
+        key = (event.user_id, event.agent_id, event.session_id, event.run_id, event.interaction_id)
         changed_run: RunState | None = None
         async with self._lock:
             if event.data.get("status") == "pending":
                 self._interactions[key] = HumanInteractionState(
                     ref=HumanInteractionRef(
+                        user_id=event.user_id,
                         agent_id=event.agent_id,
                         session_id=event.session_id,
                         run_id=event.run_id,
@@ -746,10 +851,12 @@ class AgentRuntimeManager:
                     status=InteractionStatus.PENDING,
                     created_at=event.created_at,
                 )
-                state = self._runtimes.get(event.agent_id)
+                state = self._runtimes.get((event.user_id, event.agent_id))
                 if state:
                     state.waiting_human_count += 1
-                run = self._runs.get((event.agent_id, event.session_id, event.run_id))
+                run = self._runs.get((event.user_id, event.agent_id, event.session_id, event.run_id))
+                if run is None and self._legacy_mode:
+                    run = self._runs.get((event.agent_id, event.session_id, event.run_id))  # type: ignore[arg-type]
                 if run and run.status in {RunStatus.RUNNING, RunStatus.STARTING}:
                     run.status = RunStatus.WAITING_HUMAN
                     changed_run = run
@@ -758,18 +865,21 @@ class AgentRuntimeManager:
                 if interaction and interaction.status != InteractionStatus.CANCELLED:
                     interaction.status = InteractionStatus.RESOLVED
                     interaction.ended_at = event.created_at
-                state = self._runtimes.get(event.agent_id)
+                state = self._runtimes.get((event.user_id, event.agent_id))
                 if state:
                     state.waiting_human_count = max(0, state.waiting_human_count - 1)
-                run = self._runs.get((event.agent_id, event.session_id, event.run_id))
+                run = self._runs.get((event.user_id, event.agent_id, event.session_id, event.run_id))
+                if run is None and self._legacy_mode:
+                    run = self._runs.get((event.agent_id, event.session_id, event.run_id))  # type: ignore[arg-type]
                 if run and run.status == RunStatus.WAITING_HUMAN:
                     run.status = RunStatus.RUNNING
                     changed_run = run
         if changed_run is not None:
-            await self._run_store.append(changed_run)
+            await self._stores.runs(event.user_id).append(changed_run)
         await self._publish_control(
+            event.user_id,
             "interaction_pending" if event.data.get("status") == "pending" else "interaction_resolved",
-            run=changed_run or self._runs.get((event.agent_id, event.session_id, event.run_id)),
+            run=changed_run or self._runs.get((event.user_id, event.agent_id, event.session_id, event.run_id)),
             agent_id=event.agent_id,
             data={
                 "interaction_id": event.interaction_id,
@@ -778,16 +888,16 @@ class AgentRuntimeManager:
             },
         )
 
-    async def load_session(self, agent_id: str, session_id: str) -> SessionExecutionHandle:
+    async def load_session(self, user_id: str, agent_id: str, session_id: str) -> SessionExecutionHandle:
         _validate_resource_id(session_id, "session_id")
-        profile = self._record_profile(agent_id)
-        key = (agent_id, session_id)
+        profile = self._record_profile(user_id, agent_id)
+        key = (user_id, agent_id, session_id)
         existing = self._sessions.get(key)
         if existing:
             return existing.execution
-        replay = await self._session_memory.replay(session_id)
-        self._assert_session_owner(replay, agent_id, profile)
-        execution = await self._backend.load_session(agent_id, session_id, replay, profile)
+        replay = await self._memory_replay(user_id, session_id)
+        self._assert_session_owner(replay, user_id, agent_id, profile)
+        execution = await self._backend.load_session(user_id, agent_id, session_id, replay, profile)
         self._sessions[key] = SessionRuntimeHandle(
             execution=execution,
             profile_revision_id=profile.revision_id,
@@ -796,17 +906,18 @@ class AgentRuntimeManager:
         await self._evict_idle_sessions()
         return execution
 
-    async def validate_session_owner(self, agent_id: str, session_id: str) -> dict[str, Any]:
+    async def validate_session_owner(self, user_id: str, agent_id: str, session_id: str) -> dict[str, Any]:
         """只校验历史 Session 归属，不创建执行 Runner。"""
         _validate_resource_id(session_id, "session_id")
-        profile = self._record_profile(agent_id)
-        replay = await self._session_memory.replay(session_id)
-        self._assert_session_owner(replay, agent_id, profile)
+        profile = self._record_profile(user_id, agent_id)
+        replay = await self._memory_replay(user_id, session_id)
+        self._assert_session_owner(replay, user_id, agent_id, profile)
         return replay
 
-    def get_agent_state(self, agent_id: str) -> AgentRuntimeState:
-        self._record(agent_id)
-        return self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id))
+    def get_agent_state(self, user_id: str, agent_id: str | None = None) -> AgentRuntimeState:
+        user_id, agent_id = _normalize_user_agent(user_id, agent_id)
+        self._record(user_id, agent_id)
+        return self._runtimes.get((user_id, agent_id), AgentRuntimeState(user_id=user_id, agent_id=agent_id))
 
     def readiness_snapshot(self) -> dict[str, Any]:
         """返回不包含内部句柄或异常正文的只读就绪投影。"""
@@ -820,34 +931,45 @@ class AgentRuntimeManager:
     def get_run_state(self, ref: RunRef) -> RunState:
         return self._require_run(ref)
 
-    def list_agent_states(self) -> list[AgentRuntimeState]:
-        profiles = self._profile_provider.list_active_profile_snapshots()
+    def list_agent_states(self, user_id: str) -> list[AgentRuntimeState]:
+        profiles = self._list_profiles(user_id)
         active_ids = {item.agent_id for item in profiles}
         ordered_ids = [item.agent_id for item in profiles]
-        ordered_ids.extend(agent_id for agent_id in self._runtimes if agent_id not in active_ids)
+        ordered_ids.extend(agent_id for owner, agent_id in self._runtimes if owner == user_id and agent_id not in active_ids)
         return [
-            self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id)).model_copy(deep=True)
+            self._runtimes.get((user_id, agent_id), AgentRuntimeState(user_id=user_id, agent_id=agent_id)).model_copy(deep=True)
             for agent_id in ordered_ids
         ]
 
-    async def get_runtime_overview(self) -> dict[str, Any]:
+    async def get_runtime_overview(self, user_id: str = "legacy") -> dict[str, Any]:
         """在控制事件边界之后复制快照，客户端可从 cursor 无缝续接变化。"""
-        cursor = self.current_runtime_cursor()
-        profiles = self._profile_provider.list_active_profile_snapshots()
+        cursor = self.current_runtime_cursor(user_id)
+        profiles = self._list_profiles(user_id)
         async with self._lock:
             active_ids = {item.agent_id for item in profiles}
             ordered_ids = [item.agent_id for item in profiles]
-            ordered_ids.extend(agent_id for agent_id in self._runtimes if agent_id not in active_ids)
+            ordered_ids.extend(agent_id for owner, agent_id in self._runtimes if owner == user_id and agent_id not in active_ids)
             runtimes = [
-                self._runtimes.get(agent_id, AgentRuntimeState(agent_id=agent_id)).model_copy(deep=True)
+                self._runtimes.get((user_id, agent_id), AgentRuntimeState(user_id=user_id, agent_id=agent_id)).model_copy(deep=True)
                 for agent_id in ordered_ids
             ]
             capacity = {
-                "started_agents": self._started_count(),
+                "started_agents": self._started_count(user_id),
+                "service_started_agents": self._started_count(),
                 "max_started_agents": self._max_started_agents,
-                "active_runs": self._active_run_total,
+                "max_started_agents_per_user": self._max_started_agents_per_user,
+                "active_runs": self._active_run_count(user_id),
+                "service_active_runs": self._active_run_total,
                 "max_active_runs": self._max_active_runs,
+                "max_active_runs_per_user": self._max_active_runs_per_user,
             }
+            if self._legacy_mode:
+                capacity = {
+                    "started_agents": capacity["started_agents"],
+                    "max_started_agents": capacity["max_started_agents"],
+                    "active_runs": capacity["active_runs"],
+                    "max_active_runs": capacity["max_active_runs"],
+                }
         return {
             "runtimes": [item.model_dump(mode="json") for item in runtimes],
             "capacity": capacity,
@@ -856,17 +978,18 @@ class AgentRuntimeManager:
 
     async def get_session_runtime_snapshot(
         self,
+        user_id: str,
         agent_id: str,
         session_id: str,
         replay: dict[str, Any],
     ) -> dict[str, Any]:
         """返回页面恢复所需的安全快照，不加载历史 SessionRunner。"""
         data = ((replay.get("session") or {}).get("data") or {})
-        session_key = (agent_id, session_id)
+        session_key = (user_id, agent_id, session_id)
         async with self._lock:
             active_run_id = self._active_sessions.get(session_key)
             active_run = (
-                self._runs.get((agent_id, session_id, active_run_id))
+                self._runs.get((user_id, agent_id, session_id, active_run_id))
                 if active_run_id
                 else None
             )
@@ -874,7 +997,8 @@ class AgentRuntimeManager:
                 (
                     item.model_copy(deep=True)
                     for item in self._interactions.values()
-                    if item.ref.agent_id == agent_id
+                    if item.ref.user_id == user_id
+                    and item.ref.agent_id == agent_id
                     and item.ref.session_id == session_id
                     and item.status in {InteractionStatus.PENDING, InteractionStatus.RESOLVING}
                 ),
@@ -882,7 +1006,7 @@ class AgentRuntimeManager:
             )
             handle = self._sessions.get(session_key)
         live_snapshot = self._backend.get_session_snapshot(handle.execution) if handle else {}
-        last_run = _latest_session_run(self._runs.values(), agent_id, session_id)
+        last_run = _latest_session_run(self._runs.values(), user_id, agent_id, session_id)
         pending_request = (
             live_snapshot.get("pending_human_request")
             if pending
@@ -926,44 +1050,58 @@ class AgentRuntimeManager:
             ),
         }
 
-    def list_sessions(self, agent_id: str) -> list[dict[str, Any]]:
-        profile = self._record_profile(agent_id)
+    def list_sessions(self, user_id: str, agent_id: str) -> list[dict[str, Any]]:
+        profile = self._record_profile(user_id, agent_id)
         return [
             item
-            for item in self._session_memory.list_sessions()
+            for item in self._memory_list_sessions(user_id)
             if item.get("agent_id") == agent_id
             or (not item.get("agent_id") and item.get("agent_name") == profile.name)
         ]
 
-    def find_active_agent_id(self, agent_name: str) -> str:
-        for profile in self._profile_provider.list_active_profile_snapshots():
-            if profile.name == agent_name:
-                return profile.agent_id
-        raise KeyError("Agent 不存在")
+    def find_active_agent_id(self, user_id: str, agent_name: str) -> str:
+        matches = [
+            profile.agent_id
+            for profile in self._list_profiles(user_id)
+            if profile.name == agent_name
+        ]
+        if len(matches) != 1:
+            raise KeyError("Agent 不存在或名称存在歧义")
+        return matches[0]
 
-    def get_session_status(self, agent_id: str, session_id: str) -> dict[str, Any]:
-        handle = self._sessions.get((agent_id, session_id))
+    def get_session_status(self, user_id: str, agent_id: str, session_id: str) -> dict[str, Any]:
+        handle = self._sessions.get((user_id, agent_id, session_id))
         if handle is None:
             raise KeyError("Session 未加载")
         return self._backend.get_session_snapshot(handle.execution)
 
-    async def replay_runtime_events(self, cursor: str | None) -> list[tuple[int, str, StreamEvent]]:
+    async def replay_runtime_events(self, user_id: str, cursor: str | None) -> list[tuple[int, str, StreamEvent]]:
         try:
-            return await self._control_store.replay(cursor)
+            return await self._stores.control(user_id).replay(cursor)
         except ValueError as exc:
             raise RuntimeConflict("invalid_runtime_cursor", "运行时 cursor 无效", status=422) from exc
 
-    def create_runtime_subscription(self) -> Any:
-        return self._control_bus.create_stream_subscription()
+    def create_runtime_subscription(self, user_id: str = "legacy") -> Any:
+        return self._control_bus(user_id).create_stream_subscription(user_id=user_id)
 
-    def remove_runtime_subscription(self, subscription: Any) -> None:
-        self._control_bus.remove_stream_subscription(subscription)
+    def remove_runtime_subscription(self, user_id: str | Any, subscription: Any | None = None) -> None:
+        if subscription is None:
+            subscription, user_id = user_id, "legacy"
+        self._control_bus(user_id).remove_stream_subscription(subscription)
 
-    def current_runtime_cursor(self) -> str:
-        return encode_runtime_cursor(self._control_store.current_seq)
+    def current_runtime_cursor(self, user_id: str) -> str:
+        return encode_runtime_cursor(self._stores.control(user_id).current_seq)
 
     def runtime_cursor_for_seq(self, seq: int) -> str:
         return encode_runtime_cursor(seq)
+
+    def _control_bus(self, user_id: str) -> EventBus:
+        bus = self._control_buses.get(user_id)
+        if bus is None:
+            bus = EventBus()
+            bus.subscribe_stream(self._stores.control(user_id).append)
+            self._control_buses[user_id] = bus
+        return bus
 
     async def _watch_run(self, run: RunState, execution: RunExecutionHandle) -> None:
         try:
@@ -972,7 +1110,9 @@ class AgentRuntimeManager:
             error_code = result.error_code
             error_summary = result.error_summary
             if result.external_effect_uncertain:
-                state = self._runtimes.get(run.ref.agent_id)
+                state = self._runtimes.get((run.ref.user_id, run.ref.agent_id))
+                if state is None and not run.ref.user_id:
+                    state = self._runtimes.get(run.ref.agent_id)  # type: ignore[arg-type]
                 if state:
                     state.lifecycle_state = AgentLifecycleState.ERROR
                     state.error_code = "cancellation_uncertain"
@@ -1008,10 +1148,12 @@ class AgentRuntimeManager:
                 run.error_code = error_code
                 run.error_summary = error_summary or _run_error_summary(error_code)
                 run.ended_at = utc_now_iso()
-                state = self._runtimes.get(run.ref.agent_id)
+                state = self._runtimes.get((run.ref.user_id, run.ref.agent_id))
+                if state is None and not run.ref.user_id:
+                    state = self._runtimes.get(run.ref.agent_id)  # type: ignore[arg-type]
                 if state:
                     state.active_run_count = max(0, state.active_run_count - 1)
-                session_key = (run.ref.agent_id, run.ref.session_id)
+                session_key = (run.ref.user_id, run.ref.agent_id, run.ref.session_id)
                 handle = self._sessions.get(session_key)
                 if handle and handle.active_run_id == run.ref.run_id:
                     handle.active_run_id = None
@@ -1020,8 +1162,8 @@ class AgentRuntimeManager:
                     self._active_run_total = max(0, self._active_run_total - 1)
                 self._executions.pop(key, None)
             try:
-                await self._run_store.append(run)
-                await self._publish_control(f"run_{status.value.lower()}", run=run)
+                await self._stores.runs(run.ref.user_id).append(run)
+                await self._publish_control(run.ref.user_id, f"run_{status.value.lower()}", run=run)
             except Exception:
                 if state:
                     state.lifecycle_state = AgentLifecycleState.ERROR
@@ -1051,14 +1193,16 @@ class AgentRuntimeManager:
 
     async def _publish_control(
         self,
+        user_id: str,
         event_type: str,
         *,
         agent_id: str | None = None,
         run: RunState | None = None,
         data: dict[str, Any] | None = None,
     ) -> None:
-        await self._control_bus.publish_stream_event(
+        await self._control_bus(user_id).publish_stream_event(
             StreamEvent(
+                user_id=user_id,
                 event_type=event_type,
                 agent_id=agent_id or (run.ref.agent_id if run else None),
                 session_id=run.ref.session_id if run else None,
@@ -1075,63 +1219,124 @@ class AgentRuntimeManager:
             )
         )
 
-    async def _persist_states(self) -> None:
+    async def _persist_states(self, user_id: str) -> None:
         async with self._lock:
-            self._state_generation += 1
-            generation = self._state_generation
+            generation = self._state_generation.get(user_id, 0) + 1
+            self._state_generation[user_id] = generation
             payload = {
-                "schema_version": 1,
+                "schema_version": 2,
+                "user_id": user_id,
                 "agents": {
                     agent_id: {
                         "desired_state": state.desired_state.value,
                         "recent_session_id": state.recent_session_id,
                         "updated_at": utc_now_iso(),
                     }
-                    for agent_id, state in self._runtimes.items()
+                    for (owner, agent_id), state in self._runtimes.items()
+                    if owner == user_id
                 },
             }
         async with self._state_persist_lock:
-            if generation <= self._persisted_state_generation:
+            if generation <= self._persisted_state_generation.get(user_id, 0):
                 return
-            await self._state_store.write(payload)
-            self._persisted_state_generation = generation
+            state_store = RuntimeStateStore(self._stores.workspace_dir) if self._legacy_mode else self._stores.state(user_id)
+            await state_store.write(payload)
+            self._persisted_state_generation[user_id] = generation
 
-    def _active_profile(self, agent_id: str) -> AgentProfile:
+    def _active_profile(self, user_id: str, agent_id: str) -> AgentProfile:
         try:
-            return self._profile_provider.get_active_profile_snapshot(agent_id)
+            try:
+                return self._profile_provider.get_active_profile_snapshot(user_id, agent_id)
+            except TypeError:
+                return self._profile_provider.get_active_profile_snapshot(agent_id)  # type: ignore[call-arg]
         except Exception as exc:
             code = getattr(exc, "code", "agent_not_found")
             status = getattr(exc, "status", 404)
             raise RuntimeConflict(code, str(exc), status=status) from exc
 
-    def _record(self, agent_id: str) -> dict[str, Any]:
+    def _record(self, user_id: str, agent_id: str) -> dict[str, Any]:
         try:
-            return self._profile_provider.get_record_snapshot(agent_id)
+            try:
+                return self._profile_provider.get_record_snapshot(user_id, agent_id)
+            except TypeError:
+                return self._profile_provider.get_record_snapshot(agent_id)  # type: ignore[call-arg]
         except Exception as exc:
             raise KeyError("Agent 不存在") from exc
 
-    def _record_profile(self, agent_id: str) -> AgentProfile:
-        record = self._record(agent_id)
+    def _record_profile(self, user_id: str, agent_id: str) -> AgentProfile:
+        record = self._record(user_id, agent_id)
         profile = record.get("profile")
         if not isinstance(profile, AgentProfile):
             raise RuntimeConflict("agent_invalid", "Agent 配置无效")
         return profile
 
+    def _list_profiles(self, user_id: str) -> list[AgentProfile]:
+        try:
+            return self._profile_provider.list_active_profile_snapshots(user_id)
+        except TypeError:
+            return self._profile_provider.list_active_profile_snapshots()  # type: ignore[call-arg]
+
+    async def _memory_replay(self, user_id: str, session_id: str | None) -> dict[str, Any]:
+        try:
+            return await self._session_memory.replay(user_id, session_id)
+        except TypeError:
+            return await self._session_memory.replay(session_id)  # type: ignore[call-arg]
+
+    def _memory_list_sessions(self, user_id: str) -> list[dict[str, Any]]:
+        try:
+            return self._session_memory.list_sessions(user_id)
+        except TypeError:
+            return self._session_memory.list_sessions()  # type: ignore[call-arg]
+
+    async def _backend_start_agent(self, user_id: str, agent_id: str) -> None:
+        try:
+            await self._backend.start_agent(user_id, agent_id)
+        except TypeError:
+            await self._backend.start_agent(agent_id)  # type: ignore[call-arg]
+
+    async def _backend_stop_agent(self, user_id: str, agent_id: str) -> None:
+        try:
+            await self._backend.stop_agent(user_id, agent_id)
+        except TypeError:
+            await self._backend.stop_agent(agent_id)  # type: ignore[call-arg]
+
+    async def _backend_load_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        replay: dict[str, Any] | None,
+        profile: AgentProfile,
+    ) -> SessionExecutionHandle:
+        try:
+            handle = await self._backend.load_session(user_id, agent_id, session_id, replay, profile)
+        except TypeError:
+            handle = await self._backend.load_session(agent_id, session_id, replay, profile)  # type: ignore[call-arg]
+        if not handle.user_id:
+            handle.user_id = user_id
+        return handle
+
     def _require_run(self, ref: RunRef) -> RunState:
-        key = (ref.agent_id, ref.session_id, ref.run_id)
+        key = _run_key(ref)
         run = self._runs.get(key)
         if run is None:
             # 若 run_id 存在但归属不同，明确返回归属错误，避免跨 Agent 探测。
-            if any(item.ref.run_id == ref.run_id for item in self._runs.values()):
-                raise RuntimeConflict("resource_ownership_mismatch", "Run 归属不匹配")
             raise KeyError("Run 不存在")
         return run
 
-    def _assert_session_owner(self, replay: dict[str, Any], agent_id: str, profile: AgentProfile) -> None:
+    def _assert_session_owner(
+        self,
+        replay: dict[str, Any],
+        user_id: str,
+        agent_id: str,
+        profile: AgentProfile,
+    ) -> None:
         session = replay.get("session")
         if not isinstance(session, dict) or not isinstance(session.get("data"), dict):
             raise KeyError("Session 不存在")
         data = session["data"]
+        if data.get("user_id") not in {None, "", user_id}:
+            raise RuntimeConflict("resource_ownership_mismatch", "Session 不属于当前用户")
         owner = data.get("agent_id")
         if owner and owner != agent_id:
             raise RuntimeConflict("resource_ownership_mismatch", "Session 不属于指定 Agent")
@@ -1140,12 +1345,13 @@ class AgentRuntimeManager:
 
     def _locked_session_llm(
         self,
+        user_id: str,
         agent_id: str,
         profile: AgentProfile,
         replay: dict[str, Any],
         request: GatewayInput,
     ) -> tuple[str, str, str | None]:
-        self._assert_session_owner(replay, agent_id, profile)
+        self._assert_session_owner(replay, user_id, agent_id, profile)
         data = replay["session"]["data"]
         provider, model = data.get("provider"), data.get("model")
         if request.provider and request.model and (request.provider != provider or request.model != model):
@@ -1179,14 +1385,17 @@ class AgentRuntimeManager:
             thinking = profile.default_thinking_value
         return activated.provider, selected, thinking
 
-    def _active_run_count(self) -> int:
-        return self._active_run_total
+    def _active_run_count(self, user_id: str | None = None) -> int:
+        if user_id is None:
+            return self._active_run_total
+        return sum(run.ref.user_id == user_id and run.status in _ACTIVE_RUN_STATUSES for run in self._runs.values())
 
-    def _started_count(self) -> int:
+    def _started_count(self, user_id: str | None = None) -> int:
         return sum(
             state.desired_state == AgentLifecycleState.RUNNING
             and state.lifecycle_state in {AgentLifecycleState.RUNNING, AgentLifecycleState.STARTING, AgentLifecycleState.ERROR}
-            for state in self._runtimes.values()
+            and (user_id is None or owner == user_id)
+            for (owner, _), state in self._runtimes.items()
         )
 
     def _ensure_recovered(self) -> None:
@@ -1209,7 +1418,15 @@ def _validate_resource_id(value: str, field: str, *, max_length: int = 160) -> N
         raise ValueError(f"{field} 格式无效")
 
 
-def _request_fingerprint(agent_id: str, session_id: str | None, request: GatewayInput) -> str:
+def _request_fingerprint(
+    user_id: str,
+    agent_id: str | None,
+    session_id: str | GatewayInput | None = None,
+    request: GatewayInput | None = None,
+) -> str:
+    if request is None and isinstance(session_id, GatewayInput):
+        request, session_id, agent_id, user_id = session_id, agent_id, user_id, "legacy"
+    assert request is not None and isinstance(session_id, (str, type(None))) and agent_id is not None
     attachments: list[dict[str, str]] = []
     for item in request.attachments:
         data, mime = decode_image_attachment(item.data_base64, item.mime)
@@ -1221,6 +1438,7 @@ def _request_fingerprint(agent_id: str, session_id: str | None, request: Gateway
             }
         )
     payload = {
+        "user_id": user_id,
         "agent_id": agent_id,
         "session_id": session_id or "__new_session__",
         "content_sha256": hashlib.sha256((request.content or "").encode("utf-8")).hexdigest(),
@@ -1236,12 +1454,20 @@ def _string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _run_key(ref: RunRef) -> tuple[str, str, str]:
-    return ref.agent_id, ref.session_id, ref.run_id
+def _run_key(ref: RunRef) -> RunKey:
+    return ref.user_id, ref.agent_id, ref.session_id, ref.run_id
 
 
-def _latest_session_run(runs: Any, agent_id: str, session_id: str) -> RunState | None:
-    matches = [run for run in runs if run.ref.agent_id == agent_id and run.ref.session_id == session_id]
+def _normalize_user_agent(user_id: str, agent_id: str | None) -> tuple[str, str]:
+    return (user_id, agent_id) if agent_id is not None else ("legacy", user_id)
+
+
+def _latest_session_run(runs: Any, user_id: str, agent_id: str, session_id: str) -> RunState | None:
+    matches = [
+        run
+        for run in runs
+        if run.ref.user_id == user_id and run.ref.agent_id == agent_id and run.ref.session_id == session_id
+    ]
     return max(matches, key=lambda run: run.created_at, default=None)
 
 

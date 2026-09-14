@@ -296,7 +296,8 @@ export function useAgentSession(
       content: input.content,
       client_request_id: input.clientRequestId,
       attachments: input.attachments.map(({ filename, mime, data_base64 }) => ({ filename, mime, data_base64 })),
-      metadata: input.thinkingValue ? { thinking_value: input.thinkingValue } : {},
+      thinking_value: input.thinkingValue || undefined,
+      user_metadata: {},
     };
     if (input.provider && input.model) {
       payload.provider = input.provider;

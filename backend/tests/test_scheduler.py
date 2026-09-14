@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,8 +23,9 @@ from codepilot.scheduler.models import (
     to_iso,
     utc_now,
 )
-from codepilot.scheduler.worker import _build_worker_settings, _prepare_worker_runtime
+from codepilot.scheduler.worker import _build_worker_settings, _prepare_worker_profile, _prepare_worker_runtime
 from codepilot.session.agents import build_agent_profiles
+from codepilot.session.state import RunRef
 from codepilot.tools import BaseTool, ScheduleManageTool, ToolExecutionContext, ToolRegistry, ToolSpec
 
 
@@ -125,6 +127,15 @@ def test_worker_runtime_removes_question_and_keeps_approval_policy() -> None:
     assert tool_registry.get("approval_required").spec.requires_approval is True
     assert "question" not in runtime.agent_profiles["build"].allowed_tools
     assert "question" not in runtime.agent_profiles["plan"].allowed_tools
+
+
+def test_worker_execution_profile_removes_question_without_mutating_bundle() -> None:
+    profile = build_agent_profiles(max_iterations=10)["build"]
+
+    prepared = _prepare_worker_profile(profile)
+
+    assert "question" in profile.allowed_tools
+    assert "question" not in prepared.allowed_tools
 
 
 def test_schedule_store_persists_tasks_atomically(tmp_path) -> None:
@@ -303,6 +314,70 @@ async def test_schedule_manage_tool_updates_and_toggles_task(tmp_path) -> None:
     assert disabled["schedule"]["next_run_at"] is None
     assert enabled["schedule"]["enabled"] is True
     assert enabled["schedule"]["next_run_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_schedule_manage_tool_starts_dynamic_user_runner_only_for_enabled_tasks(tmp_path) -> None:
+    tool = build_schedule_tool(tmp_path)
+    store = tool._store
+    runner = tool._runner
+    profile = build_agent_profiles(max_iterations=10)["build"].model_copy(
+        update={"agent_id": "agent-build", "revision_id": "revision-build"}
+    )
+
+    class Coordinator:
+        profile_provider = SimpleNamespace(get_active_profile_snapshot=lambda _user_id, _agent_id: profile)
+
+        def __init__(self) -> None:
+            self.started: list[str] = []
+
+        def store(self, _user_id: str):
+            return store
+
+        def runner(self, _user_id: str):
+            return runner
+
+        async def ensure_started(self, user_id: str):
+            self.started.append(user_id)
+            return runner
+
+    coordinator = Coordinator()
+    tool._runner = coordinator
+    context = build_tool_context(tmp_path)
+    context.run_ref = RunRef(
+        user_id="user-new",
+        agent_id="agent-build",
+        session_id="session-1",
+        run_id="run-1",
+        revision_id="revision-build",
+    )
+    payload = {
+        "name": "动态用户巡检",
+        "prompt": "检查项目状态",
+        "agent_id": "agent-build",
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "working_dir": str(tmp_path),
+        "trigger": {"kind": "interval", "interval_seconds": 60},
+        "enabled": False,
+    }
+
+    created = await tool.execute({"action": "create_task", **payload}, context=context)
+    await tool.execute({"action": "list_tasks"}, context=context)
+    assert coordinator.started == []
+
+    task_id = created["schedule"]["id"]
+    await tool.execute({"action": "update_task", "task_id": task_id, "prompt": "更新检查"}, context=context)
+    assert coordinator.started == []
+
+    await tool.execute({"action": "enable_task", "task_id": task_id}, context=context)
+    assert coordinator.started == ["user-new"]
+
+    await tool.execute({"action": "disable_task", "task_id": task_id}, context=context)
+    assert coordinator.started == ["user-new"]
+
+    await tool.execute({"action": "create_task", **payload, "name": "启用巡检", "enabled": True}, context=context)
+    assert coordinator.started == ["user-new", "user-new"]
 
 
 @pytest.mark.asyncio
@@ -523,7 +598,17 @@ async def test_runner_passes_prompt_by_file_not_command_line(tmp_path, monkeypat
     store = ScheduleStore(tmp_path)
     secret_prompt = "包含项目细节和凭据的定时任务 prompt"
     task = build_task(tmp_path, ScheduleTrigger(kind="interval", interval_seconds=60))
-    task = task.model_copy(update={"prompt": secret_prompt})
+    profile = build_agent_profiles(5)["build"].model_copy(
+        update={"agent_id": "agent-build", "revision_id": "revision-a"}
+    )
+    task = task.model_copy(
+        update={
+            "user_id": "user-a",
+            "agent_id": profile.agent_id,
+            "revision_id": profile.revision_id,
+            "prompt": secret_prompt,
+        }
+    )
     run = ScheduleRun(
         task_id=task.id,
         task_name=task.name,
@@ -531,7 +616,15 @@ async def test_runner_passes_prompt_by_file_not_command_line(tmp_path, monkeypat
         scheduled_at=to_iso(utc_now()),
         working_dir=str(tmp_path),
     )
-    runner = build_runner(tmp_path, store)
+    provider = SimpleNamespace(get_profile_revision_snapshot=lambda *_: profile.model_copy(deep=True))
+    runner = ScheduleRunner(
+        store=store,
+        settings=AppSettings(),
+        workspace=SimpleNamespace(workspace_dir=tmp_path),
+        agent_profiles={},
+        profile_provider=provider,
+        max_workers=0,
+    )
     captured: dict[str, object] = {}
 
     class FakeProcess:
@@ -542,7 +635,7 @@ async def test_runner_passes_prompt_by_file_not_command_line(tmp_path, monkeypat
 
     async def fake_create_subprocess_exec(*args, **kwargs):
         captured["args"] = args
-        prompt_file = args[args.index("--prompt-file") + 1]
+        prompt_file = args[args.index("--execution-bundle-file") + 1]
         captured["prompt_file"] = prompt_file
         captured["prompt_content"] = Path(prompt_file).read_text(encoding="utf-8")
         return FakeProcess()
@@ -553,17 +646,102 @@ async def test_runner_passes_prompt_by_file_not_command_line(tmp_path, monkeypat
     await asyncio.gather(*runner._monitor_tasks)
 
     args = captured["args"]
-    assert "--prompt-file" in args
+    assert "--execution-bundle-file" in args
+    assert "--prompt-file" not in args
+    assert "--agent-name" not in args
     assert "--prompt" not in args
     assert secret_prompt not in args
-    assert captured["prompt_content"] == secret_prompt
+    assert json.loads(captured["prompt_content"])["prompt"] == secret_prompt
     assert not Path(captured["prompt_file"]).exists()
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_legacy_task_without_starting_worker(tmp_path, monkeypatch) -> None:
+    store = ScheduleStore(tmp_path)
+    task = build_task(tmp_path, ScheduleTrigger(kind="interval", interval_seconds=60))
+    run = ScheduleRun(
+        task_id=task.id,
+        task_name=task.name,
+        status=ScheduleRunStatus.PENDING,
+        scheduled_at=to_iso(utc_now()),
+        working_dir=str(tmp_path),
+    )
+    runner = build_runner(tmp_path, store)
+    store.append_run(run)
+
+    async def unexpected_worker(*_args, **_kwargs):
+        raise AssertionError("旧任务不得启动 worker")
+
+    monkeypatch.setattr("codepilot.scheduler.runner.asyncio.create_subprocess_exec", unexpected_worker)
+    await runner._start_run(task, run)
+
+    failed = store.get_run(run.id)
+    assert failed is not None
+    assert failed.status == ScheduleRunStatus.FAILED
+    assert "稳定" in (failed.error or "")
+
+
+@pytest.mark.asyncio
+async def test_revision_failure_only_fails_current_run(tmp_path, monkeypatch) -> None:
+    store = ScheduleStore(tmp_path)
+    profile = build_agent_profiles(5)["build"].model_copy(
+        update={"agent_id": "agent-build", "revision_id": "revision-a"}
+    )
+    task = build_task(tmp_path, ScheduleTrigger(kind="interval", interval_seconds=60)).model_copy(
+        update={"user_id": "user-a", "agent_id": profile.agent_id, "revision_id": profile.revision_id}
+    )
+    provider = SimpleNamespace(get_profile_revision_snapshot=lambda *_: (_ for _ in ()).throw(ValueError("损坏")))
+    runner = ScheduleRunner(
+        store=store,
+        settings=AppSettings(),
+        workspace=SimpleNamespace(workspace_dir=tmp_path),
+        agent_profiles={},
+        profile_provider=provider,
+        max_workers=0,
+    )
+    first = ScheduleRun(
+        task_id=task.id,
+        task_name=task.name,
+        status=ScheduleRunStatus.PENDING,
+        scheduled_at=to_iso(utc_now()),
+        working_dir=str(tmp_path),
+    )
+    store.append_run(first)
+    await runner._start_run(task, first)
+    assert store.get_run(first.id).status == ScheduleRunStatus.FAILED
+
+    started: list[str] = []
+
+    class FakeProcess:
+        pid = 12345
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_create_subprocess_exec(*args, **_kwargs):
+        started.append(args[args.index("--run-id") + 1])
+        return FakeProcess()
+
+    provider.get_profile_revision_snapshot = lambda *_: profile.model_copy(deep=True)
+    monkeypatch.setattr("codepilot.scheduler.runner.asyncio.create_subprocess_exec", fake_create_subprocess_exec)
+    second = first.model_copy(update={"id": "run-follow-up"})
+    store.append_run(second)
+    await runner._start_run(task, second)
+    await asyncio.gather(*runner._monitor_tasks)
+
+    assert started == [second.id]
 
 
 @pytest.mark.asyncio
 async def test_runner_uses_loopback_report_url_when_server_binds_all_interfaces(tmp_path, monkeypatch) -> None:
     store = ScheduleStore(tmp_path)
     task = build_task(tmp_path, ScheduleTrigger(kind="interval", interval_seconds=60))
+    profile = build_agent_profiles(5)["build"].model_copy(
+        update={"agent_id": "agent-build", "revision_id": "revision-a"}
+    )
+    task = task.model_copy(
+        update={"user_id": "user-a", "agent_id": profile.agent_id, "revision_id": profile.revision_id}
+    )
     run = ScheduleRun(
         task_id=task.id,
         task_name=task.name,
@@ -576,6 +754,7 @@ async def test_runner_uses_loopback_report_url_when_server_binds_all_interfaces(
         settings=AppSettings(server=ServerSettings(host="0.0.0.0", port=8765)),
         workspace=SimpleNamespace(workspace_dir=tmp_path),
         agent_profiles={},
+        profile_provider=SimpleNamespace(get_profile_revision_snapshot=lambda *_: profile.model_copy(deep=True)),
         max_workers=0,
         tick_seconds=0.01,
     )
@@ -627,6 +806,44 @@ async def test_report_updates_running_run(tmp_path) -> None:
 
     assert updated.status == ScheduleRunStatus.COMPLETED
     assert store.get_run(run.id).session_id == "sess_1"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_terminates_worker_and_marks_run_cancelled(tmp_path) -> None:
+    store = ScheduleStore(tmp_path)
+    run = ScheduleRun(
+        task_id="scht_1",
+        task_name="巡检",
+        status=ScheduleRunStatus.RUNNING,
+        scheduled_at=to_iso(utc_now()),
+        started_at=to_iso(utc_now()),
+        pid=12345,
+        working_dir=str(tmp_path),
+    )
+    store.append_run(run)
+    runner = build_runner(tmp_path, store)
+
+    class FakeProcess:
+        returncode = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return int(self.returncode or 0)
+
+    process = FakeProcess()
+    runner._processes[run.id] = process  # type: ignore[assignment]
+
+    await runner.shutdown(status=ScheduleRunStatus.CANCELLED, reason="用户已禁用")
+
+    assert process.terminated is True
+    assert store.get_run(run.id).status == ScheduleRunStatus.CANCELLED
 
 
 def test_session_summary_contains_schedule_marker() -> None:

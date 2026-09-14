@@ -27,6 +27,8 @@ class StreamSubscription:
     queue: asyncio.Queue[StreamEvent] = field(default_factory=lambda: asyncio.Queue(maxsize=1000))
     resync_required: asyncio.Event = field(default_factory=asyncio.Event)
     closed: bool = False
+    user_id: str | None = None
+    session_id: str | None = None
 
 
 class RunEventScope:
@@ -42,14 +44,17 @@ class RunEventScope:
         # 同一 Run 的序号分配、持久化和投递必须保持一个严格有序临界区。
         async with self._lock:
             self.run_seq += 1
+            event.user_id = self.run_ref.user_id
             event.agent_id = self.run_ref.agent_id
             event.session_id = self.run_ref.session_id
             event.run_id = self.run_ref.run_id
+            event.revision_id = self.run_ref.revision_id
             event.run_seq = self.run_seq
             return await self._parent_bus.publish_stream_event(event)
 
     async def publish_domain_event(self, event: DomainEvent) -> DomainEvent:
         async with self._lock:
+            event.user_id = self.run_ref.user_id
             event.agent_id = self.run_ref.agent_id
             event.session_id = self.run_ref.session_id
             event.run_id = self.run_ref.run_id
@@ -70,6 +75,7 @@ class EventBus:
         self._domain_persist_subscribers: list[DomainSubscriber] = []
         self._domain_subscribers: list[DomainSubscriber] = []
         self._seq = 0
+        self._user_seq: dict[str, int] = {}
 
     def subscribe_stream(self, subscriber: StreamSubscriber) -> None:
         """注册流式事件订阅者。"""
@@ -86,8 +92,14 @@ class EventBus:
     async def publish_stream_event(self, event: StreamEvent) -> StreamEvent:
         """发布流式事件，并同步推送到所有已创建的流式消费队列。"""
         # 流式事件需要严格递增的序号，便于前端按顺序消费与恢复断点。
-        self._seq += 1
-        event.seq = self._seq
+        if event.user_id:
+            next_seq = self._user_seq.get(event.user_id, 0) + 1
+            self._user_seq[event.user_id] = next_seq
+            event.seq = next_seq
+        else:
+            # 仅保留给未进入认证运行时的兼容测试；正式用户事件必须由 RunEventScope 补齐身份。
+            self._seq += 1
+            event.seq = self._seq
 
         for subscriber in list(self._stream_persist_subscribers):
             result = subscriber(event)
@@ -96,6 +108,10 @@ class EventBus:
 
         # 发布期间订阅关系可能变化，因此基于快照遍历，避免集合迭代失效。
         for subscription in list(self._stream_subscribers):
+            if subscription.user_id is not None and event.user_id != subscription.user_id:
+                continue
+            if subscription.session_id is not None and event.session_id != subscription.session_id:
+                continue
             # 慢消费者不能反压 Agent 执行；溢出后由 SSE 连接主动重连并回放。
             if subscription.queue.full():
                 subscription.closed = True
@@ -121,8 +137,13 @@ class EventBus:
         self._legacy_subscriptions[subscription.queue] = subscription
         return subscription.queue
 
-    def create_stream_subscription(self) -> StreamSubscription:
-        subscription = StreamSubscription()
+    def create_stream_subscription(
+        self,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> StreamSubscription:
+        subscription = StreamSubscription(user_id=user_id, session_id=session_id)
         self._stream_subscribers.add(subscription)
         return subscription
 
@@ -137,13 +158,23 @@ class EventBus:
         subscription.closed = True
         self._stream_subscribers.discard(subscription)
 
-    def current_seq(self) -> int:
-        """返回当前已分配的最新流式事件序号。"""
-        return self._seq
+    def close_user_subscriptions(self, user_id: str) -> None:
+        for subscription in list(self._stream_subscribers):
+            if subscription.user_id == user_id:
+                subscription.closed = True
+                subscription.resync_required.set()
+                self._stream_subscribers.discard(subscription)
 
-    def set_initial_seq(self, seq: int) -> None:
+    def current_seq(self, user_id: str | None = None) -> int:
+        """返回当前已分配的最新流式事件序号。"""
+        return self._user_seq.get(user_id, 0) if user_id else self._seq
+
+    def set_initial_seq(self, seq: int, user_id: str | None = None) -> None:
         """基于外部状态初始化序号，并保证序号不会回退。"""
-        self._seq = max(self._seq, seq)
+        if user_id:
+            self._user_seq[user_id] = max(self._user_seq.get(user_id, 0), seq)
+        else:
+            self._seq = max(self._seq, seq)
 
     def _safe_wrapper(self, subscriber: Callable[..., Awaitable[None] | None], channel: str) -> Callable[..., Any]:
         """为订阅者增加异常隔离，避免单个订阅者影响总线分发。"""

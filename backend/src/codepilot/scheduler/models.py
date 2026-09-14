@@ -81,10 +81,14 @@ class ScheduleTrigger(BaseModel):
 
 
 class ScheduleTask(BaseModel):
+    schema_version: int = 2
+    user_id: str = ""
     id: str = Field(default_factory=lambda: f"scht_{uuid4().hex}")
     name: str
     prompt: str
+    agent_id: str = ""
     agent_name: str
+    revision_id: str = ""
     provider: str
     model: str
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -99,9 +103,14 @@ class ScheduleTask(BaseModel):
 
 
 class ScheduleRun(BaseModel):
+    schema_version: int = 2
+    user_id: str = ""
     id: str = Field(default_factory=lambda: f"run_{uuid4().hex}")
     task_id: str
     task_name: str
+    agent_id: str = ""
+    agent_name: str = ""
+    revision_id: str = ""
     session_id: str | None = None
     status: ScheduleRunStatus
     scheduled_at: str

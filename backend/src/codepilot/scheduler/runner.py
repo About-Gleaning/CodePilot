@@ -3,6 +3,7 @@ from __future__ import annotations
 """定时任务主进程调度器。"""
 
 import asyncio
+import json
 import secrets
 import sys
 from asyncio.subprocess import Process
@@ -35,6 +36,8 @@ class ScheduleRunner:
         settings: AppSettings,
         workspace: WorkspaceState,
         agent_profiles: dict[str, Any],
+        user_id: str = "",
+        profile_provider: Any | None = None,
         max_workers: int = 2,
         tick_seconds: float = 1.0,
         worker_timeout_seconds: int = 60 * 60,
@@ -43,6 +46,8 @@ class ScheduleRunner:
         self._settings = settings
         self._workspace = workspace
         self._agent_profiles = agent_profiles
+        self._user_id = user_id
+        self._profile_provider = profile_provider
         self._max_workers = max_workers
         self._tick_seconds = tick_seconds
         self._worker_timeout_seconds = worker_timeout_seconds
@@ -56,17 +61,43 @@ class ScheduleRunner:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run_forever(), name="codepilot-schedule-runner")
 
-    async def shutdown(self) -> None:
+    async def shutdown(
+        self,
+        *,
+        status: ScheduleRunStatus = ScheduleRunStatus.INTERRUPTED,
+        reason: str = "调度器已关闭，worker 已终止。",
+    ) -> None:
         if self._task and not self._task.done():
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
                 pass
+        processes = list(self._processes.items())
+        for _, process in processes:
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+        for _, process in processes:
+            if process.returncode is not None:
+                continue
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
         for task in list(self._monitor_tasks):
             task.cancel()
         if self._monitor_tasks:
             await asyncio.gather(*self._monitor_tasks, return_exceptions=True)
+        for run_id, _ in processes:
+            await self._mark_running_process_finished(run_id, status, reason)
+            self._processes.pop(run_id, None)
 
     async def tick_once(self) -> None:
         async with self._lock:
@@ -79,7 +110,9 @@ class ScheduleRunner:
         *,
         name: str,
         prompt: str,
+        agent_id: str = "",
         agent_name: str,
+        revision_id: str = "",
         provider: str,
         model: str,
         trigger: ScheduleTrigger,
@@ -90,9 +123,12 @@ class ScheduleRunner:
     ) -> ScheduleTask:
         now_iso = to_iso(utc_now())
         task = ScheduleTask(
+            user_id=self._user_id,
             name=name,
             prompt=prompt,
+            agent_id=agent_id,
             agent_name=agent_name,
+            revision_id=revision_id,
             provider=provider,
             model=model,
             metadata=metadata or {},
@@ -163,8 +199,12 @@ class ScheduleRunner:
             if parse_iso_datetime(task.next_run_at) > now:
                 continue
             run = ScheduleRun(
+                user_id=task.user_id,
                 task_id=task.id,
                 task_name=task.name,
+                agent_id=task.agent_id,
+                agent_name=task.agent_name,
+                revision_id=task.revision_id,
                 status=ScheduleRunStatus.PENDING,
                 scheduled_at=task.next_run_at,
                 working_dir=task.working_dir,
@@ -208,9 +248,25 @@ class ScheduleRunner:
     async def _start_run(self, task: ScheduleTask, run: ScheduleRun) -> None:
         stdout_path = self._store.run_logs_dir / f"{run.id}.stdout.log"
         stderr_path = self._store.run_logs_dir / f"{run.id}.stderr.log"
-        prompt_path = self._write_prompt_file(run.id, task.prompt)
-        stdout = stdout_path.open("ab")
-        stderr = stderr_path.open("ab")
+        if not task.user_id or not task.agent_id or not task.revision_id:
+            self._fail_unstarted_run(run, "定时任务缺少稳定的用户、Agent 或 revision 归属，未启动 worker。")
+            return
+        bundle_path: Path | None = None
+        stdout = None
+        stderr = None
+        try:
+            bundle_path = self._write_execution_bundle(run.id, task)
+            stdout = stdout_path.open("ab")
+            stderr = stderr_path.open("ab")
+        except Exception:  # 配置详情和本地路径不得写入持久化错误。
+            if stdout is not None:
+                stdout.close()
+            if stderr is not None:
+                stderr.close()
+            if bundle_path is not None:
+                self._delete_prompt_file(bundle_path)
+            self._fail_unstarted_run(run, "定时任务引用的 Agent revision 不可用，未启动 worker。")
+            return
         report_url = f"http://127.0.0.1:{self._settings.server.port}/api/schedule-runs/{run.id}/report"
         args = [
             sys.executable,
@@ -222,10 +278,6 @@ class ScheduleRunner:
             task.id,
             "--task-name",
             task.name,
-            "--prompt-file",
-            str(prompt_path),
-            "--agent-name",
-            task.agent_name,
             "--provider",
             task.provider,
             "--model",
@@ -239,12 +291,18 @@ class ScheduleRunner:
             "--report-token-file",
             str(self._store.token_file),
         ]
+        args[5:5] = [
+            "--execution-bundle-file", str(bundle_path),
+            "--user-id", task.user_id,
+            "--agent-id", task.agent_id,
+            "--revision-id", task.revision_id,
+        ]
         try:
             process = await asyncio.create_subprocess_exec(*args, stdout=stdout, stderr=stderr, cwd=task.working_dir)
         except Exception as exc:  # noqa: BLE001
             stdout.close()
             stderr.close()
-            self._delete_prompt_file(prompt_path)
+            self._delete_prompt_file(bundle_path)
             self._store.update_run(
                 run.model_copy(
                     update={
@@ -259,17 +317,38 @@ class ScheduleRunner:
         self._store.update_run(running)
         self._processes[run.id] = process
         monitor = asyncio.create_task(
-            self._monitor_process(run.id, process, stdout_path, stderr_path, prompt_path, stdout, stderr),
+            self._monitor_process(run.id, process, stdout_path, stderr_path, bundle_path, stdout, stderr),
             name=f"codepilot-schedule-monitor-{run.id}",
         )
         self._monitor_tasks.add(monitor)
         monitor.add_done_callback(self._monitor_tasks.discard)
 
-    def _write_prompt_file(self, run_id: str, prompt: str) -> Path:
+    def _fail_unstarted_run(self, run: ScheduleRun, error: str) -> None:
+        self._store.update_run(
+            run.model_copy(
+                update={
+                    "status": ScheduleRunStatus.FAILED,
+                    "finished_at": to_iso(utc_now()),
+                    "pid": None,
+                    "error": error,
+                }
+            )
+        )
+
+    def _write_execution_bundle(self, run_id: str, task: ScheduleTask) -> Path:
         prompt_dir = self._store.workspace_dir / "schedule_prompts"
         prompt_dir.mkdir(parents=True, exist_ok=True)
-        prompt_path = prompt_dir / f"{run_id}.{secrets.token_urlsafe(12)}.prompt"
-        prompt_path.write_text(prompt, encoding="utf-8")
+        prompt_path = prompt_dir / f"{run_id}.{secrets.token_urlsafe(12)}.bundle.json"
+        if self._profile_provider is not None:
+            profile = self._profile_provider.get_profile_revision_snapshot(task.user_id, task.agent_id, task.revision_id)
+        else:
+            profile = self._agent_profiles.get(task.agent_name)
+        if profile is None or profile.revision_id != task.revision_id:
+            raise ValueError("定时任务引用的 Agent revision 不可用")
+        prompt_path.write_text(
+            json.dumps({"schema_version": 1, "prompt": task.prompt, "profile": profile.model_dump(mode="json")}, ensure_ascii=False),
+            encoding="utf-8",
+        )
         try:
             prompt_path.chmod(0o600)
         except OSError:

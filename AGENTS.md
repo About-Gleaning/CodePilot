@@ -1,5 +1,11 @@
 # Repository Guidelines
 
+## 产品方向与后续开发入口
+
+开始后续 Agent 平台设计或开发前，先阅读根目录 [PRODUCT_DIRECTION.md](PRODUCT_DIRECTION.md)。其中记录用户已确认的通用平台目标、八项产品规则、实现差距、验收场景与待确定细节；设计目录登记见 [product-direction-handoff.md](docs/agent-platform/product-direction-handoff.md)。
+
+本文件下文描述当前实现契约。后续目标明确要求任务在下一次模型决策前自动采用最新 Agent 配置，并允许子 Agent 拥有独立专用工具；不能沿用已被用户否定的“旧任务永久锁定配置”或“子工具必须是父工具子集”作为目标。当前 Run 固定 revision、worker 执行束和其他历史机制尚未因此改变，实现相应功能时必须同步契约、兼容方案、测试与本文，不能只改文档宣称完成。身份归属、任务约束、凭证隔离和禁止不确定副作用盲目重放等要求继续适用。
+
 ## Project Structure & Module Organization
 
 本仓库是前后端分离的 CodePilot 原型。后端位于 `backend/`，核心包在 `backend/src/codepilot/`：`api/` 提供 FastAPI 路由，`session/` 管理 Agent 会话流，`tools/` 放内置工具，`skills/` 管理按需加载的技能运行时，`scheduler/` 管理定时任务和独立 worker，`llm/` 封装 LiteLLM，`memory/` 处理 jsonl 存储。后端测试位于 `backend/tests/`。前端位于 `frontend/`，React 入口为 `frontend/src/main.tsx`，主界面在 `frontend/src/App.tsx`，样式在 `frontend/src/styles.css`。运行期文件写入 `storage.codepilot_home/workspace/<workspace_id>/`，不要提交日志、PID、密钥或本地缓存。
@@ -8,6 +14,8 @@
 
 - `./dev.sh start`：同时启动后端 `127.0.0.1:8000` 和前端 `127.0.0.1:5173`。
 - `./dev.sh stop` / `./dev.sh restart`：停止或重启开发服务。
+- 启动前必须完成冻结锁文件依赖整备；普通启动使用 `uv run --no-sync --offline`，禁止 Corepack 联网下载。前端固定 5173 并使用 `--strictPort`；前后端共享 20 秒就绪期限，HTTP 200 与监听进程归属均通过后才报告成功。失败仅回收本次创建且归属匹配的进程组，不影响已有组件或其他端口占用者。
+- 启动脚本回归入口：`backend/.venv/bin/python -m pytest backend/tests/test_dev_script.py`，测试只使用临时项目和替身，不操作真实业务服务。
 - `cd backend && uv sync --extra dev`：安装后端依赖与测试依赖。
 - `cd backend && uv run pytest`：运行后端测试。
 - `cd backend && uv run uvicorn codepilot.main:app --app-dir src --reload --host 127.0.0.1 --port 8000`：单独启动后端。
@@ -35,11 +43,11 @@ MCP 连接必须使用官方 Python SDK，主进程和 scheduler worker 都要�
 
 ## Agent & Subagent Runtime Guidelines
 
-运行时控制接口必须使用完整的 `agent_id + session_id + run_id` 归属键；不得新增全局 current agent/run 作为事实来源。每个 SessionRunner 只能管理一个 Session 的可变执行状态，跨 Session 并发由运行时协调层控制。运行期期望启动状态写入 `workspace/agent-runtimes.json` 时必须原子替换并使用 0600 权限，重启只能取消中断 Run，不能重放 Tool、MCP 或 LLM 副作用。
+运行时控制接口必须使用完整的 `user_id + agent_id + session_id + run_id` 归属键；不得新增全局 current user/agent/run 作为事实来源。每个 SessionRunner 只能管理一个 Session 的可变执行状态，跨 Session 并发由运行时协调层控制。用户运行期期望启动状态写入 `workspace/users/<user_id>/agent-runtimes.json` 时必须原子替换并使用 0600 权限。重启时所有用户的活动 Run 统一转为 `CANCELLED/service_restarted`，但只恢复启用用户的 Agent；禁用用户的期望状态必须持久化为 `STOPPED`，不能重放 Tool、MCP 或 LLM 副作用。
 
-HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner 的 Task、Event、审批或 Question holder。Manager 获取配置时必须使用 `AgentConfigService` 的不可变快照；Run 启动后固定 revision。Run 终态必须比较并更新，确保 cancel、Agent stop、watcher 和 shutdown 只释放一次容量。`agent-runs.jsonl` 与控制事件必须追加、flush、fsync；末行截断可归档后恢复完整前缀，中间损坏必须拒绝新 Run。Session 历史索引需要识别 Scheduler 跨进程写入，外部 session ID 禁止拼入 glob。
+HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner 的 Task、Event、审批或 Question holder。Manager 获取配置时必须使用 `AgentConfigService` 的不可变快照；Run 启动后固定 revision。Run 终态必须比较并更新，确保 cancel、Agent stop、watcher 和 shutdown 只释放一次容量。恢复期同样必须执行全服务与每用户 started Agent 上限；超限 Agent 不启动、不排队，必须持久化为带容量错误码的停止状态。`agent-runs.jsonl` 与控制事件必须追加、flush、fsync；末行截断可归档后恢复完整前缀，中间损坏必须拒绝新 Run。Session 历史索引需要识别 Scheduler 跨进程写入，外部 session ID 禁止拼入 glob。
 
-交互式活动 Run 上限为 5，同一 Session 上限为 1，不得隐藏排队。并发相同 `client_request_id` 必须共享请求预留并返回同一 Run；容量、Session 和 Agent 启停检查必须在同一 Manager 临界区完成。`workspace_mutation` Tool 必须持有 RunRef 级跨进程写入租约至执行收尾，subagent 继承父 Run 租约。MCP 每服务最多 5 个并发调用、20 个 pending，已发出调用失败不得自动重放；Bash 取消必须回收整个进程组。
+交互式活动 Run 全服务上限为 5、每用户上限为 2，同一 Session 上限为 1，不得隐藏排队。并发相同 `client_request_id` 只在同一用户内共享请求预留并返回同一 Run；容量、Session 和 Agent 启停检查必须在同一 Manager 临界区完成。`workspace_mutation` Tool 必须持有 RunRef 级跨进程共享 workspace 写入租约至执行收尾，subagent 继承父 Run 租约。MCP 每服务最多 5 个并发调用、20 个 pending，已发出调用失败不得自动重放；Bash 取消必须回收整个进程组。
 
 完整 Session SSE 与低频运行态 SSE 必须分离；聚合流不得传 token、Prompt、附件或 Tool 大结果。所有订阅队列固定上限 1000，溢出后要求客户端重连回放，不能阻塞 Agent。Scheduler worker 只构建 Execution Bundle，不得创建 Manager、执行 recover 或写入 `agent-runtimes.json`。
 
@@ -47,15 +55,15 @@ Agent Studio 只能调用资源化 `/api/agents/*` 与 `/api/agent-runtimes*` �
 
 Agent Studio 的体验层统一放在 `frontend/src/features/agent-studio/agent-studio-refined.css`，视觉重构不得改动 API 请求与 SSE 协议。桌面与移动端必须复用同一业务 DOM；900px 以下的导航和检查器使用抽屉，抽屉层级必须高于带模糊效果的遮罩。交互元素需保留稳定的可访问名称，并支持 `prefers-reduced-motion`。
 
-Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；自定义 Agent 位于 `storage.codepilot_home/agents/*.md`，例如用户自定义 `life.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。自定义 Agent 不允许覆盖内置 Agent 名称；没有自定义 Agent 时只暴露三个内置 Agent。
+Agent 配置采用 Markdown 文件声明。内置 Agent 位于 `backend/src/codepilot/session/agent_profiles/`，必须固定包含 `build`、`plan`、`explore` 三个文件；共享 Agent 位于 `storage.codepilot_home/agents/shared/*.md`，用户私有 Agent 位于 `storage.codepilot_home/users/<user_id>/agents/*.md`。文件头使用 YAML frontmatter，至少声明 `name`、`kind`（`agent` 或 `subagent`）、`description`、`tools`、`readonly`、`max_iterations`（可省略以使用全局默认）、`can_call_subagent`，正文即该 Agent 的 system prompt。私有与共享 Agent 允许同名，运行时必须使用 `agent_id` 解析，名称只作展示快照。历史 revision 必须按 `agent_id + revision_id` 的单个确定路径读取并校验摘要、身份、大小和符号链接；配置更新保留旧 revision 可执行性，归档立即禁止所有新 Run。
 
 `session_id` 是持久化和前端回放边界，主 Agent 与 subagent 的消息可以写入同一个 session jsonl。`context_id` 是 LLM 上下文和压缩边界，主 Agent 与每次 `task` 派发的 subagent 必须使用不同上下文；构造 provider messages、上下文压缩和 replay 压缩替换时都必须按 `context_id` 过滤，不能直接把整场 `session.messages` 作为当前 Agent 的 LLM 输入。
 
-subagent 只能通过 `task` 工具由主 Agent 同步派发，不能从前端 Agent 下拉直接选择，也不能递归调用 `task`。subagent 的消息和 stream event 必须带上 `agent_kind`、`context_id` 和 `parent_call_id`，便于前端展示、jsonl 回放和审计时恢复父子关系。`SessionCompactedEvent` 若只压缩某个上下文，必须写入 `scope="context"` 和对应 `context_id`，回放时只替换该上下文消息，不能覆盖整个 session。
+subagent 只能通过 `task` 工具由主 Agent 同步派发，不能从前端 Agent 下拉直接选择，也不能递归调用 `task`。`task` 的静态描述只能枚举活动的内置与共享 subagent，不能复用只返回主 Agent 的目录；实际执行仍必须携带当前 `user_id` 按稳定 `agent_id` 解析，禁止跨用户访问私有配置。subagent 的消息和 stream event 必须带上 `agent_kind`、`context_id` 和 `parent_call_id`，便于前端展示、jsonl 回放和审计时恢复父子关系。`SessionCompactedEvent` 若只压缩某个上下文，必须写入 `scope="context"` 和对应 `context_id`，回放时只替换该上下文消息，不能覆盖整个 session。
 
 ## Scheduler Runtime Guidelines
 
-定时任务由主进程调度、独立 worker 子进程执行。任务配置写入 workspace 运行目录下的 `schedules.json`，必须使用临时文件原子替换；运行状态写入 `schedule_runs.jsonl`，必须追加完整状态快照，不要覆盖历史。worker 的 session 仍写入同一 `sessions/` 目录，并且创建会话时必须在 metadata/session_meta 中保留 `source="schedule"`、`schedule_task_id`、`schedule_run_id` 和 `schedule_task_name`，保证历史记录可独立识别定时任务。
+定时任务由主进程调度、独立 worker 子进程执行。每个用户的任务配置写入 `workspace/users/<user_id>/schedules.json`，必须使用临时文件原子替换；运行状态写入同目录的 `schedule-runs.jsonl`，必须追加完整状态快照，不要覆盖历史。动态用户创建、启用或更新启用任务时必须先确保该用户的 Schedule runner 已启动；查询、禁用和删除不得为此创建后台循环。worker 的 session 写入该用户的 `sessions/` 目录，并且创建会话时必须在服务端 metadata/session_meta 中保留 `source="schedule"`、`schedule_task_id`、`schedule_run_id` 和 `schedule_task_name`。Schedule 与 worker 执行束必须固化 `user_id + agent_id + revision_id`，名称只作展示快照；不得按名称降级执行。缺失、损坏或归档 revision 只允许把本次 Run 标记为失败，不得终止调度循环；无法稳定映射的迁移任务必须禁用并在已有 metadata 中记录原因。
 
 worker 执行目录只作为项目工作目录，不能向用户项目目录写入 CodePilot 运行态文件。主进程只接受本机 worker 上报，并必须校验 `schedule_worker_token`；删除任务时只取消未启动的 pending run，不强杀已经运行的 worker。第一版只支持 `once`、`interval`、`daily`、`weekly` 四类触发，不引入 cron 或实时 SSE 推送。
 
@@ -65,11 +73,11 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 ## Long Memory Guidelines
 
-长期记忆文件固定写入 `storage.codepilot_home/instructions/memory.instruction.md`，文件必须包含 YAML frontmatter。当前只有 `life` Agent 可以通过 `long_memory_write` 工具追加长期记忆；system prompt 注入范围以文件头 `applyTo` 为准，支持单值、数组和 `**` 全局匹配。读取时必须剥离 frontmatter，只注入正文记忆。
+长期记忆按用户写入 `storage.codepilot_home/users/<user_id>/memory/`，全局记忆为 `_global.md`，Agent 专属记忆为 `<agent_id>.md`；构造 Prompt 时先合并全局记忆，再合并 Agent 专属记忆。文件必须包含 YAML frontmatter，`long_memory_write` 必须按实际能力快照校验，不能只按 Agent 名称授权。读取时必须剥离 frontmatter，只注入正文记忆。
 
 ## Attachment Runtime Guidelines
 
-用户上传附件属于 CodePilot 运行态数据，必须保存到 `workspace_dir/attachments/<session_id>/<message_id>/`，会话 JSONL 只保存 `FilePart` 元数据、受控预览 URL 和本地文件路径，不得持久化 base64 原文。首期附件仅支持 `image/png`、`image/jpeg`、`image/webp` 和 `image/gif`，单图默认不超过 5MB，单条用户消息最多 4 张；前端可做提前拦截，但后端必须基于文件头再次校验 MIME 和大小。
+用户上传附件属于 CodePilot 运行态数据，必须保存到 `workspace_dir/users/<user_id>/attachments/<session_id>/<message_id>/`，会话 JSONL 只保存 `FilePart` 元数据、受控预览 URL 和本地文件路径，不得持久化 base64 原文。首期附件仅支持 `image/png`、`image/jpeg`、`image/webp` 和 `image/gif`，单图默认不超过 5MB，单条用户消息最多 4 张；前端可做提前拦截，但后端必须基于文件头再次校验 MIME、大小、路径与记录 owner。
 
 附件预览接口只能读取当前 workspace 的 attachments 目录，必须清理文件名并校验解析后的路径仍位于目标消息目录内。`read_file` 读取图片时可返回图片附件元数据；LLM 请求构造阶段再按需把图片编码为 data URL，日志与持久化记录不得写入图片 base64。
 
@@ -83,7 +91,7 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 涉及 Agent 配置、运行时拓扑、会话/Run 生命周期、并发、Tool/MCP 权限或验证结论的改动，设计与验证证据必须写入 `docs/agent-platform/`，并更新该目录的 `README.md`。不得只在聊天、Plane 评论或日志中保存架构结论；结果文件不得包含绝对用户目录、密钥、Prompt 正文或附件 base64。
 
-自定义 Agent 配置的活动 Markdown 位于 `{codepilot_home}/agents/`；归档文件位于 `.archived/`，revision 快照位于 `.revisions/`。配置写入必须使用受控文件名、临时文件和原子替换，不能物理删除 revision。能力目录不得返回 MCP 命令、URL、工作目录、环境变量、Header、密钥或原始 Tool schema；新增 Tool 必须声明副作用类别和是否可分配给自定义 Agent。
+共享 Agent 配置的活动 Markdown 位于 `{codepilot_home}/agents/shared/`，用户私有配置位于 `{codepilot_home}/users/<user_id>/agents/`；各自的归档文件位于 `.archived/`，revision 快照位于 `.revisions/`。配置写入必须使用受控文件名、临时文件和原子替换，不能物理删除 revision。能力目录不得返回 MCP 命令、URL、工作目录、环境变量、Header、密钥或原始 Tool schema；新增 Tool 必须声明副作用类别和是否可分配给私有 Agent。
 
 当前历史只有初始提交，后续请使用中文、祈使式提交信息，例如 `修复会话恢复的事件重放顺序`。PR 应说明变更目的、主要实现、验证命令和潜在风险；涉及 UI 时附截图或录屏；涉及配置时说明新增环境变量或迁移步骤。不要在 PR 中混入无关格式化或顺手重构。
 
@@ -91,7 +99,7 @@ worker 执行目录只作为项目工作目录，不能向用户项目目录写�
 
 `backend/config.yaml` 是可提交的项目配置，用于维护服务端口、模型清单和工具策略；真实 `backend/.env`、API Key、会话 jsonl、日志和本地 workspace 数据不得提交。处理文件工具、workspace 路径和 LLM 输入时，注意路径越权、敏感信息泄露和非预期写入风险。
 
-源码发布仅支持本机单用户回环访问。后端、开发脚本、Host 与 CORS 都不得放宽到非回环地址；配置、Session replay 和附件响应必须使用 `no-store`。健康探针只能返回稳定组件状态和计数，不得返回路径、Agent 配置、MCP 地址或底层异常。
+源码发布支持可信局域网内的应用级多用户隔离。后端和开发脚本不得放宽到非回环监听；局域网入口必须由同机反向代理在唯一 HTTPS Origin 下提供前端与 `/api`，不得信任任意来源的 Forwarded Header。认证不构成 OS、项目文件或 Bash 沙箱，只适用于共享 workspace 的互信用户。配置、Session replay 和附件响应必须使用 `no-store`；健康探针只能返回稳定组件状态和计数，不得返回用户信息、路径、Agent 配置、MCP 地址或底层异常。
 
 用户正文、附件编码、文件名、审批备注、Question 回答和 metadata 必须在进入 Runtime 前执行有限长度校验。LLM 请求日志默认关闭；开启后也只能记录 Provider、Model、数量和耗时摘要。日志与发布结果必须递归脱敏认证信息、图片 data URL 和绝对用户目录。
 

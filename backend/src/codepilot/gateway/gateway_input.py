@@ -4,7 +4,7 @@ import json
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from codepilot.session.attachments import (
     MAX_IMAGE_ATTACHMENT_BASE64_CHARS,
@@ -29,6 +29,8 @@ class GatewayInputType(str, Enum):
 class UploadedAttachmentInput(BaseModel):
     """前端上传的附件输入；首期只允许图片。"""
 
+    model_config = ConfigDict(extra="forbid")
+
     filename: str = Field(min_length=1, max_length=255, description="原始文件名，仅用于展示和生成安全落盘文件名。")
     mime: str = Field(min_length=1, max_length=64, description="浏览器识别到的 MIME 类型。")
     data_base64: str = Field(
@@ -44,6 +46,8 @@ class GatewayInput(BaseModel):
     GatewayInput 只描述“用户想做什么”和必要上下文，不直接承载运行结果。
     真正的状态流转由 SessionRunner 处理，运行过程通过 SSE 事件回传前端。
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     type: GatewayInputType = Field(description="输入类型，决定本次请求是用户消息、人工审批回复还是停止任务。")
     session_id: str | None = Field(default=None, description="目标会话 ID；为空表示创建新会话，非空表示继续当前已加载会话。")

@@ -3,6 +3,15 @@ server:
   port: 8000
 storage:
   codepilot_home: "~/codepilot"
+auth:
+  enabled: true
+  mode: "local_dev"
+  public_origin:
+  trusted_proxy_addresses: ["127.0.0.1", "::1"]
+  idle_timeout_seconds: 43200
+  absolute_timeout_seconds: 604800
+  max_active_runs_per_user: 2
+  max_started_agents_per_user: 3
 llm:
   providers:
     openai:

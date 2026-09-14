@@ -23,9 +23,11 @@ class StreamEvent(BaseModel):
     event_id: str = Field(default_factory=lambda: f"evt_{uuid4().hex}")
     event_type: str
     # 新运行时按 Agent/Session/Run 归属；旧事件和旧 JSONL 仍允许缺少这些字段。
+    user_id: str | None = None
     agent_id: str | None = None
     session_id: str | None = None
     run_id: str | None = None
+    revision_id: str | None = None
     run_seq: int = 0
     created_at: str
     data: dict[str, Any] = Field(default_factory=dict)
@@ -45,6 +47,7 @@ class DomainEvent(BaseModel):
     """领域事件基类，承载不同事件共有的元数据。"""
 
     event_type: DomainEventType
+    user_id: str | None = None
     agent_id: str | None = None
     session_id: str | None = None
     run_id: str | None = None

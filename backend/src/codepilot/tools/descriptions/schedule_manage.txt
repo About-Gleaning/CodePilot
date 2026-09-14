@@ -8,13 +8,13 @@
 调用前规则：
 - create_task、update_task、enable_task、disable_task、delete_task 会改变持久化调度状态；用户意图明确且必要字段齐全时可以直接调用。
 - 如果缺少关键字段、时间表达有歧义、目标任务不明确，先向用户提问，不要猜测或编造参数。
-- 不要编造 agent_name、provider、model、working_dir、trigger 或 prompt；这些必须来自用户明确输入、上下文中已确认的信息或当前系统已有配置。
+- 不要编造 agent_id、provider、model、working_dir、trigger 或 prompt；这些必须来自用户明确输入、上下文中已确认的信息或当前系统已有配置。
 - 不要在 prompt 或 metadata 中写入 API Key、令牌、密码等敏感信息。
 - 避免创建高频任务或会反复执行高风险写入、删除、外部命令的任务。
 
 action：
 - list_tasks：列出当前工作区定时任务。
-- create_task：创建任务。必须提供 name、prompt、agent_name、provider、model、working_dir、trigger。
+- create_task：创建任务。必须提供 name、prompt、agent_id、provider、model、working_dir、trigger。
 - update_task：修改任务。必须提供 task_id，并且至少提供一个要修改的字段；只传确实需要修改的字段。
 - enable_task / disable_task：开启或关闭任务。必须提供 task_id。
 - delete_task：删除任务。必须提供 task_id。已运行的 worker 不会被强杀，未启动的 pending run 会被取消。
@@ -30,7 +30,7 @@ trigger 支持四类：
 - interval_seconds 最小为 60。
 - weekly 必须提供 day_of_week 和 time_of_day。
 - working_dir 必须是本机已存在目录。
-- agent_name 必须是可直接执行的 Agent，不能选择 subagent 或不存在的 Agent。
+- agent_id 必须指向当前用户可见且可直接执行的 Agent，不能选择 subagent 或不存在的 Agent。
 - provider 必须是已激活的模型 provider。
 - model 必须属于所选 provider。
 - 第一版仅支持 subprocess 隔离模式，不要传其他 isolation_mode。

@@ -30,6 +30,7 @@ def register_health_routes(router: APIRouter, app_state: Any) -> None:
             and runtime["error_code"] is None
             and provider_count > 0
             and storage_writable
+            and not bool(getattr(app_state, "migration_required", False))
         )
         status = "ready" if ready_now and unavailable_mcp == 0 else "degraded" if ready_now else "not_ready"
         payload = {
@@ -41,8 +42,8 @@ def register_health_routes(router: APIRouter, app_state: Any) -> None:
                 "llm_provider_count": provider_count,
                 "mcp_configured_count": len(mcp),
                 "mcp_unavailable_count": unavailable_mcp,
+                "migration": "required" if getattr(app_state, "migration_required", False) else "ready",
             },
-            "error_code": runtime["error_code"],
+            "error_code": "migration_required" if getattr(app_state, "migration_required", False) else runtime["error_code"],
         }
         return JSONResponse(payload, status_code=200 if ready_now else 503)
-

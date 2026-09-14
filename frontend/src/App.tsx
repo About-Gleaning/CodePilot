@@ -1,5 +1,5 @@
-import AgentStudio from './features/agent-studio/AgentStudio';
+import AuthGate from './AuthGate';
 
 export default function App() {
-  return <AgentStudio />;
+  return <AuthGate />;
 }

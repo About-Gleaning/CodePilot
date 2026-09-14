@@ -12,6 +12,8 @@ BACKEND_PORT=8000
 FRONTEND_PORT=5173
 BACKEND_GRACEFUL_SHUTDOWN_SECONDS=5
 DEV_HOST="${CODEPILOT_HOST:-127.0.0.1}"
+NEW_BACKEND_PID=""
+NEW_FRONTEND_PID=""
 
 case "$DEV_HOST" in
   127.0.0.1|localhost|::1) ;;
@@ -22,7 +24,7 @@ case "$DEV_HOST" in
 esac
 
 BACKEND_CMD=(
-  uv run uvicorn codepilot.main:app
+  uv run --no-sync --offline uvicorn codepilot.main:app
   --app-dir src
   --reload
   --host "$DEV_HOST"
@@ -30,7 +32,7 @@ BACKEND_CMD=(
   # 将 Uvicorn 的优雅退出时间限制在 stop 脚本等待窗口内，避免 SSE 长连接导致外部强杀。
   --timeout-graceful-shutdown "$BACKEND_GRACEFUL_SHUTDOWN_SECONDS"
 )
-FRONTEND_CMD=(pnpm dev --host "$DEV_HOST" --port "$FRONTEND_PORT")
+FRONTEND_CMD=(env COREPACK_ENABLE_NETWORK=0 COREPACK_ENABLE_AUTO_PIN=0 pnpm dev --host "$DEV_HOST" --port "$FRONTEND_PORT" --strictPort)
 
 mkdir -p "$RUN_DIR"
 
@@ -56,6 +58,7 @@ require_file() {
 
 is_pid_running() {
   local pid="$1"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   kill -0 "$pid" >/dev/null 2>&1
 }
 
@@ -142,10 +145,15 @@ start_backend() {
     return
   fi
 
+  if [[ -n "$(find_listener_pid "$BACKEND_PORT")" ]]; then
+    echo "错误: 后端启动前检查失败，端口 ${BACKEND_PORT} 已被占用。"
+    return 1
+  fi
   rm -f "$BACKEND_PID_FILE"
-  launch_in_own_session "$ROOT_DIR/backend" "$BACKEND_LOG_FILE" "$BACKEND_PID_FILE" "${BACKEND_CMD[@]}"
+  launch_in_own_session "$ROOT_DIR/backend" "$BACKEND_LOG_FILE" "$BACKEND_PID_FILE" "${BACKEND_CMD[@]}" || return 1
   pid="$(read_pid "$BACKEND_PID_FILE")"
-  echo "后端已启动，PID=${pid}，日志: ${BACKEND_LOG_FILE}"
+  NEW_BACKEND_PID="$pid"
+  echo "后端进程已创建，等待就绪。"
 }
 
 start_frontend() {
@@ -156,10 +164,75 @@ start_frontend() {
     return
   fi
 
+  if [[ -n "$(find_listener_pid "$FRONTEND_PORT")" ]]; then
+    echo "错误: 前端启动前检查失败，端口 ${FRONTEND_PORT} 已被占用。"
+    return 1
+  fi
   rm -f "$FRONTEND_PID_FILE"
-  launch_in_own_session "$ROOT_DIR/frontend" "$FRONTEND_LOG_FILE" "$FRONTEND_PID_FILE" "${FRONTEND_CMD[@]}"
+  launch_in_own_session "$ROOT_DIR/frontend" "$FRONTEND_LOG_FILE" "$FRONTEND_PID_FILE" "${FRONTEND_CMD[@]}" || return 1
   pid="$(read_pid "$FRONTEND_PID_FILE")"
-  echo "前端已启动，PID=${pid}，日志: ${FRONTEND_LOG_FILE}"
+  NEW_FRONTEND_PID="$pid"
+  echo "前端进程已创建，等待就绪。"
+}
+
+cleanup_started() {
+  local pid fragment pid_file index
+  # 仅回收本次创建且仍与命令和独立进程组匹配的进程，不按端口兜底杀进程。
+  for index in 0 1; do
+    if [[ "$index" == 0 ]]; then
+      pid="$NEW_BACKEND_PID"; fragment="uvicorn codepilot.main:app"; pid_file="$BACKEND_PID_FILE"
+    else
+      pid="$NEW_FRONTEND_PID"; fragment="pnpm dev --host"; pid_file="$FRONTEND_PID_FILE"
+    fi
+    [[ -n "$pid" ]] || continue
+    if is_pid_running "$pid" && pid_matches_command "$pid" "$fragment" \
+      && [[ "$(get_process_group_id "$pid")" == "$pid" ]]; then
+      stop_process_group "$pid" TERM
+      sleep 0.5
+      if is_pid_running "$pid" && pid_matches_command "$pid" "$fragment" \
+        && [[ "$(get_process_group_id "$pid")" == "$pid" ]]; then
+        stop_process_group "$pid" KILL
+      fi
+    fi
+    if [[ "$(read_pid "$pid_file")" == "$pid" ]]; then rm -f "$pid_file"; fi
+  done
+}
+
+listener_belongs_to() {
+  local listener
+  listener="$(find_listener_pid "$1")"
+  [[ -n "$listener" ]] && [[ "$(get_process_group_id "$listener")" == "$(get_process_group_id "$2")" ]]
+}
+
+wait_until_ready() {
+  local deadline=$((SECONDS + 20)) backend_ready=0 frontend_ready=0 pid host="$DEV_HOST"
+  [[ "$host" != "::1" ]] || host="[::1]"
+  # 两个组件共享截止时间；不使用代理，也不读取可能包含敏感内容的响应正文。
+  while (( SECONDS < deadline )); do
+    for component in backend frontend; do
+      if [[ "$component" == backend ]]; then
+        pid="$(read_pid "$BACKEND_PID_FILE")"
+      else
+        pid="$(read_pid "$FRONTEND_PID_FILE")"
+      fi
+      if ! is_pid_running "$pid"; then
+        if [[ "$component" == backend ]]; then echo "错误: 后端在就绪前退出，请查看本地后端日志。"
+        else echo "错误: 前端在就绪前退出，请查看本地前端日志。"; fi
+        return 1
+      fi
+    done
+    backend_ready=0; frontend_ready=0
+    if [[ "$(curl --noproxy '*' --connect-timeout 1 --max-time 1 -s -o /dev/null -w '%{http_code}' "http://${host}:${BACKEND_PORT}/api/health/ready")" == 200 ]] \
+      && listener_belongs_to "$BACKEND_PORT" "$(read_pid "$BACKEND_PID_FILE")"; then backend_ready=1; fi
+    (( SECONDS < deadline )) || break
+    if [[ "$(curl --noproxy '*' --connect-timeout 1 --max-time 1 -s -o /dev/null -w '%{http_code}' "http://${host}:${FRONTEND_PORT}/")" == 200 ]] \
+      && listener_belongs_to "$FRONTEND_PORT" "$(read_pid "$FRONTEND_PID_FILE")"; then frontend_ready=1; fi
+    if (( backend_ready && frontend_ready && SECONDS < deadline )); then return 0; fi
+    sleep 0.2
+  done
+  (( backend_ready )) || echo "错误: 后端就绪检查超时（两个组件共用 20 秒），请检查本地日志、模型配置和迁移状态。"
+  (( frontend_ready )) || echo "错误: 前端就绪检查超时（两个组件共用 20 秒），请检查本地前端日志。"
+  return 1
 }
 
 stop_service() {
@@ -224,14 +297,26 @@ stop_service() {
 start_all() {
   require_command "uv"
   require_command "pnpm"
+  require_command "node"
   require_command "python3"
+  require_command "curl"
+  require_command "lsof"
   require_file "$ROOT_DIR/backend/pyproject.toml"
   require_file "$ROOT_DIR/backend/uv.lock"
   require_file "$ROOT_DIR/frontend/package.json"
   require_file "$ROOT_DIR/frontend/pnpm-lock.yaml"
+  require_file "$ROOT_DIR/backend/.venv/bin/python"
+  require_file "$ROOT_DIR/backend/.venv/bin/uvicorn"
+  require_file "$ROOT_DIR/frontend/node_modules/vite/bin/vite.js"
+  if ! "$ROOT_DIR/backend/.venv/bin/python" -c 'import sys; assert (3,12) <= sys.version_info < (3,15); import uvicorn, fastapi, litellm' >/dev/null 2>&1; then
+    echo "错误: 后端依赖检查失败，请在 backend 执行 uv sync --frozen。"
+    return 1
+  fi
 
-  start_backend
-  start_frontend
+  trap cleanup_started EXIT
+  trap 'exit 1' INT TERM
+  start_backend && start_frontend && wait_until_ready || return 1
+  trap - EXIT INT TERM
 
   echo "启动完成。"
   echo "后端地址: http://${DEV_HOST}:8000"

@@ -11,6 +11,7 @@ from uuid import uuid4
 import httpx
 from dotenv import load_dotenv
 
+from codepilot.auth import AuthStore
 from codepilot.config import WorkspaceState, build_workspace_id, load_settings
 from codepilot.gateway import GatewayInput
 from codepilot.events import RunEventScope
@@ -18,6 +19,7 @@ from codepilot.logging import configure_logging
 from codepilot.runtime import build_runtime_bundle
 from codepilot.scheduler.models import ScheduleRunStatus
 from codepilot.session import SessionStatus
+from codepilot.session.agents import AgentProfile
 from codepilot.session.state import RunRef
 
 
@@ -31,8 +33,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--task-name", required=True)
-    parser.add_argument("--prompt-file", required=True)
-    parser.add_argument("--agent-name", required=True)
+    parser.add_argument("--execution-bundle-file", required=True)
+    parser.add_argument("--user-id", required=True)
+    parser.add_argument("--agent-id", required=True)
+    parser.add_argument("--revision-id", required=True)
     parser.add_argument("--provider", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--execution-dir", required=True)
@@ -53,21 +57,30 @@ async def run_worker(args: argparse.Namespace) -> None:
             execution_dir=Path(args.execution_dir),
             storage_workspace_dir=Path(args.storage_workspace_dir),
         )
-        configure_logging(settings.logging, workspace.logs_dir)
+        user_workspace = workspace.for_user(args.user_id)
+        configure_logging(settings.logging, user_workspace.logs_dir)
+        auth_store = AuthStore(
+            workspace.codepilot_home / "auth.sqlite3",
+            idle_timeout_seconds=settings.auth.idle_timeout_seconds,
+            absolute_timeout_seconds=settings.auth.absolute_timeout_seconds,
+        )
+        principal = auth_store.find_enabled_user(args.user_id)
         runtime = build_runtime_bundle(
             settings=settings,
             workspace=workspace,
             allow_manual_approval=False,
             allow_question_interaction=False,
+            principal_resolver=lambda user_id: principal if user_id == principal.user_id else auth_store.find_enabled_user(user_id),
         )
         await runtime.start()
         _prepare_worker_runtime(runtime)
-        prompt = _read_prompt_file(Path(args.prompt_file))
-        profile = runtime.agent_profiles.get(args.agent_name)
-        if profile is None or profile.kind != "agent":
+        prompt, profile = _read_execution_bundle(Path(args.execution_bundle_file))
+        profile = _prepare_worker_profile(profile)
+        if profile.kind != "agent" or profile.agent_id != args.agent_id or profile.revision_id != args.revision_id:
             raise ValueError("定时任务 Agent 不存在或已归档")
         session_id = f"sess_{uuid4().hex}"
         run_ref = RunRef(
+            user_id=args.user_id,
             agent_id=profile.agent_id,
             session_id=session_id,
             run_id=args.run_id,
@@ -77,7 +90,7 @@ async def run_worker(args: argparse.Namespace) -> None:
             type="user_message",
             session_id=session_id,
             content=prompt,
-            agent_name=args.agent_name,
+            agent_name=profile.name,
             provider=args.provider,
             model=args.model,
             metadata={
@@ -85,19 +98,23 @@ async def run_worker(args: argparse.Namespace) -> None:
                 "schedule_task_id": args.task_id,
                 "schedule_run_id": args.run_id,
                 "schedule_task_name": args.task_name,
-                "agent_id": profile.agent_id,
-                "revision_id": profile.revision_id,
-                "run_id": args.run_id,
             },
         )
-        session = await runtime.session_runner.start_resource_run(
+        handle = await runtime.agent_backend.load_session(
+            args.user_id,
+            args.agent_id,
+            session_id,
+            None,
+            profile,
+        )
+        session = await handle.runner.start_resource_run(
             payload,
             run_ref=run_ref,
             profile=profile,
             event_scope=RunEventScope(runtime.event_bus, run_ref),
         )
         session_id = session.session_id if session else None
-        finished = await runtime.session_runner.wait_current_run()
+        finished = await handle.runner.wait_current_run()
         status = _run_status_from_session(finished.status if finished else None)
         await report(
             args,
@@ -117,6 +134,7 @@ async def run_worker(args: argparse.Namespace) -> None:
         raise
     finally:
         if runtime is not None:
+            await runtime.agent_backend.shutdown()
             await runtime.session_runner.shutdown()
             await runtime.shutdown()
 
@@ -162,14 +180,18 @@ def _build_worker_workspace(*, execution_dir: Path, storage_workspace_dir: Path)
     )
 
 
-def _read_prompt_file(prompt_file: Path) -> str:
-    prompt = prompt_file.read_text(encoding="utf-8")
+def _read_execution_bundle(bundle_file: Path) -> tuple[str, AgentProfile]:
+    import json
+
+    payload = json.loads(bundle_file.read_text(encoding="utf-8"))
     try:
-        prompt_file.unlink(missing_ok=True)
+        bundle_file.unlink(missing_ok=True)
     except OSError:
         # runner 进程退出监控时还会兜底清理；这里优先缩短敏感内容落盘时间。
         pass
-    return prompt
+    if payload.get("schema_version") != 1:
+        raise ValueError("定时任务执行包版本无效")
+    return str(payload.get("prompt") or ""), AgentProfile.model_validate(payload.get("profile"))
 
 
 def _build_worker_settings(settings: Any) -> Any:
@@ -185,6 +207,14 @@ def _prepare_worker_runtime(runtime: Any) -> None:
         runtime.agent_profiles[name] = profile.model_copy(
             update={"allowed_tools": [tool for tool in profile.allowed_tools if tool != "question"]}
         )
+
+
+def _prepare_worker_profile(profile: AgentProfile) -> AgentProfile:
+    """执行包是独立快照，必须在交给 SessionRunner 前移除无人值守工具。"""
+    return profile.model_copy(
+        update={"allowed_tools": [tool for tool in profile.allowed_tools if tool != "question"]},
+        deep=True,
+    )
 
 
 def _run_status_from_session(status: SessionStatus | None) -> ScheduleRunStatus:

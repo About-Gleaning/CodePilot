@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "work_item": "CODE-54",
+  "amended_by": ["CODE-56", "CODE-57"],
+  "status": "passed",
+  "deterministic_release_gate": {
+    "status": "passed",
+    "python_vulnerability_count": 0,
+    "frontend_high_vulnerability_count": 0,
+    "frontend_critical_vulnerability_count": 0,
+    "sensitive_data_scan": "passed",
+    "live_provider": "passed",
+    "external_mcp": "not_configured"
+  },
+  "backend": {
+    "command": "uv run pytest -q",
+    "passed": 337,
+    "skipped": 1
+  },
+  "frontend": {
+    "test_command": "pnpm test --run",
+    "passed": 23,
+    "build_command": "pnpm build",
+    "build": "passed",
+    "browser_command": "pnpm test:e2e",
+    "browser_passed": 1
+  },
+  "covered": [
+    "认证存储、密码与会话摘要、CSRF 绑定、禁用与撤销",
+    "同 Session ID 的用户分区",
+    "同共享 Agent 与 client_request_id 的用户幂等隔离",
+    "SSE 入队前过滤与用户级 cursor replay",
+    "HTTPS 同源登录、Secure Cookie、注销、过期与双浏览器 SSE 隔离",
+    "迁移预览、重复执行、中间损坏 fail closed 与旧 Schedule 映射失败禁用",
+    "重启取消所有遗留 Run，仅恢复启用用户 Agent，并持久化禁用用户停止状态",
+    "历史 revision 固化读取、摘要与身份校验、归档拒绝及单次调度失败隔离",
+    "禁用用户启动阶段不创建 Scheduler，并原子禁用已有周期任务",
+    "Task 描述保留共享 subagent，执行按当前用户解析私有目标",
+    "动态用户启用 Schedule 时即时启动 runner，禁用与查询不创建后台循环",
+    "当前 revision 缺失、符号链接和身份不匹配均失败闭合，旧格式仅首次补建",
+    "worker 执行包 profile 移除 question 且不修改原始能力快照",
+    "恢复阶段同时执行全服务与每用户 started Agent 容量限制"
+  ],
+  "contains_sensitive_data": false
+}

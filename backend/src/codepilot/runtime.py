@@ -7,6 +7,7 @@ from __future__ import annotations
 """
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from codepilot.config import AppSettings, WorkspaceState
@@ -21,7 +22,7 @@ from codepilot.hooks import (
     PromptPluginHook,
 )
 from codepilot.llm import LiteLLMClient
-from codepilot.memory import JsonlEventStore, JsonlSessionMemory
+from codepilot.memory import UserPartitionedEventStore, UserPartitionedSessionMemory
 from codepilot.session import AgentLoop, SessionRunner, build_agent_profiles
 from codepilot.session.agent_runtime import InProcessAgentRuntimeBackend, SessionRunnerFactory
 from codepilot.session.title import SessionTitleService
@@ -51,8 +52,8 @@ class RuntimeBundle:
     """应用和 worker 共享的长期运行时对象集合。"""
 
     event_bus: EventBus
-    event_store: JsonlEventStore
-    session_memory: JsonlSessionMemory
+    event_store: UserPartitionedEventStore
+    session_memory: UserPartitionedSessionMemory
     tool_registry: ToolRegistry
     hook_manager: HookManager
     llm_client: LiteLLMClient
@@ -77,12 +78,12 @@ def build_runtime_bundle(
     *,
     allow_manual_approval: bool = True,
     allow_question_interaction: bool = True,
+    principal_resolver: Callable[[str], Any] | None = None,
 ) -> RuntimeBundle:
     """按指定 workspace 构建一套独立的 Agent 会话运行时。"""
     event_bus = EventBus()
-    session_memory = JsonlSessionMemory(workspace.sessions_dir)
-    event_store = JsonlEventStore(workspace.sessions_dir)
-    event_bus.set_initial_seq(event_store.latest_seq())
+    session_memory = UserPartitionedSessionMemory(workspace.workspace_dir)
+    event_store = UserPartitionedEventStore(workspace.workspace_dir)
     event_bus.subscribe_domain(session_memory.handle_domain_event, critical=True)
     event_bus.subscribe_stream(event_store.append)
 
@@ -111,7 +112,7 @@ def build_runtime_bundle(
     agent_profiles = build_agent_profiles(
         max_iterations=settings.agent.max_loop_iterations,
         subagent_max_iterations=settings.agent.subagent_max_loop_iterations,
-        custom_agents_root=workspace.codepilot_home / "agents",
+        custom_agents_root=None,
     )
     agent_loop = AgentLoop(
         llm_client=llm_client,
@@ -127,9 +128,11 @@ def build_runtime_bundle(
             timeout_seconds=settings.tools.default_timeout_seconds,
         )
     )
-    def create_session_runner() -> SessionRunner:
+    def create_session_runner(user_id: str | None = None) -> SessionRunner:
+        principal = principal_resolver(user_id) if user_id and principal_resolver else None
+        runner_workspace = workspace.for_user(user_id, principal) if user_id else workspace
         return SessionRunner(
-            workspace=workspace,
+            workspace=runner_workspace,
             config=settings,
             event_bus=event_bus,
             hook_manager=hook_manager,

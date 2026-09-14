@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from codepilot.events import StreamEvent
 from codepilot.gateway import GatewayInput, UploadedAttachmentInput
@@ -25,13 +25,29 @@ class LoadSessionRequest(BaseModel):
 
 
 class StartRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     session_id: str | None = None
     content: str = Field(min_length=1, max_length=MAX_USER_CONTENT_CHARS)
     provider: str | None = None
     model: str | None = None
-    metadata: dict[str, Any] = Field(default_factory=dict)
+    thinking_value: str | None = Field(default=None, max_length=64)
+    user_metadata: dict[str, Any] = Field(default_factory=dict)
     attachments: list[UploadedAttachmentInput] = Field(default_factory=list, max_length=4)
     client_request_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+    @field_validator("user_metadata")
+    @classmethod
+    def validate_user_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        reserved = {
+            "user_id", "agent_id", "agent_name", "run_id", "revision_id",
+            "source", "schedule", "schedule_task_id", "schedule_run_id", "schedule_task_name",
+        }
+        if reserved.intersection(value):
+            raise ValueError("user_metadata 包含服务端保留字段")
+        if len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)) > MAX_USER_CONTENT_CHARS:
+            raise ValueError("user_metadata 内容过大")
+        return value
 
 
 class InteractionReplyRequest(BaseModel):
@@ -42,18 +58,23 @@ class InteractionReplyRequest(BaseModel):
 
 
 def register_session_routes(router: APIRouter, app_state: Any) -> None:
-    legacy = LegacySessionAdapter(app_state)
+    legacy_by_user: dict[str, LegacySessionAdapter] = {}
+
+    def legacy(request: Request) -> "LegacySessionAdapter":
+        user_id = _user_id(request)
+        return legacy_by_user.setdefault(user_id, LegacySessionAdapter(app_state, user_id))
     @router.get("/agent-runtimes")
-    async def get_agent_runtimes() -> JSONResponse:
-        return JSONResponse(await app_state.agent_runtime.get_runtime_overview())
+    async def get_agent_runtimes(request: Request) -> JSONResponse:
+        return JSONResponse(await app_state.agent_runtime.get_runtime_overview(_user_id(request)))
 
     @router.get("/agent-runtimes/stream")
     async def get_agent_runtime_stream(request: Request, cursor: str | None = None) -> StreamingResponse:
-        subscription = app_state.agent_runtime.create_runtime_subscription()
+        user_id = _user_id(request)
+        subscription = app_state.agent_runtime.create_runtime_subscription(user_id)
         try:
-            replay = await app_state.agent_runtime.replay_runtime_events(cursor)
+            replay = await app_state.agent_runtime.replay_runtime_events(user_id, cursor)
         except RuntimeConflict as exc:
-            app_state.agent_runtime.remove_runtime_subscription(subscription)
+            app_state.agent_runtime.remove_runtime_subscription(user_id, subscription)
             raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
 
         async def event_generator() -> AsyncIterator[str]:
@@ -75,46 +96,49 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
                     event_cursor = app_state.agent_runtime.runtime_cursor_for_seq(event.seq)
                     yield _to_control_sse(event, event_cursor)
             finally:
-                app_state.agent_runtime.remove_runtime_subscription(subscription)
+                app_state.agent_runtime.remove_runtime_subscription(user_id, subscription)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
     @router.get("/agents/{agent_id}/runtime")
-    async def get_agent_runtime(agent_id: str) -> JSONResponse:
+    async def get_agent_runtime(agent_id: str, request: Request) -> JSONResponse:
         try:
-            return JSONResponse(app_state.agent_runtime.get_agent_state(agent_id).model_dump())
+            return JSONResponse(app_state.agent_runtime.get_agent_state(_user_id(request), agent_id).model_dump())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_not_found"}) from exc
 
     @router.post("/agents/{agent_id}/start")
-    async def start_agent(agent_id: str) -> JSONResponse:
+    async def start_agent(agent_id: str, request: Request) -> JSONResponse:
         try:
-            return JSONResponse((await app_state.agent_runtime.start_agent(agent_id)).model_dump())
+            return JSONResponse((await app_state.agent_runtime.start_agent(_user_id(request), agent_id)).model_dump())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_not_found"}) from exc
         except RuntimeConflict as exc:
             raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
 
     @router.post("/agents/{agent_id}/stop")
-    async def stop_agent(agent_id: str) -> JSONResponse:
+    async def stop_agent(agent_id: str, request: Request) -> JSONResponse:
         try:
-            return JSONResponse((await app_state.agent_runtime.stop_agent(agent_id)).model_dump())
+            return JSONResponse((await app_state.agent_runtime.stop_agent(_user_id(request), agent_id)).model_dump())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_not_found"}) from exc
 
     @router.get("/agents/{agent_id}/sessions")
-    async def get_agent_sessions(agent_id: str) -> JSONResponse:
+    async def get_agent_sessions(agent_id: str, request: Request) -> JSONResponse:
         try:
-            sessions = app_state.agent_runtime.list_sessions(agent_id)
+            sessions = app_state.agent_runtime.list_sessions(_user_id(request), agent_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_not_found"}) from exc
         return JSONResponse({"sessions": sessions})
 
     @router.post("/agents/{agent_id}/runs")
-    async def start_run(agent_id: str, payload: StartRunRequest) -> JSONResponse:
-        request = GatewayInput(type=GatewayInputType.USER_MESSAGE, session_id=payload.session_id, content=payload.content, agent_name="runtime", provider=payload.provider, model=payload.model, metadata=payload.metadata, attachments=payload.attachments)
+    async def start_run(agent_id: str, payload: StartRunRequest, http_request: Request) -> JSONResponse:
+        metadata = {"user_metadata": payload.user_metadata}
+        if payload.thinking_value:
+            metadata["thinking_value"] = payload.thinking_value
+        request = GatewayInput(type=GatewayInputType.USER_MESSAGE, session_id=payload.session_id, content=payload.content, agent_name="runtime", provider=payload.provider, model=payload.model, metadata=metadata, attachments=payload.attachments)
         try:
-            run = await app_state.agent_runtime.start_run(agent_id, request, payload.session_id, payload.client_request_id)
+            run = await app_state.agent_runtime.start_run(_user_id(http_request), agent_id, request, payload.session_id, payload.client_request_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_or_session_not_found"}) from exc
         except RuntimeConflict as exc:
@@ -129,18 +153,18 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
         return JSONResponse(run.model_dump())
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/runs/{run_id}")
-    async def get_run(agent_id: str, session_id: str, run_id: str) -> JSONResponse:
+    async def get_run(agent_id: str, session_id: str, run_id: str, request: Request) -> JSONResponse:
         try:
-            return JSONResponse(app_state.agent_runtime.get_run_state(RunRef(agent_id=agent_id, session_id=session_id, run_id=run_id)).model_dump())
+            return JSONResponse(app_state.agent_runtime.get_run_state(RunRef(user_id=_user_id(request), agent_id=agent_id, session_id=session_id, run_id=run_id)).model_dump())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "run_not_found"}) from exc
         except RuntimeConflict as exc:
             raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
 
     @router.post("/agents/{agent_id}/sessions/{session_id}/runs/{run_id}/cancel")
-    async def cancel_run(agent_id: str, session_id: str, run_id: str) -> JSONResponse:
+    async def cancel_run(agent_id: str, session_id: str, run_id: str, request: Request) -> JSONResponse:
         try:
-            run = await app_state.agent_runtime.cancel_run(RunRef(agent_id=agent_id, session_id=session_id, run_id=run_id))
+            run = await app_state.agent_runtime.cancel_run(RunRef(user_id=_user_id(request), agent_id=agent_id, session_id=session_id, run_id=run_id))
             return JSONResponse(run.model_dump())
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "run_not_found"}) from exc
@@ -148,24 +172,26 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             raise HTTPException(status_code=409, detail={"code": exc.code}) from exc
 
     @router.post("/agents/{agent_id}/sessions/{session_id}/runs/{run_id}/interactions/{interaction_id}")
-    async def reply_interaction(agent_id: str, session_id: str, run_id: str, interaction_id: str, payload: InteractionReplyRequest) -> JSONResponse:
+    async def reply_interaction(agent_id: str, session_id: str, run_id: str, interaction_id: str, payload: InteractionReplyRequest, request: Request) -> JSONResponse:
         if payload.type not in {GatewayInputType.HUMAN_REPLY, GatewayInputType.QUESTION_REPLY, GatewayInputType.QUESTION_DECLINE}:
             raise HTTPException(status_code=422, detail={"code": "invalid_interaction_type"})
-        request = GatewayInput(type=payload.type, approval_id=interaction_id if payload.type == GatewayInputType.HUMAN_REPLY else None, question_id=interaction_id if payload.type != GatewayInputType.HUMAN_REPLY else None, approved=payload.approved, answers=payload.answers, comment=payload.comment)
+        gateway_request = GatewayInput(type=payload.type, approval_id=interaction_id if payload.type == GatewayInputType.HUMAN_REPLY else None, question_id=interaction_id if payload.type != GatewayInputType.HUMAN_REPLY else None, approved=payload.approved, answers=payload.answers, comment=payload.comment)
         try:
-            run = await app_state.agent_runtime.reply_interaction(RunRef(agent_id=agent_id, session_id=session_id, run_id=run_id), interaction_id, request)
+            run = await app_state.agent_runtime.reply_interaction(RunRef(user_id=_user_id(request), agent_id=agent_id, session_id=session_id, run_id=run_id), interaction_id, gateway_request)
             return JSONResponse(run.model_dump())
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail={"code": getattr(exc, "code", "interaction_conflict"), "message": str(exc)}) from exc
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/replay")
-    async def get_agent_session_replay(agent_id: str, session_id: str) -> JSONResponse:
+    async def get_agent_session_replay(agent_id: str, session_id: str, request: Request) -> JSONResponse:
         try:
+            user_id = _user_id(request)
             # 先固定已持久化事件边界；其后的事件由 SSE 重放，重复部分由 event_id 去重。
-            latest_event_seq = app_state.event_store.latest_seq(session_id)
-            replay = await app_state.agent_runtime.validate_session_owner(agent_id, session_id)
+            latest_event_seq = app_state.event_store.latest_seq(user_id, session_id)
+            replay = await app_state.agent_runtime.validate_session_owner(user_id, agent_id, session_id)
             replay["latest_event_seq"] = latest_event_seq
             replay["runtime"] = await app_state.agent_runtime.get_session_runtime_snapshot(
+                user_id,
                 agent_id,
                 session_id,
                 replay,
@@ -179,15 +205,22 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
         if after_seq < 0:
             raise HTTPException(status_code=422, detail={"code": "invalid_after_seq"})
         try:
-            await app_state.agent_runtime.validate_session_owner(agent_id, session_id)
+            user_id = _user_id(request)
+            await app_state.agent_runtime.validate_session_owner(user_id, agent_id, session_id)
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
-        return _stream_response(request, app_state, session_id, after_seq)
+        return _stream_response(request, app_state, user_id, session_id, after_seq)
 
     @router.post("/session/input")
-    async def post_session_input(payload: GatewayInput) -> JSONResponse:
+    async def post_session_input(payload: GatewayInput, request: Request) -> JSONResponse:
+        reserved = {
+            "user_id", "agent_id", "agent_name", "run_id", "revision_id",
+            "source", "schedule", "schedule_task_id", "schedule_run_id", "schedule_task_name",
+        }
+        if payload.type == GatewayInputType.USER_MESSAGE and reserved.intersection(payload.metadata):
+            raise HTTPException(status_code=422, detail={"code": "reserved_metadata_forbidden"})
         try:
-            return JSONResponse(await legacy.handle_input(payload))
+            return JSONResponse(await legacy(request).handle_input(payload))
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(
                 status_code=getattr(exc, "status", 409),
@@ -195,24 +228,25 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             ) from exc
 
     @router.get("/session/status")
-    async def get_session_status() -> JSONResponse:
-        return JSONResponse(legacy.status())
+    async def get_session_status(request: Request) -> JSONResponse:
+        return JSONResponse(legacy(request).status())
 
     @router.get("/session/replay")
-    async def get_session_replay() -> JSONResponse:
-        session_id = legacy.session_id
+    async def get_session_replay(request: Request) -> JSONResponse:
+        user_id = _user_id(request)
+        session_id = legacy(request).session_id
         if not session_id:
             return JSONResponse({"session": None, "messages": [], "records": []})
-        return JSONResponse(await app_state.session_memory.replay(session_id))
+        return JSONResponse(await _memory_replay(app_state.session_memory, user_id, session_id))
 
     @router.get("/sessions")
-    async def get_sessions() -> JSONResponse:
-        return JSONResponse({"sessions": app_state.session_memory.list_sessions()})
+    async def get_sessions(request: Request) -> JSONResponse:
+        return JSONResponse({"sessions": _memory_list(app_state.session_memory, _user_id(request))})
 
     @router.post("/session/load")
-    async def post_session_load(payload: LoadSessionRequest) -> JSONResponse:
+    async def post_session_load(payload: LoadSessionRequest, request: Request) -> JSONResponse:
         try:
-            result = await legacy.load(payload.session_id)
+            result = await legacy(request).load(payload.session_id)
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=409, detail={"code": "legacy_session_conflict", "message": str(exc)}) from exc
         return JSONResponse(result)
@@ -222,19 +256,21 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
         if after_seq < 0:
             raise HTTPException(status_code=422, detail={"code": "invalid_after_seq"})
         async def event_generator() -> AsyncIterator[str]:
-            active_session_id = legacy.session_id
-            queue = app_state.event_bus.create_stream_queue()
+            user_id = _user_id(request)
+            adapter = legacy(request)
+            active_session_id = adapter.session_id
+            subscription = _create_subscription(app_state.event_bus, user_id=user_id)
             if active_session_id and app_state.settings.sse.replay_on_connect:
-                for event in app_state.event_store.replay(session_id=active_session_id, after_seq=after_seq):
+                for event in _event_replay(app_state.event_store, user_id, active_session_id, after_seq):
                     yield _to_sse(event)
             try:
                 while True:
                     if await request.is_disconnected():
                         break
                     try:
-                        event = await asyncio.wait_for(queue.get(), timeout=app_state.settings.sse.heartbeat_seconds)
+                        event = await asyncio.wait_for(subscription.queue.get(), timeout=app_state.settings.sse.heartbeat_seconds)
                         if active_session_id and event.session_id != active_session_id:
-                            if event.event_type == "session_started" and event.session_id == legacy.session_id:
+                            if event.event_type == "session_started" and event.session_id == adapter.session_id:
                                 active_session_id = event.session_id
                             else:
                                 continue
@@ -246,7 +282,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
                     except TimeoutError:
                         yield _to_sse_comment(f"heartbeat {utc_now_iso()}")
             finally:
-                app_state.event_bus.remove_stream_queue(queue)
+                _remove_subscription(app_state.event_bus, subscription)
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -316,12 +352,12 @@ def _to_control_sse(event: StreamEvent, cursor: str) -> str:
     return f"id: {cursor}\nevent: {event.event_type}\ndata: {json.dumps(event.model_dump(), ensure_ascii=False)}\n\n"
 
 
-def _stream_response(request: Request, app_state: Any, session_id: str, after_seq: int) -> StreamingResponse:
+def _stream_response(request: Request, app_state: Any, user_id: str, session_id: str, after_seq: int) -> StreamingResponse:
     """按明确 Session 建立 SSE；队列被总线移除时客户端自行重连回放。"""
     async def event_generator() -> AsyncIterator[str]:
-        subscription = app_state.event_bus.create_stream_subscription()
+        subscription = _create_subscription(app_state.event_bus, user_id=user_id, session_id=session_id)
         if app_state.settings.sse.replay_on_connect:
-            for event in app_state.event_store.replay(session_id=session_id, after_seq=after_seq):
+            for event in _event_replay(app_state.event_store, user_id, session_id, after_seq):
                 yield _to_sse(event)
         try:
             while True:
@@ -337,7 +373,7 @@ def _stream_response(request: Request, app_state: Any, session_id: str, after_se
                 except TimeoutError:
                     yield _to_sse_comment(f"heartbeat {utc_now_iso()}")
         finally:
-            app_state.event_bus.remove_stream_subscription(subscription)
+            _remove_subscription(app_state.event_bus, subscription)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -349,8 +385,9 @@ def _to_sse_comment(comment: str) -> str:
 class LegacySessionAdapter:
     """把旧单会话指针限制在兼容层，所有执行仍委托资源化 Manager。"""
 
-    def __init__(self, app_state: Any) -> None:
+    def __init__(self, app_state: Any, user_id: str = "") -> None:
         self._app_state = app_state
+        self.user_id = user_id
         self.agent_id: str | None = None
         snapshot = app_state.session_runner.get_status_snapshot()
         self.session_id: str | None = snapshot.get("session_id")
@@ -367,13 +404,14 @@ class LegacySessionAdapter:
                 "session": session.model_dump(exclude={"messages"}) if session else None,
             }
         if payload.type == GatewayInputType.USER_MESSAGE:
-            agent_id = self._app_state.agent_runtime.find_active_agent_id(payload.agent_name or "")
-            await self._app_state.agent_runtime.start_agent(agent_id)
+            agent_id = self._app_state.agent_runtime.find_active_agent_id(self.user_id, payload.agent_name or "")
+            await self._app_state.agent_runtime.start_agent(self.user_id, agent_id)
             request_id = payload.metadata.get("client_request_id")
             legacy_best_effort = not isinstance(request_id, str) or not request_id
             if legacy_best_effort:
                 request_id = f"legacy_{uuid4().hex}"
             run = await self._app_state.agent_runtime.start_run(
+                self.user_id,
                 agent_id,
                 payload,
                 payload.session_id,
@@ -383,7 +421,7 @@ class LegacySessionAdapter:
             return {
                 "ok": True,
                 "legacy_best_effort": legacy_best_effort,
-                "session": self._app_state.agent_runtime.get_session_status(agent_id, run.ref.session_id),
+                "session": self._app_state.agent_runtime.get_session_status(self.user_id, agent_id, run.ref.session_id),
             }
         if self.run_ref is None:
             raise RuntimeConflict("legacy_run_not_selected", "旧接口没有明确的活动 Run")
@@ -397,12 +435,12 @@ class LegacySessionAdapter:
         return {"ok": True, "session": self.status(), "run": run.model_dump()}
 
     async def load(self, session_id: str) -> dict[str, Any]:
-        replay = await self._app_state.session_memory.replay(session_id)
+        replay = await _memory_replay(self._app_state.session_memory, self.user_id, session_id)
         data = (replay.get("session") or {}).get("data") or {}
         agent_id = data.get("agent_id")
         if not agent_id:
-            agent_id = self._app_state.agent_runtime.find_active_agent_id(str(data.get("agent_name") or ""))
-        await self._app_state.agent_runtime.load_session(agent_id, session_id)
+            agent_id = self._app_state.agent_runtime.find_active_agent_id(self.user_id, str(data.get("agent_name") or ""))
+        await self._app_state.agent_runtime.load_session(self.user_id, agent_id, session_id)
         self.agent_id, self.session_id, self.run_ref = agent_id, session_id, None
         return {
             "ok": True,
@@ -417,6 +455,47 @@ class LegacySessionAdapter:
         if not self.agent_id or not self.session_id:
             return {"session_id": None, "status": "IDLE"}
         try:
-            return self._app_state.agent_runtime.get_session_status(self.agent_id, self.session_id)
+            return self._app_state.agent_runtime.get_session_status(self.user_id, self.agent_id, self.session_id)
         except KeyError:
             return {"session_id": self.session_id, "agent_id": self.agent_id, "status": "IDLE"}
+
+
+def _user_id(request: Request) -> str:
+    principal = getattr(request.state, "principal", None)
+    return principal.user_id if principal is not None else "legacy"
+
+
+async def _memory_replay(memory: Any, user_id: str, session_id: str) -> dict[str, Any]:
+    try:
+        return await memory.replay(user_id, session_id)
+    except TypeError:
+        result = memory.replay(session_id)
+        return await result if hasattr(result, "__await__") else result
+
+
+def _memory_list(memory: Any, user_id: str) -> list[dict[str, Any]]:
+    try:
+        return memory.list_sessions(user_id)
+    except TypeError:
+        return memory.list_sessions()
+
+
+def _event_replay(store: Any, user_id: str, session_id: str, after_seq: int) -> list[StreamEvent]:
+    try:
+        return store.replay(user_id, session_id=session_id, after_seq=after_seq)
+    except TypeError:
+        return store.replay(session_id=session_id, after_seq=after_seq)
+
+
+def _create_subscription(event_bus: Any, *, user_id: str, session_id: str | None = None) -> Any:
+    if hasattr(event_bus, "create_stream_subscription"):
+        return event_bus.create_stream_subscription(user_id=user_id, session_id=session_id)
+    queue = event_bus.create_stream_queue()
+    return type("LegacySubscription", (), {"queue": queue, "resync_required": asyncio.Event()})()
+
+
+def _remove_subscription(event_bus: Any, subscription: Any) -> None:
+    if hasattr(event_bus, "remove_stream_subscription"):
+        event_bus.remove_stream_subscription(subscription)
+    else:
+        event_bus.remove_stream_queue(subscription.queue)

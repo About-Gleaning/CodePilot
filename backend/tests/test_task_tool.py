@@ -9,7 +9,7 @@ from codepilot.events import EventBus
 from codepilot.hooks import RuntimeHandles
 from codepilot.session.agents import AgentProfile
 from codepilot.session.message import Message, TextPart, build_assistant_message_info
-from codepilot.session.state import SessionState, SessionStatus
+from codepilot.session.state import RunRef, SessionState, SessionStatus
 from codepilot.tools import TaskTool, ToolExecutionContext
 from codepilot.utils import utc_now_iso, utc_now_millis
 
@@ -194,3 +194,64 @@ def test_task_tool_description_reports_empty_subagent_list() -> None:
 
     assert "{{available_subagents}}" not in description
     assert "当前没有可用 subagent。" in description
+
+
+def test_task_tool_profile_provider_keeps_shared_subagents_in_description() -> None:
+    tool = build_tool(FakeSubagentLoop())
+    shared_subagent = AgentProfile(
+        agent_id="shared-explore",
+        name="explore",
+        description="共享探查 Agent",
+        system_prompt="",
+        kind="subagent",
+    )
+    provider = SimpleNamespace(
+        shared=SimpleNamespace(
+            list_active_profile_snapshots=lambda: [
+                AgentProfile(agent_id="shared-build", name="build", system_prompt="", kind="agent")
+            ],
+            list_active_subagent_profile_snapshots=lambda: [shared_subagent],
+        )
+    )
+
+    tool.set_profile_provider(provider)
+
+    description = tool.get_llm_description()
+    assert "shared-explore" in description
+    assert "共享探查 Agent" in description
+
+
+def test_task_tool_resolves_subagent_with_current_user_id(tmp_path: Path) -> None:
+    loop = FakeSubagentLoop()
+    tool = build_tool(loop)
+    target = AgentProfile(
+        agent_id="private-explore",
+        name="private_explore",
+        system_prompt="",
+        kind="subagent",
+    )
+    resolved: list[tuple[str, str]] = []
+
+    def resolve(user_id: str, agent_id: str) -> AgentProfile:
+        resolved.append((user_id, agent_id))
+        return target
+
+    tool.set_profile_provider(
+        SimpleNamespace(
+            shared=SimpleNamespace(list_active_subagent_profile_snapshots=lambda: []),
+            get_active_profile_snapshot=resolve,
+        )
+    )
+    context = build_context(tmp_path)
+    context.run_ref = RunRef(
+        user_id="user-a",
+        agent_id="build-agent",
+        session_id="session_1",
+        run_id="run-1",
+        revision_id="revision-1",
+    )
+
+    result = run_tool(tool, {"agent_id": "private-explore", "task": "读取 README"}, context)
+
+    assert result["status"] == "ok"
+    assert resolved == [("user-a", "private-explore")]

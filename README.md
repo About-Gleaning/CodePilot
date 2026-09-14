@@ -109,7 +109,20 @@ pnpm dev
 
 如果脚本提示缺少 `uv` 或 `pnpm`，请先完成对应工具安装与依赖初始化。后端启动时会自动加载 `backend/.env`，因此不需要额外执行 `export`。
 
-当前源码发布只支持本机单用户访问。后端和开发脚本仅允许监听回环地址，不支持局域网或公网暴露；远程访问、登录和反向代理属于后续独立安全范围。
+首次整备或依赖锁文件更新后，在 `backend/` 执行 `uv sync --frozen --inexact --extra dev`，在 `frontend/` 执行 `pnpm install --frozen-lockfile`。需要 Node、pnpm（版本见 `packageManager`）、uv，以及 Python 3.12 至 3.14；脚本还使用 Python 创建独立进程会话。普通启动不安装依赖、不让 Corepack 联网下载。
+
+启动脚本固定使用后端 8000 和前端 5173，端口占用不会自动换端口。两个组件共享 20 秒就绪期限：后端 `/api/health/ready` 与前端首页均返回 200，且监听进程属于对应服务时，才报告启动完成。失败只清理本次新建的服务进程，已有组件保持运行。SSwitch 应将后端端口登记为 8000，并使用就绪接口检查健康。
+
+当前源码支持可信局域网内的应用级多用户隔离。后端和开发脚本仍只监听回环地址；局域网生产访问必须由同机反向代理把前端与 `/api` 放在一个唯一 HTTPS Origin 下。该认证边界不隔离 workspace、项目文件或 Bash，只适用于互信用户。
+
+首次启动前初始化管理员；升级旧单用户数据时先预览、再离线执行迁移：
+
+```bash
+cd backend
+uv run python -m codepilot.admin init-admin --username admin
+uv run python -m codepilot.admin migrate-multi-user --admin admin
+uv run python -m codepilot.admin migrate-multi-user --admin admin --apply
+```
 
 ## LiteLLM 配置
 
@@ -225,13 +238,13 @@ uv run python scripts/validate_agent_platform_release.py \
 
 该命令覆盖后端与前端测试、并发和恢复压力、本地 MCP 协议、真实 DeepSeek、生产依赖漏洞审计及敏感信息扫描。任一硬门槛失败或审计服务不可用都会以非零状态退出。启动后应确认 `/api/health/live` 与 `/api/health/ready` 均返回 200。
 
-当前没有数据库迁移，旧 Session 与 Agent Markdown 保持兼容。回滚时停止服务、切回上一 Git 提交并恢复 `CODEPILOT_HOME` 备份；中断 Run 只会取消，不会重放副作用。
+旧 Session 与 Agent Markdown 需要通过 `migrate-multi-user` 离线迁移到初始管理员私有分区。回滚时停止服务、切回上一 Git 提交并恢复迁移生成的完整备份；中断 Run 只会取消，不会重放副作用。
 
 ## 使用说明
 
 - 内置主 agent 提供：`build`、`plan`
 - 默认 subagent 提供：`explore`
-- 自定义 agent 从 `{codepilot_home}/agents/*.md` 加载，例如本机默认目录为 `~/codepilot/agents/`
+- 共享 agent 从 `{codepilot_home}/agents/shared/*.md` 加载；用户私有 agent 位于 `{codepilot_home}/users/<user_id>/agents/*.md`
 - `build / plan` 共用同一个 `AgentLoop`
 - 若要触发人工审批，可以在任务文本中加入 `[[approve]]`
 - `echo_tool` 为无副作用示例工具，便于验证 LLM tool call 链路
@@ -241,7 +254,7 @@ uv run python scripts/validate_agent_platform_release.py \
 
 Agent Studio 的“配置”检查器可以创建、编辑、复制、归档和恢复自定义主 Agent。配置保存为 Markdown 并保留 revision 快照；新 Session 默认采用 Agent 的 Provider/Model，也可以在首条消息前显式覆盖。
 
-运行时由 `AgentRuntimeManager` 统一管理，最多可保持 5 个 Agent 启动和 5 个交互式活动 Run；每个 Session 使用独立 SessionRunner，资源 API 按 `agent_id/session_id/run_id` 精确路由。同一 Session 只允许一个活动 Run，workspace 变更 Tool 通过跨进程写入租约串行化。
+运行时由 `AgentRuntimeManager` 统一管理，全服务最多可保持 5 个 Agent 启动和 5 个交互式活动 Run，每用户上限分别为 3 和 2；每个 Session 使用独立 SessionRunner，资源 API 按 `user_id/agent_id/session_id/run_id` 精确路由。同一 Session 只允许一个活动 Run，workspace 变更 Tool 通过全用户共享的跨进程写入租约串行化。
 
 Agent 分为两类：
 

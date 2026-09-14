@@ -6,6 +6,7 @@ from __future__ import annotations
 工具注册与 Agent 运行时装配，最终对外暴露可启动的 `app` 对象。
 """
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -19,19 +20,22 @@ from dotenv import load_dotenv
 
 from codepilot.api import build_api_router
 from codepilot.api.security import LocalAccessMiddleware
+from codepilot.api.security import AuthenticationMiddleware
+from codepilot.auth import AuthService, AuthStore
 from codepilot.config import AppSettings, WorkspaceState, build_workspace_id, load_settings
 from codepilot.events import EventBus
 from codepilot.hooks import HookManager
 from codepilot.llm import LiteLLMClient
 from codepilot.logging import configure_logging
-from codepilot.memory import JsonlEventStore, JsonlSessionMemory
+from codepilot.memory import UserPartitionedEventStore, UserPartitionedSessionMemory
+from codepilot.migration import MultiUserMigration
 from codepilot.runtime import build_hook_manager as _build_hook_manager
 from codepilot.runtime import build_runtime_bundle
-from codepilot.scheduler import ScheduleRunner, ScheduleStore
+from codepilot.scheduler import UserScheduleCoordinator
 from codepilot.skills import SkillRegistry
 from codepilot.session import SessionRunner
 from codepilot.session.agent_runtime import AgentRuntimeManager
-from codepilot.session.agent_config import AgentConfigService
+from codepilot.session.agent_config import MultiUserAgentConfigService
 from codepilot.tools import ScheduleManageTool, ToolRegistry
 from codepilot.tools import McpClientManager
 
@@ -42,8 +46,8 @@ class AppContext:
     settings: AppSettings
     workspace: WorkspaceState
     event_bus: EventBus
-    event_store: JsonlEventStore
-    session_memory: JsonlSessionMemory
+    event_store: UserPartitionedEventStore
+    session_memory: UserPartitionedSessionMemory
     tool_registry: ToolRegistry
     hook_manager: HookManager
     llm_client: LiteLLMClient
@@ -51,10 +55,12 @@ class AppContext:
     agent_profiles: dict[str, object]
     session_runner: SessionRunner
     agent_runtime: AgentRuntimeManager
-    schedule_store: ScheduleStore
-    schedule_runner: ScheduleRunner
-    agent_config_service: AgentConfigService
+    schedule_coordinator: UserScheduleCoordinator
+    agent_config_service: MultiUserAgentConfigService
     mcp_manager: McpClientManager
+    auth_store: AuthStore
+    auth_service: AuthService
+    migration_required: bool
 
 
 def create_app() -> FastAPI:
@@ -69,36 +75,47 @@ def create_app() -> FastAPI:
 
     # 先完成本地工作区初始化，再装配日志、会话与运行时组件，避免后续组件缺少目录依赖。
     workspace = _build_workspace_state(repo_root, settings)
+    auth_store = AuthStore(
+        workspace.codepilot_home / "auth.sqlite3",
+        idle_timeout_seconds=settings.auth.idle_timeout_seconds,
+        absolute_timeout_seconds=settings.auth.absolute_timeout_seconds,
+    )
+    auth_service = AuthService(auth_store)
+    migration = MultiUserMigration(codepilot_home=workspace.codepilot_home, workspace_dir=workspace.workspace_dir)
     configure_logging(settings.logging, workspace.logs_dir)
     runtime = build_runtime_bundle(
         settings=settings,
         workspace=workspace,
         allow_manual_approval=settings.human_in_the_loop.enabled,
         allow_question_interaction=True,
+        principal_resolver=auth_store.find_enabled_user,
     )
-    schedule_store = ScheduleStore(workspace.workspace_dir)
-    schedule_runner = ScheduleRunner(
-        store=schedule_store,
+    schedule_tool = ScheduleManageTool(
+        store=None,  # type: ignore[arg-type]
+        runner=None,  # type: ignore[arg-type]
         settings=settings,
-        workspace=workspace,
-        agent_profiles=runtime.agent_profiles,
+        agent_profiles={},
+        timeout_seconds=settings.tools.default_timeout_seconds,
     )
-    runtime.tool_registry.register(
-        ScheduleManageTool(
-            store=schedule_store,
-            runner=schedule_runner,
-            settings=settings,
-            agent_profiles=runtime.agent_profiles,
-            timeout_seconds=settings.tools.default_timeout_seconds,
-        )
-    )
-    agent_config_service = AgentConfigService(
+    runtime.tool_registry.register(schedule_tool)
+    agent_config_service = MultiUserAgentConfigService(
         settings=settings,
-        root=workspace.codepilot_home / "agents",
-        agent_profiles=runtime.agent_profiles,
+        shared_root=workspace.codepilot_home / "agents" / "shared",
+        users_root=workspace.codepilot_home / "users",
+        builtin_profiles=runtime.agent_profiles,
         tool_registry=runtime.tool_registry,
         mcp_manager=runtime.mcp_manager,
     )
+    task_tool = runtime.tool_registry.get("task")
+    if task_tool is not None and hasattr(task_tool, "set_profile_provider"):
+        task_tool.set_profile_provider(agent_config_service)
+    schedule_coordinator = UserScheduleCoordinator(
+        settings=settings,
+        workspace=workspace,
+        profile_provider=agent_config_service,
+    )
+    schedule_tool._store = schedule_coordinator
+    schedule_tool._runner = schedule_coordinator
     agent_runtime = AgentRuntimeManager(
         workspace=workspace,
         config=settings,
@@ -108,8 +125,12 @@ def create_app() -> FastAPI:
         backend=runtime.agent_backend,
         max_active_runs=5,
         max_started_agents=settings.agent.max_started_agents,
+        max_active_runs_per_user=settings.auth.max_active_runs_per_user,
+        max_started_agents_per_user=settings.auth.max_started_agents_per_user,
     )
     runtime.event_bus.subscribe_domain(agent_runtime.handle_domain_event)
+    auth_service.add_disable_listener(agent_runtime.disable_user)
+    auth_service.add_disable_listener(schedule_coordinator.disable_user)
 
     app_state = AppContext(
         settings=settings,
@@ -124,30 +145,47 @@ def create_app() -> FastAPI:
         agent_profiles=runtime.agent_profiles,
         session_runner=runtime.session_runner,
         agent_runtime=agent_runtime,
-        schedule_store=schedule_store,
-        schedule_runner=schedule_runner,
+        schedule_coordinator=schedule_coordinator,
         agent_config_service=agent_config_service,
         mcp_manager=runtime.mcp_manager,
+        auth_store=auth_store,
+        auth_service=auth_service,
+        migration_required=migration.required(),
     )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        for user_id in app_state.event_store.known_user_ids():
+            app_state.event_bus.set_initial_seq(app_state.event_store.latest_seq(user_id), user_id)
         await runtime.start()
-        await app_state.agent_runtime.recover()
-        await app_state.schedule_runner.start()
+        enabled_states = await asyncio.to_thread(app_state.auth_store.user_enabled_states)
+        enabled_user_ids = {user_id for user_id, enabled in enabled_states.items() if enabled}
+        await app_state.agent_runtime.recover(enabled_user_ids)
+        if not app_state.migration_required:
+            # 迁移完成前不得拉起旧 Schedule，避免服务在只读保护期产生外部副作用。
+            await app_state.schedule_coordinator.start(enabled_user_ids)
+        await app_state.auth_service.start(enabled_states)
         try:
             yield
         finally:
-            await app_state.schedule_runner.shutdown()
+            await app_state.auth_service.shutdown()
+            await app_state.schedule_coordinator.shutdown()
             await app_state.agent_runtime.shutdown()
             await app_state.session_runner.shutdown()
             await runtime.shutdown()
 
     app = FastAPI(title="CodePilot", version="0.1.0", lifespan=lifespan)
     app.add_middleware(LocalAccessMiddleware)
+    app.add_middleware(AuthenticationMiddleware)
+    allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
+    if settings.auth.public_origin:
+        from urllib.parse import urlsplit
+        public_host = urlsplit(settings.auth.public_origin).hostname
+        if public_host:
+            allowed_hosts.append(public_host)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["localhost", "127.0.0.1", "[::1]"],
+        allowed_hosts=allowed_hosts,
     )
     app.add_middleware(
         CORSMiddleware,

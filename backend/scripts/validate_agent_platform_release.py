@@ -84,8 +84,10 @@ def _deterministic_checks(temp_root: Path) -> dict[str, Any]:
     commands = {
         "uv_lock": (["uv", "lock", "--check"], BACKEND),
         "backend_pytest": (["uv", "run", "pytest", "-q"], BACKEND),
+        "multi_user_isolation": (["uv", "run", "pytest", "-q", "tests/test_auth.py", "tests/test_multi_user_isolation.py"], BACKEND),
         "frontend_test": (["pnpm", "test", "--run"], FRONTEND),
         "frontend_build": (["pnpm", "build"], FRONTEND),
+        "browser_e2e": (["pnpm", "test:e2e"], FRONTEND),
         "mcp_protocol": (["uv", "run", "pytest", "-q", "tests/test_mcp.py"], BACKEND),
     }
     for name, (command, cwd) in commands.items():

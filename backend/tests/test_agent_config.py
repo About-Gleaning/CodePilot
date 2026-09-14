@@ -35,6 +35,7 @@ def _payload(**changes):
 
 def test_create_update_revision_and_archive_restore(tmp_path: Path) -> None:
     service = _service(tmp_path)
+    assert {profile.name for profile in service.list_active_subagent_profile_snapshots()} == {"explore"}
     created = service.create(_payload())
     assert created["revision_id"]
     assert service.create(_payload())["agent_id"] == created["agent_id"]
@@ -48,6 +49,109 @@ def test_create_update_revision_and_archive_restore(tmp_path: Path) -> None:
     assert archived["archived"] is True and "reviewer" not in service.agent_profiles
     restored = service.restore(created["agent_id"])
     assert restored["archived"] is False and "reviewer" in service.agent_profiles
+
+
+def test_revision_snapshot_survives_update_but_not_archive_or_corruption(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    created = service.create(_payload())
+    old_revision = created["revision_id"]
+    service.update(
+        created["agent_id"],
+        _payload(name="reviewer", description="新的描述", expected_revision_id=old_revision),
+    )
+
+    snapshot = service.get_profile_revision_snapshot(created["agent_id"], old_revision)
+    assert snapshot.description == "审查代码"
+    assert snapshot.revision_id == old_revision
+
+    revision_path = tmp_path / "agents" / ".revisions" / created["agent_id"] / f"{old_revision}.md"
+    revision_path.write_text(revision_path.read_text(encoding="utf-8") + "损坏", encoding="utf-8")
+    with pytest.raises(AgentConfigError, match="revision"):
+        service.get_profile_revision_snapshot(created["agent_id"], old_revision)
+    revision_path.unlink()
+    with pytest.raises(AgentConfigError) as missing:
+        service.get_profile_revision_snapshot(created["agent_id"], old_revision)
+    assert missing.value.code == "agent_revision_not_found"
+
+    service.archive(created["agent_id"])
+    with pytest.raises(AgentConfigError) as archived:
+        service.get_profile_revision_snapshot(created["agent_id"], old_revision)
+    assert archived.value.code == "agent_archived"
+
+
+def test_current_revision_snapshot_must_exist_and_survive_service_reload(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    created = service.create(_payload())
+    revision_path = tmp_path / "agents" / ".revisions" / created["agent_id"] / f"{created['revision_id']}.md"
+    revision_path.unlink()
+
+    with pytest.raises(AgentConfigError) as missing:
+        service.get_profile_revision_snapshot(created["agent_id"], created["revision_id"])
+    assert missing.value.code == "agent_revision_not_found"
+
+    reloaded = _service(tmp_path)
+    assert not revision_path.exists()
+    with pytest.raises(AgentConfigError) as still_missing:
+        reloaded.get_profile_revision_snapshot(created["agent_id"], created["revision_id"])
+    assert still_missing.value.code == "agent_revision_not_found"
+
+
+def test_current_revision_snapshot_rejects_symlink(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    created = service.create(_payload())
+    revision_path = tmp_path / "agents" / ".revisions" / created["agent_id"] / f"{created['revision_id']}.md"
+    target = tmp_path / "revision-copy.md"
+    target.write_text(revision_path.read_text(encoding="utf-8"), encoding="utf-8")
+    revision_path.unlink()
+    revision_path.symlink_to(target)
+
+    with pytest.raises(AgentConfigError) as invalid:
+        service.get_profile_revision_snapshot(created["agent_id"], created["revision_id"])
+    assert invalid.value.code == "agent_revision_not_found"
+
+
+def test_current_revision_snapshot_rejects_revision_identity_mismatch(tmp_path: Path) -> None:
+    service = _service(tmp_path)
+    created = service.create(_payload())
+    revision_path = tmp_path / "agents" / ".revisions" / created["agent_id"] / f"{created['revision_id']}.md"
+    content = revision_path.read_text(encoding="utf-8")
+    revision_path.write_text(
+        content.replace(f"revision_id: {created['revision_id']}", f"revision_id: {'0' * 64}"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(AgentConfigError) as invalid:
+        service.get_profile_revision_snapshot(created["agent_id"], created["revision_id"])
+    assert invalid.value.code == "agent_revision_corrupt"
+
+
+def test_legacy_agent_without_declared_revision_gets_one_time_snapshot(tmp_path: Path) -> None:
+    _service(tmp_path)
+    root = tmp_path / "agents"
+    root.mkdir(parents=True)
+    (root / "legacy.md").write_text(
+        """---
+name: legacy
+kind: agent
+description: 旧配置
+default_provider: test
+default_model: model
+tools:
+  - read_file
+readonly: false
+can_call_subagent: false
+---
+执行旧配置。
+""",
+        encoding="utf-8",
+    )
+
+    reloaded = _service(tmp_path)
+    record = next(item for item in reloaded.list() if item["name"] == "legacy")
+    revision_path = root / ".revisions" / record["agent_id"] / f"{record['revision_id']}.md"
+
+    assert revision_path.exists()
+    assert reloaded.get_profile_revision_snapshot(record["agent_id"], record["revision_id"]).name == "legacy"
 
 
 def test_update_rejects_conflict_and_unknown_tool(tmp_path: Path) -> None:

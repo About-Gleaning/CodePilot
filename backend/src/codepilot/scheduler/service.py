@@ -25,12 +25,15 @@ class ScheduleValidationError(Exception):
 def validate_schedule_task_payload(
     *,
     settings: AppSettings,
-    agent_profiles: dict[str, Any],
+    agent_profiles: dict[str, Any] | None,
     payload: dict[str, Any],
+    profile_resolver: Any | None = None,
+    user_id: str = "",
 ) -> dict[str, Any]:
     """校验定时任务输入，并归一化为 ScheduleRunner 可直接接收的字段。"""
     name = str(payload.get("name") or "").strip()
     prompt = str(payload.get("prompt") or "").strip()
+    agent_id = str(payload.get("agent_id") or "").strip()
     agent_name = str(payload.get("agent_name") or "").strip()
     provider = str(payload.get("provider") or "").strip()
     model = str(payload.get("model") or "").strip()
@@ -39,9 +42,15 @@ def validate_schedule_task_payload(
     if not prompt:
         raise ScheduleValidationError("prompt 不能为空", error_type="SchedulePromptEmpty")
 
-    profile = agent_profiles.get(agent_name)
+    if profile_resolver is not None and agent_id:
+        try:
+            profile = profile_resolver(user_id, agent_id)
+        except Exception:
+            profile = None
+    else:
+        profile = (agent_profiles or {}).get(agent_name)
     if profile is None or getattr(profile, "kind", "agent") != "agent":
-        raise ScheduleValidationError(f"agent `{agent_name}` 不存在或不能直接选择", error_type="ScheduleAgentInvalid")
+        raise ScheduleValidationError(f"agent `{agent_id or agent_name}` 不存在或不能直接选择", error_type="ScheduleAgentInvalid")
 
     activated_provider = settings.llm_runtime.activated_providers.get(provider)
     if activated_provider is None:
@@ -68,7 +77,9 @@ def validate_schedule_task_payload(
     return {
         "name": name,
         "prompt": prompt,
-        "agent_name": agent_name,
+        "agent_id": str(getattr(profile, "agent_id", "") or ""),
+        "agent_name": str(getattr(profile, "name", agent_name) or agent_name),
+        "revision_id": str(getattr(profile, "revision_id", "") or ""),
         "provider": provider,
         "model": model,
         "trigger": trigger,

@@ -252,7 +252,7 @@ export default function AgentStudio() {
         content: translateSkillShortcuts(content, skills),
         client_request_id: clientRequestId,
         attachments: [],
-        metadata: {},
+        user_metadata: {},
       });
       setSessionByAgent((current) => ({ ...current, [agentId]: run.ref.session_id }));
       await catalog.refresh();

@@ -92,7 +92,7 @@ export function AgentConfigPanel({
   const models = provider?.models || [];
   const thinking = provider?.model_capabilities?.[form.default_model]?.thinking;
   const readonly = mode === 'edit' && (
-    detail?.source === 'builtin'
+    (detail?.visibility || (detail?.source === 'builtin' ? 'builtin' : 'private')) !== 'private'
     || detail?.validation_status === 'invalid'
   );
   const toolGroups = useMemo(() => {
@@ -188,7 +188,7 @@ export function AgentConfigPanel({
         </div>
         <div className="inline-actions">
           {detail ? <button type="button" className="studio-icon-button" onClick={copy} aria-label="复制为新 Agent" title="复制为新 Agent"><Copy size={15} /></button> : null}
-          {detail?.source === 'custom' ? (
+          {detail?.visibility === 'private' ? (
             <button type="button" className="studio-icon-button" onClick={() => void archiveOrRestore()} aria-label={detail.archived ? '恢复 Agent' : '归档 Agent'} title={detail.archived ? '恢复' : '归档'}>
               {detail.archived ? <RotateCcw size={15} /> : <Archive size={15} />}
             </button>

@@ -5,7 +5,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from codepilot.memory import read_long_memory
+from codepilot.memory import read_long_memory, read_user_long_memory
 from codepilot.skills import SkillRegistry
 from codepilot.session.agents import AgentProfile
 from codepilot.session.state import AgentState, LLMState, SessionState
@@ -76,6 +76,9 @@ def _read_long_memory_for_agent(workspace: Any, agent_state: AgentState) -> str 
     codepilot_home = getattr(workspace, "codepilot_home", None)
     if codepilot_home is None:
         return None
+    user_home = getattr(workspace, "user_home_dir", None)
+    if user_home is not None and agent_state.agent_id:
+        return read_user_long_memory(Path(user_home), agent_id=agent_state.agent_id)
     return read_long_memory(Path(codepilot_home), agent_name=agent_state.name)
 
 

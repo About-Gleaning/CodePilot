@@ -32,6 +32,7 @@ class ToolExecutionContext:
     stop_event: Any | None = None
     skip_approval: bool = False
     run_ref: Any | None = None
+    principal: Any | None = None
 
 
 @dataclass(slots=True)
