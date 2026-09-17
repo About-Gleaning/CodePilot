@@ -267,7 +267,10 @@ async def _publish_waiting_human(
     stream_event_type: str,
 ) -> None:
     """进入等待人工交互状态，并发布统一的领域事件与前端流事件。"""
-    session.status = SessionStatus.WAITING_HUMAN
+    if runtime.inbox is not None:
+        await runtime.inbox.wait_for_human(session)
+    else:
+        session.status = SessionStatus.WAITING_HUMAN
     session.metadata["pending_human_type"] = kind
     if kind == "question":
         # 回复必须绑定当前等待请求，拒绝陈旧页面或手工构造的错误交互 ID。

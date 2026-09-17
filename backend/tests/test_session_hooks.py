@@ -1485,7 +1485,8 @@ def test_agent_loop_auto_approves_tool_when_manual_approval_disabled() -> None:
         )
     )
 
-    assert result.status == SessionStatus.COMPLETED
+    assert result.status == SessionStatus.CANCELLED
+    assert result.stop_reason == "max_iterations"
     assert "human_approval_required" not in [event.event_type for event in stream_events]
     assert "error" not in [event.event_type for event in stream_events]
 
@@ -1874,7 +1875,8 @@ def test_agent_loop_appends_assistant_message_when_max_iterations_exceeded() -> 
     )
 
     max_iterations_message = result.messages[-1]
-    assert result.status == SessionStatus.COMPLETED
+    assert result.status == SessionStatus.CANCELLED
+    assert result.stop_reason == "max_iterations"
     assert max_iterations_message.info.role == "assistant"
     assert max_iterations_message.info.finish == "max_iterations"
     assert "已超过最大轮推理次数限制（1 轮），停止推理。" == max_iterations_message.text_content()

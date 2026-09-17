@@ -137,6 +137,8 @@ class AgentLoop:
             if should_continue:
                 await self._run_iterations(ctx)
         finally:
+            if runtime.inbox is not None:
+                await runtime.inbox.close()
             # SESSION_AFTER 放在 finally 中，保证无论是成功、失败还是取消，都能执行收尾 Hook。
             await self._turn_executor.run_hook(
                 HookType.SESSION_AFTER,
@@ -311,6 +313,8 @@ class AgentLoop:
         iteration = 1
         while True:
             if iteration > ctx.agent_profile.max_iterations:
+                ctx.session.status = SessionStatus.CANCELLED
+                ctx.session.stop_reason = "max_iterations"
                 await self._append_max_iterations_message(ctx)
                 break
 
@@ -319,6 +323,8 @@ class AgentLoop:
                 break
 
             await self._publish_iteration_started(ctx, iteration)
+            if ctx.runtime.inbox is not None:
+                await ctx.runtime.inbox.prepare(ctx.session)
             turn_result = await self._execute_turn(ctx, iteration)
             should_continue = await self._handle_turn_result(ctx, turn_result, iteration)
             if not should_continue:
@@ -359,6 +365,11 @@ class AgentLoop:
 
     async def _handle_turn_result(self, ctx: _RunContext, turn_result: TurnResult, iteration: int) -> bool:
         """根据单轮结果决定继续、完成或退出主循环。"""
+        if ctx.stop_event.is_set():
+            ctx.session.status = SessionStatus.CANCELLED
+            return False
+        if turn_result.status == "completed" and ctx.runtime.inbox is not None:
+            return await ctx.runtime.inbox.complete(ctx.session)
         if turn_result.status in {"completed", "stopped"}:
             ctx.session.status = SessionStatus.COMPLETED
             return False
@@ -717,7 +728,7 @@ class AgentLoop:
                 event_type="session_finished" if session.status != SessionStatus.FAILED else "session_failed",
                 session_id=session.session_id,
                 created_at=utc_now_iso(),
-                data={"status": session.status.value},
+                data={"status": session.status.value, "stop_reason": session.stop_reason},
             )
         )
         return session

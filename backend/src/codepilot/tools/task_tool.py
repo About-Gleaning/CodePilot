@@ -186,6 +186,8 @@ def _subagent_failure_type(status: SessionStatus) -> str:
 
 
 def _subagent_failure_message(agent: str, child_session: Any) -> str:
+    if getattr(child_session, "stop_reason", None) == "max_iterations":
+        return f"subagent {agent} 已停止：达到轮数上限，未完成交付。"
     detail = str(child_session.metadata.get("subagent_error") or "").strip()
     status = getattr(child_session.status, "value", str(child_session.status))
     if detail:

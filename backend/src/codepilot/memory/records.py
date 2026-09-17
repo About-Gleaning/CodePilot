@@ -87,11 +87,14 @@ def lifecycle_data(event: SessionLifecycleEvent) -> dict[str, Any]:
         "updated_at": data.get("updated_at") or event.created_at,
     }
     optional = {
+        "stop_reason": data.get("stop_reason"),
         "agent_id": event.agent_id or data.get("agent_id"),
         "run_id": event.run_id or data.get("run_id"),
         "revision_id": event.revision_id or data.get("revision_id"),
     }
     result.update({key: value for key, value in optional.items() if value})
+    if "stop_reason" in data:
+        result["stop_reason"] = data["stop_reason"]
     return result
 
 

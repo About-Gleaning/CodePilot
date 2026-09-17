@@ -17,6 +17,7 @@ from codepilot.gateway import GatewayInputType
 from codepilot.gateway.gateway_input import MAX_USER_CONTENT_CHARS
 from codepilot.session.state import RunRef
 from codepilot.session.agent_runtime import RuntimeConflict
+from codepilot.session.inbox import public_submission
 from codepilot.utils import utc_now_iso
 
 
@@ -28,6 +29,7 @@ class StartRunRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str | None = None
+    expected_run_id: str | None = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     content: str = Field(min_length=1, max_length=MAX_USER_CONTENT_CHARS)
     provider: str | None = None
     model: str | None = None
@@ -138,7 +140,10 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             metadata["thinking_value"] = payload.thinking_value
         request = GatewayInput(type=GatewayInputType.USER_MESSAGE, session_id=payload.session_id, content=payload.content, agent_name="runtime", provider=payload.provider, model=payload.model, metadata=metadata, attachments=payload.attachments)
         try:
-            run = await app_state.agent_runtime.start_run(_user_id(http_request), agent_id, request, payload.session_id, payload.client_request_id)
+            run = await app_state.agent_runtime.submit_message(
+                _user_id(http_request), agent_id, request, payload.session_id,
+                payload.client_request_id, payload.expected_run_id,
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_or_session_not_found"}) from exc
         except RuntimeConflict as exc:
@@ -150,7 +155,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail={"code": "invalid_run_request", "message": str(exc)}) from exc
-        return JSONResponse(run.model_dump())
+        return JSONResponse(run)
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/runs/{run_id}")
     async def get_run(agent_id: str, session_id: str, run_id: str, request: Request) -> JSONResponse:
@@ -218,6 +223,8 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             "source", "schedule", "schedule_task_id", "schedule_run_id", "schedule_task_name",
         }
         if payload.type == GatewayInputType.USER_MESSAGE and reserved.intersection(payload.metadata):
+            raise HTTPException(status_code=422, detail={"code": "reserved_metadata_forbidden"})
+        if "_message_id" in payload.metadata:
             raise HTTPException(status_code=422, detail={"code": "reserved_metadata_forbidden"})
         try:
             return JSONResponse(await legacy(request).handle_input(payload))
@@ -307,6 +314,7 @@ def _safe_replay(replay: dict[str, Any]) -> dict[str, Any]:
                 "provider",
                 "model",
                 "status",
+                "stop_reason",
                 "created_at",
                 "updated_at",
                 "source",
@@ -330,6 +338,9 @@ def _safe_replay(replay: dict[str, Any]) -> dict[str, Any]:
             if isinstance(message, dict)
         ],
         "latest_event_seq": int(replay.get("latest_event_seq") or 0),
+        "submissions": [
+            _redact_local_paths(public_submission(item)) for item in replay.get("submissions", [])[-240:]
+        ],
         "runtime": _redact_local_paths(replay.get("runtime")) if isinstance(replay.get("runtime"), dict) else {},
     }
 

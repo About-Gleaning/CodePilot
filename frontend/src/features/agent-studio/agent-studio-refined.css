@@ -620,3 +620,8 @@ body {
   .agent-studio-shell, .studio-inspector, .welcome-suggestions button { transition: none; }
   .studio-welcome, .message-card { animation: none; }
 }
+.submission-status { display: flex; gap: 12px; align-items: baseline; padding: 4px 0; font-size: 12px; }
+.submission-status span { min-width: 0; overflow-wrap: anywhere; flex: 1; }
+.submission-status small { flex-shrink: 0; }
+.submission-list { max-height: 120px; overflow-y: auto; }
+.submission-list:empty { display: none; }

@@ -92,6 +92,7 @@ export type PendingInteraction = {
 
 export type SessionRuntime = {
   status: string;
+  stop_reason?: string | null;
   provider: string | null;
   model: string | null;
   thinking_value: string | null;
@@ -114,6 +115,15 @@ export type ReplayResponse = {
   messages: MessageRecord[];
   latest_event_seq: number;
   runtime: SessionRuntime;
+  submissions?: MessageSubmission[];
+};
+
+export type MessageSubmission = {
+  mode: 'started' | 'appended';
+  message_id: string;
+  status: 'accepted' | 'pending' | 'included';
+  sequence?: number;
+  message?: MessageRecord;
 };
 
 export type ProviderCapability = {
@@ -147,6 +157,7 @@ export type AgentCapabilities = {
 };
 
 export type SessionViewState = {
+  submissions?: MessageSubmission[];
   messages: MessageRecord[];
   events: StreamEvent[];
   liveDelta: string;

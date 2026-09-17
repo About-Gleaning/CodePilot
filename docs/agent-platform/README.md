@@ -2,6 +2,8 @@
 
 此目录保存 Agent 平台的可追溯设计和验证证据，不能只在聊天或 Plane 评论中保留结论。
 
+- [message-submissions.md](message-submissions.md)：CODE-61 本轮执行上限修复、复用发送接口追加、幂等持久化与决策边界；本轮验证不代表六阶段或发布门禁完成。
+
 - [product-direction-handoff.md](product-direction-handoff.md)：CODE-60 产品方向交接记录；完整已确认目标、八项规则、开发差距和验收场景见根目录 [PRODUCT_DIRECTION.md](../../PRODUCT_DIRECTION.md)。该目标尚未全部实现，不能将历史契约或验证结果视为新目标已通过。
 
 - `startup-readiness.md`：CODE-59 的桌面启动依赖、就绪检查和失败回收验证。

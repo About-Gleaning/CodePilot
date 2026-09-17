@@ -41,6 +41,7 @@ class DomainEventType(str, Enum):
     HUMAN_INTERACTION = "human_interaction"
     SESSION_LIFECYCLE = "session_lifecycle"
     SESSION_COMPACTED = "session_compacted"
+    MESSAGE_SUBMISSION = "message_submission"
 
 
 class DomainEvent(BaseModel):
@@ -61,6 +62,12 @@ class MessageCreatedEvent(DomainEvent):
 
     event_type: DomainEventType = DomainEventType.MESSAGE_CREATED
     message: Message
+
+
+class MessageSubmissionEvent(DomainEvent):
+    """发送回执与决策纳入记录，共用会话日志而不污染活动上下文。"""
+
+    event_type: DomainEventType = DomainEventType.MESSAGE_SUBMISSION
 
 
 class HumanInteractionEvent(DomainEvent):

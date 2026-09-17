@@ -85,6 +85,7 @@ export default function AgentStudio() {
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
   const messagesRef = useRef<HTMLDivElement | null>(null);
   const draftsRef = useRef(drafts);
+  const cardRequestsRef = useRef(new Map<string, { content: string; payload: Record<string, unknown> }>());
 
   const selectedAgent = selectedAgentId ? catalog.agentsById[selectedAgentId] || null : null;
   const selectedRuntime = selectedAgentId ? catalog.runtimes[selectedAgentId] || stoppedRuntime(selectedAgentId) : null;
@@ -244,18 +245,30 @@ export default function AgentStudio() {
     const agent = catalog.agentsById[agentId];
     const runtime = catalog.runtimes[agentId];
     if (!agent || !runtime || runtime.lifecycle_state !== 'RUNNING' || agent.archived) throw new Error('该 Agent 当前不可接收任务。');
-    const clientRequestId = `web_${crypto.randomUUID().replace(/-/g, '')}`;
+    if (runtime.waiting_human_count) throw new Error('当前正在等待人工处理，请处理后再发送。');
+    const targetSessionId = sessionByAgent[agentId] || runtime.recent_session_id || null;
+    const snapshot = cardSnapshots[agentId];
+    const previous = cardRequestsRef.current.get(agentId);
+    const payload = previous?.content === content ? previous.payload : {
+      session_id: targetSessionId,
+      expected_run_id: agentId === selectedAgentId && targetSessionId === selectedSessionId
+        ? session.runtime?.active_run?.run_id || undefined
+        : snapshot?.sessionId === targetSessionId ? snapshot.activeRunId || undefined : undefined,
+      content: translateSkillShortcuts(content, skills),
+      client_request_id: `web_${crypto.randomUUID().replace(/-/g, '')}`,
+      attachments: [],
+      user_metadata: {},
+    };
+    cardRequestsRef.current.set(agentId, { content, payload });
     setSendingAgentIds((current) => new Set(current).add(agentId));
     try {
-      const run = await apiJson<{ ref: { session_id: string } }>(`/api/agents/${encodeURIComponent(agentId)}/runs`, 'POST', {
-        session_id: sessionByAgent[agentId] || runtime.recent_session_id || null,
-        content: translateSkillShortcuts(content, skills),
-        client_request_id: clientRequestId,
-        attachments: [],
-        user_metadata: {},
-      });
+      const run = await apiJson<{ ref: { session_id: string } }>(`/api/agents/${encodeURIComponent(agentId)}/runs`, 'POST', payload);
+      cardRequestsRef.current.delete(agentId);
       setSessionByAgent((current) => ({ ...current, [agentId]: run.ref.session_id }));
-      await catalog.refresh();
+      void catalog.refresh();
+    } catch (reason) {
+      if (!isUnknownRequest(reason)) cardRequestsRef.current.delete(agentId);
+      throw reason;
     } finally {
       setSendingAgentIds((current) => {
         const next = new Set(current);
@@ -312,6 +325,10 @@ export default function AgentStudio() {
       return;
     }
     const clientRequestId = draft.clientRequestId || `web_${crypto.randomUUID().replace(/-/g, '')}`;
+    if (session.runtime?.pending_interaction || ['WAITING_HUMAN', 'CANCELLING', 'STOPPING'].includes(session.runtime?.status || '')) {
+      setLocalError('当前正在等待人工处理或停止，请处理后再发送。');
+      return;
+    }
     updateDraft({ clientRequestId });
     setSending(true);
     setLocalError('');
@@ -530,7 +547,10 @@ export default function AgentStudio() {
           {session.runtime?.last_run ? <span><CircleDot size={13} />最近 Run：{session.runtime.last_run.status}{session.runtime.last_run.error_code ? ` · ${session.runtime.last_run.error_code}` : ''}</span> : null}
           {session.streamOffline ? <em>Session 流离线，正在重连</em> : null}
         </div>
-        {(catalog.error || session.error || localError || selectedRuntime?.error_code || session.runtime?.last_run?.error_summary) ? (
+        {session.runtime?.status === 'CANCELLED' && (session.runtime.stop_reason === 'max_iterations' || session.runtime.last_run?.error_code === 'max_iterations') ? (
+          <div role="status">已停止：达到轮数上限</div>
+        ) : null}
+        {(catalog.error || session.error || localError || selectedRuntime?.error_code || (session.runtime?.last_run?.error_summary && session.runtime.last_run.status === 'FAILED')) ? (
           <div className="chat-local-error" role="alert">
             <CircleDot size={14} />
             <span>{localError || session.error || selectedRuntime?.error_code || session.runtime?.last_run?.error_summary || catalog.error}</span>
@@ -554,6 +574,14 @@ export default function AgentStudio() {
           )}
         </div>
         <form className="studio-composer" onSubmit={submit}>
+          <div className="submission-list">
+          {(session.view.submissions || []).filter((item) => item.mode === 'appended').slice(-20).map((item) => (
+            <div className="submission-status" key={item.message_id} role="status">
+              <span>{item.message?.parts?.filter((part) => part.type === 'text').map((part) => String(part.text || '')).join(' ').slice(0, 160) || '追加消息'}</span>
+              <small>{item.status === 'included' ? '已纳入' : '已收到，待纳入'}</small>
+            </div>
+          ))}
+          </div>
           <InteractionPanel
             interaction={session.runtime?.pending_interaction || null}
             busy={interactionBusy}

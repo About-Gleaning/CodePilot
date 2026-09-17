@@ -16,6 +16,7 @@ export type StreamEvent = {
   agent_id?: string | null;
   session_id: string | null;
   run_id?: string | null;
+  revision_id?: string | null;
   run_seq?: number;
   created_at: string;
   data: Record<string, unknown>;

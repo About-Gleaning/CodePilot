@@ -4,6 +4,7 @@ import { ApiError, apiJson, apiRequest } from '../../api/client';
 import type { MessageRecord, PendingAttachment, StreamEvent } from '../../types';
 import type {
   ReplayResponse,
+  MessageSubmission,
   RunRef,
   SessionRuntime,
   SessionSummary,
@@ -16,6 +17,8 @@ const SESSION_EVENTS = [
   'llm_delta', 'llm_reasoning_delta', 'tool_call_started', 'tool_call_finished', 'tool_call_failed',
   'context_compacted', 'human_approval_required', 'human_approval_resolved',
   'human_question_required', 'human_question_resolved', 'error',
+  'message_submission',
+  'loop_started',
 ];
 
 const EMPTY_VIEW: SessionViewState = {
@@ -60,6 +63,8 @@ export function useAgentSession(
   const pendingDeltaRef = useRef<Array<{ kind: 'text' | 'reasoning'; text: string; subagent: string | null }>>([]);
   const onSessionCreatedRef = useRef(onSessionCreated);
   const onCatalogRefreshRef = useRef(onCatalogRefresh);
+  const requestPayloadsRef = useRef(new Map<string, Record<string, unknown>>());
+  const runtimeVersionRef = useRef(0);
 
   useEffect(() => {
     onSessionCreatedRef.current = onSessionCreated;
@@ -116,6 +121,8 @@ export function useAgentSession(
     if (event.agent_id && event.agent_id !== expectedAgentId) return;
     if (event.session_id !== expectedSessionId) return;
     if (!rememberEvent(event.event_id)) return;
+    if (['loop_started', 'session_finished', 'session_failed', 'human_approval_required', 'human_question_required',
+      'human_approval_resolved', 'human_question_resolved'].includes(event.event_type)) runtimeVersionRef.current += 1;
     latestSeqRef.current = Math.max(latestSeqRef.current, event.seq);
     if (event.event_type === 'llm_delta' || event.event_type === 'llm_reasoning_delta') {
       pendingDeltaRef.current.push({
@@ -130,6 +137,14 @@ export function useAgentSession(
     }
     setView((current) => {
       const events = [...current.events, event].slice(-240);
+      if (event.event_type === 'message_submission') {
+        const submissions = mergeSubmissions(current.submissions || [], event.data.submissions as MessageSubmission[] || []);
+        let messages = current.messages;
+        for (const item of submissions) {
+          if (item.status === 'included' && item.message) messages = upsertMessage(messages, item.message);
+        }
+        return { ...current, messages, submissions, events };
+      }
       if (
         (event.event_type === 'assistant_message_completed' || event.event_type === 'user_message_created')
         && event.data.message && typeof event.data.message === 'object'
@@ -144,13 +159,23 @@ export function useAgentSession(
           delete reasoning[key];
           return { ...current, messages, events, subagentLiveDeltas: text, subagentLiveReasoningDeltas: reasoning };
         }
-        return { ...current, messages, events, liveDelta: '', liveReasoningDelta: '' };
+        return event.event_type === 'user_message_created'
+          ? { ...current, messages, events }
+          : { ...current, messages, events, liveDelta: '', liveReasoningDelta: '' };
       }
       return { ...current, events };
     });
     if (event.event_type === 'error') {
       const message = String(event.data.message || '本次执行发生错误。').slice(0, 800);
       setError(message);
+    }
+    if (event.event_type === 'loop_started' && event.data.agent_kind !== 'subagent') {
+      setRuntime((current) => current ? {
+        ...current, status: 'RUNNING', stop_reason: null, pending_interaction: null,
+        active_run: current.active_run?.run_id === event.run_id ? current.active_run : {
+          run_id: event.run_id || '', status: 'RUNNING', revision_id: event.revision_id || '', started_at: event.created_at,
+        },
+      } : current);
     }
     if (event.event_type === 'human_approval_required' || event.event_type === 'human_question_required') {
       const interactionId = String(
@@ -159,6 +184,9 @@ export function useAgentSession(
       setRuntime((current) => current ? {
         ...current,
         status: 'WAITING_HUMAN',
+        active_run: current.active_run?.run_id === event.run_id ? current.active_run : {
+          run_id: event.run_id || '', status: 'WAITING_HUMAN', revision_id: event.revision_id || '', started_at: event.created_at,
+        },
         pending_interaction: {
           interaction_id: interactionId,
           run_id: event.run_id || current.active_run?.run_id || '',
@@ -174,7 +202,11 @@ export function useAgentSession(
     }
     if (['session_finished', 'session_failed'].includes(event.event_type)) {
       if (event.event_type === 'session_failed' && !event.data.message) setError((current) => current || '本次执行失败，请查看最近 Run 状态。');
-      setRuntime((current) => current ? { ...current, status: event.event_type === 'session_failed' ? 'FAILED' : 'COMPLETED', active_run: null } : current);
+      setRuntime((current) => current ? {
+        ...current, status: String(event.data.status || (event.event_type === 'session_failed' ? 'FAILED' : 'COMPLETED')),
+        stop_reason: typeof event.data.stop_reason === 'string' ? event.data.stop_reason : null,
+        active_run: null, pending_interaction: null,
+      } : current);
       onCatalogRefreshRef.current();
     }
   }, [flushDeltas]);
@@ -243,7 +275,8 @@ export function useAgentSession(
     latestSeqRef.current = replay.latest_event_seq;
     seenEventIdsRef.current.clear();
     seenEventOrderRef.current = [];
-    setView({ ...EMPTY_VIEW, messages: replay.messages });
+    setView({ ...EMPTY_VIEW, messages: replay.messages, submissions: mergeSubmissions([], replay.submissions || []) });
+    runtimeVersionRef.current += 1;
     setRuntime(replay.runtime);
     setLoading(false);
     connect(selectedAgentId, selectedSessionId, generation);
@@ -291,41 +324,57 @@ export function useAgentSession(
 
   const send = useCallback(async (input: SendInput) => {
     if (!agentId) throw new Error('请先选择 Agent。');
-    const payload: Record<string, unknown> = {
+    const generation = generationRef.current;
+    const version = runtimeVersionRef.current;
+    const payload: Record<string, unknown> = requestPayloadsRef.current.get(input.clientRequestId) || {
       session_id: sessionId,
+      expected_run_id: runtime?.active_run?.run_id || undefined,
       content: input.content,
       client_request_id: input.clientRequestId,
       attachments: input.attachments.map(({ filename, mime, data_base64 }) => ({ filename, mime, data_base64 })),
       thinking_value: input.thinkingValue || undefined,
       user_metadata: {},
     };
-    if (input.provider && input.model) {
+    if (!requestPayloadsRef.current.has(input.clientRequestId) && input.provider && input.model) {
       payload.provider = input.provider;
       payload.model = input.model;
     }
-    const run = await apiJson<{ ref: RunRef; status: string }>(
+    requestPayloadsRef.current.set(input.clientRequestId, payload);
+    while (requestPayloadsRef.current.size > 100) requestPayloadsRef.current.delete(requestPayloadsRef.current.keys().next().value!);
+    const run = await apiJson<{ ref: RunRef; status: string; submission?: MessageSubmission }>(
       `/api/agents/${encodeURIComponent(agentId)}/runs`,
       'POST',
       payload,
-    );
+    ).catch(async (reason) => {
+      if (!isUnknownRequest(reason)) requestPayloadsRef.current.delete(input.clientRequestId);
+      if (generation === generationRef.current && sessionId && reason instanceof ApiError && reason.status === 409) {
+        await loadReplay(agentId, sessionId);
+      }
+      throw reason;
+    });
+    requestPayloadsRef.current.delete(input.clientRequestId);
+    if (generation !== generationRef.current) return run;
+    if (run.submission) setView((current) => ({
+      ...current, submissions: mergeSubmissions(current.submissions || [], [run.submission!]),
+    }));
     if (!sessionId) onSessionCreatedRef.current(run.ref.session_id);
-    setRuntime((current) => ({
+    if (run.submission?.mode !== 'appended' && version === runtimeVersionRef.current) setRuntime((current) => ({
       status: run.status,
       provider: current?.provider || input.provider || null,
       model: current?.model || input.model || null,
       thinking_value: current?.thinking_value || input.thinkingValue || null,
-      active_run: {
+      active_run: ['STARTING', 'RUNNING', 'WAITING_HUMAN'].includes(run.status) ? {
         run_id: run.ref.run_id,
         status: run.status,
         revision_id: run.ref.revision_id,
         started_at: new Date().toISOString(),
-      },
+      } : null,
       pending_interaction: null,
     }));
     await loadSessions(agentId);
     onCatalogRefreshRef.current();
     return run;
-  }, [agentId, loadSessions, sessionId]);
+  }, [agentId, loadSessions, loadReplay, sessionId, runtime?.active_run?.run_id]);
 
   const cancel = useCallback(async () => {
     if (!agentId || !sessionId || !runtime?.active_run) return;
@@ -378,4 +427,15 @@ function upsertMessage(messages: MessageRecord[], message: MessageRecord): Messa
 
 export function isUnknownRequest(error: unknown): boolean {
   return !(error instanceof ApiError) || error.status >= 500;
+}
+
+export function mergeSubmissions(current: MessageSubmission[], incoming: MessageSubmission[]): MessageSubmission[] {
+  const items = new Map(current.map((item) => [item.message_id, item]));
+  for (const item of incoming) {
+    const previous = items.get(item.message_id);
+    items.set(item.message_id, { ...previous, ...item,
+      status: previous?.status === 'included' ? 'included' : item.status,
+    });
+  }
+  return [...items.values()].slice(-240);
 }

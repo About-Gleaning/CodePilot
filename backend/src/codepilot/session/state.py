@@ -88,6 +88,7 @@ class RunState(BaseModel):
     provider: str | None = None
     model: str | None = None
     thinking_value: str | None = None
+    submission: dict[str, Any] | None = None
 
 
 class AgentRuntimeState(BaseModel):
@@ -112,6 +113,7 @@ class SessionState(BaseModel):
     provider: str
     model: str
     status: SessionStatus
+    stop_reason: str | None = None
     created_at: str
     updated_at: str
     messages: list[Message] = Field(default_factory=list)

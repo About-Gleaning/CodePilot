@@ -15,10 +15,11 @@ from codepilot.utils import utc_now_iso, utc_now_millis
 
 
 class FakeSubagentLoop:
-    def __init__(self, *, status: SessionStatus = SessionStatus.COMPLETED, subagent_error: str | None = None) -> None:
+    def __init__(self, *, status: SessionStatus = SessionStatus.COMPLETED, subagent_error: str | None = None, stop_reason: str | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.status = status
         self.subagent_error = subagent_error
+        self.stop_reason = stop_reason
 
     async def run_subagent(self, **kwargs: Any) -> SessionState:
         self.calls.append(kwargs)
@@ -32,6 +33,7 @@ class FakeSubagentLoop:
             provider=parent_session.provider,
             model=parent_session.model,
             status=self.status,
+            stop_reason=self.stop_reason,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
             metadata={"agent_context_id": "ctx_child"},
@@ -133,6 +135,14 @@ def test_task_tool_returns_error_when_subagent_fails(tmp_path: Path) -> None:
     assert result["status"] == "error"
     assert result["error_type"] == "TaskSubagentFailed"
     assert "subagent 不支持人工审批" in result["error_message"]
+
+
+def test_task_tool_does_not_report_iteration_limit_as_success(tmp_path: Path) -> None:
+    tool = build_tool(FakeSubagentLoop(status=SessionStatus.CANCELLED, stop_reason="max_iterations"))
+    result = run_tool(tool, {"agent": "explore", "task": "检查资料"}, build_context(tmp_path))
+    assert result["status"] == "error"
+    assert result["error_type"] == "TaskSubagentCancelled"
+    assert "达到轮数上限" in result["error_message"]
 
 
 def test_task_tool_rejects_subagent_caller(tmp_path: Path) -> None:

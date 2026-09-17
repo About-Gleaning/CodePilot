@@ -47,6 +47,9 @@ class JsonlSessionMemory:
             # JSONL 采用“一行一条记录”的追加写入方式，既便于顺序回放，也避免整文件重写。
             async with aiofiles.open(path, "a", encoding="utf-8") as file:
                 await file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                if record["record_type"] == "message_submission":
+                    await file.flush()
+                    await asyncio.to_thread(os.fsync, file.fileno())
 
     async def replay(self, session_id: str | None = None) -> dict[str, Any]:
         """回放指定会话的领域事件，并重建最新会话快照与消息列表。"""

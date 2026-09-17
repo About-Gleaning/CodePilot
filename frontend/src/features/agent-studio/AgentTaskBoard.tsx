@@ -7,6 +7,7 @@ import type { AgentRuntime, AgentSummary, ReplayResponse, SessionSummary } from 
 
 export type CardSnapshot = {
   sessionId: string | null;
+  activeRunId?: string | null;
   result: string;
   lastTool: string | null;
   updatedAt: string | null;
@@ -142,9 +143,15 @@ export function useCardSnapshots(agents: AgentSummary[], runtimes: Record<string
       if (!sessionId) return;
       const key = `${agent.agent_id}:${sessionId}:${runtimes[agent.agent_id]?.active_run_count || 0}:${runtimes[agent.agent_id]?.waiting_human_count || 0}`;
       if (requested.current.has(key)) return;
+      // 状态往返后必须重新观察 Run 身份，旧活动快照不能永久用于追加预期。
+      for (const previous of requested.current) {
+        if (previous.startsWith(`${agent.agent_id}:`)) requested.current.delete(previous);
+      }
       requested.current.add(key);
       void apiRequest<ReplayResponse>(`/api/agents/${encodeURIComponent(agent.agent_id)}/sessions/${encodeURIComponent(sessionId)}/replay`)
-        .then((replay) => setSnapshots((current) => ({ ...current, [agent.agent_id]: snapshotFromReplay(sessionId, replay.messages) })))
+        .then((replay) => setSnapshots((current) => ({ ...current, [agent.agent_id]: {
+          ...snapshotFromReplay(sessionId, replay.messages), activeRunId: replay.runtime?.active_run?.run_id,
+        } })))
         .catch(() => undefined);
     });
   }, [agents, runtimeSignature, runtimes]);

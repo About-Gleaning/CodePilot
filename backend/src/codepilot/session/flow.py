@@ -117,6 +117,9 @@ class TurnExecutor:
         if llm_before_result:
             return llm_before_result
 
+        if stop_event is not None and stop_event.is_set():
+            return TurnResult(status="stopped")
+
         stream_payload = await self._stream_assistant_message(
             session=session,
             workspace=workspace,
@@ -193,6 +196,7 @@ class TurnExecutor:
                 llm_state=llm_state,
                 llm_client=self.llm_client,
                 context_id=agent_state.context_id,
+                protected_message_ids=set(runtime.inbox.batch) if runtime.inbox else set(),
             )
         except ContextCompressionError as exc:
             await runtime.event_bus.publish_stream_event(
@@ -286,6 +290,8 @@ class TurnExecutor:
                 now=_latest_user_message_datetime(context_messages),
             ),
         )
+        if runtime.inbox is not None:
+            await runtime.inbox.include(session, runtime, iteration)
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
                 event_type="assistant_message_started",

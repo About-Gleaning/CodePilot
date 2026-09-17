@@ -19,6 +19,7 @@ from codepilot.session.agents import AgentProfile
 from codepilot.session.attachments import attachment_message_dir, decode_image_attachment, sanitize_attachment_filename
 from codepilot.session.message import FilePart, FileSource, Message, MessagePart, TextPart, build_user_message_info
 from codepilot.session.session import AgentLoop
+from codepilot.session.inbox import SessionInbox
 from codepilot.session.state import ApprovalResult, QuestionResult, RunRef, SessionState, SessionStatus
 from codepilot.session.title import SessionTitleService
 from codepilot.tools.workspace_lease import get_workspace_write_lease_manager
@@ -58,6 +59,7 @@ class SessionRunner:
         self._approval_result_holder: dict[str, ApprovalResult | None] = {"result": None}
         self._question_event = asyncio.Event()
         self._question_result_holder: dict[str, QuestionResult | None] = {"result": None}
+        self._inbox = SessionInbox()
 
     async def handle_input(self, gateway_input: GatewayInput) -> SessionState | None:
         """按输入类型路由到对应的会话处理分支。"""
@@ -116,6 +118,13 @@ class SessionRunner:
         """返回当前内存中持有的 session_id；没有会话时返回 None。"""
         return self._session.session_id if self._session else None
 
+    async def append_message(self, request: GatewayInput, receipt: dict[str, Any]) -> dict[str, Any]:
+        if self._session is None:
+            raise ValueError("会话尚未启动")
+        return await self._inbox.receive(
+            self._session, self._event_bus, lambda: self._build_user_message(request), receipt,
+        )
+
     async def wait_current_run(self) -> SessionState | None:
         """等待当前后台执行任务结束，供 headless worker 在进程内同步收尾。"""
         if self._task and not self._task.done():
@@ -160,6 +169,7 @@ class SessionRunner:
             loaded.status = SessionStatus.CANCELLED
             loaded.updated_at = utc_now_iso()
         self._session = loaded
+        self._inbox = SessionInbox(replay.get("submissions"))
         self._task = None
         self._stop_event = asyncio.Event()
         self._approval_event = asyncio.Event()
@@ -250,6 +260,9 @@ class SessionRunner:
                 )
 
         # 用户输入先落入 session 内存，再交给 AgentLoop 负责完整的一次 session 执行。
+        self._session.stop_reason = None
+        self._inbox.accepting = True
+        await self._inbox.prepare(self._session)
         message = self._build_user_message(gateway_input)
         self._session.messages.append(message)
         self._session.updated_at = utc_now_iso()
@@ -290,7 +303,7 @@ class SessionRunner:
             )
             self._schedule_title_generation(self._session)
 
-        runtime = RuntimeHandles(event_bus=self._event_bus, run_ref=run_ref)
+        runtime = RuntimeHandles(event_bus=self._event_bus, run_ref=run_ref, inbox=self._inbox)
         profile = profile_override or self._agent_profiles[self._session.agent_name]
         await self._event_bus.publish_domain_event(
             MessageCreatedEvent(
@@ -370,6 +383,7 @@ class SessionRunner:
             )
             raise
         finally:
+            await self._inbox.close()
             if runtime.run_ref is not None:
                 lease_root = getattr(self._workspace, "shared_runtime_dir", self._workspace.workspace_dir)
                 await get_workspace_write_lease_manager(lease_root).release(runtime.run_ref)
@@ -379,6 +393,8 @@ class SessionRunner:
         """处理停止请求，并根据当前状态选择终止运行或中断审批等待。"""
         if self._session is None:
             return None
+        await self._inbox.close()
+        self._session.stop_reason = "user_requested"
         if self._session.status == SessionStatus.WAITING_HUMAN:
             # 等待人工确认时没有运行中的 Loop 可中断，需要通过审批结果唤醒等待协程。
             self._session.status = SessionStatus.CANCELLED
@@ -557,7 +573,7 @@ class SessionRunner:
     def _build_user_message(self, gateway_input: GatewayInput) -> Message:
         """把网关输入转换为统一的用户消息结构，写入 session 消息列表。"""
         assert self._session is not None
-        message_id = new_message_id()
+        message_id = str(gateway_input.metadata.get("_message_id") or new_message_id())
         parts: list[MessagePart] = [TextPart(text=gateway_input.content or "")]
         parts.extend(self._build_attachment_parts(gateway_input, message_id))
         return Message(

@@ -251,6 +251,7 @@ def test_session_meta_is_first_record_and_lifecycle_is_compact(tmp_path) -> None
         assert records[1]["record_type"] == "session_started"
         assert records[1]["data"] == {
             "status": "RUNNING",
+            "stop_reason": None,
             "agent_name": "build",
             "provider": "openai",
             "model": "gpt-5.3-codex",

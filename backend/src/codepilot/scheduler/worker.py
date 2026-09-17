@@ -121,7 +121,10 @@ async def run_worker(args: argparse.Namespace) -> None:
             status=status,
             session_id=finished.session_id if finished else session_id,
             summary=_summary_from_session(finished),
-            error=None if status == ScheduleRunStatus.COMPLETED else f"session 状态为 {finished.status.value if finished else 'unknown'}",
+            error=None if status == ScheduleRunStatus.COMPLETED else (
+                "已停止：达到轮数上限" if finished and finished.stop_reason == "max_iterations"
+                else f"session 状态为 {finished.status.value if finished else 'unknown'}"
+            ),
         )
     except Exception as exc:  # noqa: BLE001
         await report(
@@ -222,6 +225,8 @@ def _run_status_from_session(status: SessionStatus | None) -> ScheduleRunStatus:
         return ScheduleRunStatus.COMPLETED
     if status == SessionStatus.FAILED:
         return ScheduleRunStatus.FAILED
+    if status == SessionStatus.CANCELLED:
+        return ScheduleRunStatus.CANCELLED
     return ScheduleRunStatus.FAILED
 
 

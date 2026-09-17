@@ -68,6 +68,7 @@ class CompressionContext:
     llm_client: LiteLLMClient
     messages: list[Message]
     token_estimator: "TokenEstimator"
+    protected_message_ids: set[str] = field(default_factory=set)
 
 
 class TokenEstimator:
@@ -100,6 +101,7 @@ class ContextCompressor:
         llm_state: LLMState,
         llm_client: LiteLLMClient,
         context_id: str | None = None,
+        protected_message_ids: set[str] | None = None,
     ) -> CompressionResult:
         settings = config.context
         target_context_id = context_id or "main"
@@ -128,6 +130,7 @@ class ContextCompressor:
             llm_client=llm_client,
             messages=deepcopy(context_messages),
             token_estimator=self._token_estimator,
+            protected_message_ids=protected_message_ids or set(),
         )
         strategies: list[CompressionStrategy] = []
         if settings.strategies.tool_result_placeholder.enabled:
@@ -213,6 +216,11 @@ class LLMSummaryCompressionStrategy:
     async def apply(self, ctx: CompressionContext) -> bool:
         keep_rounds = max(0, ctx.config.context.latest_rounds_to_keep)
         keep_start = self._find_keep_start(ctx.messages, keep_rounds)
+        # 首次纳入的新输入必须保留原文，不能在送入决策前被摘要替代。
+        keep_start = min([keep_start, *(
+            index for index, message in enumerate(ctx.messages)
+            if message.info.id in ctx.protected_message_ids
+        )])
         summary_index = self._find_summary_index(ctx.messages)
         candidate_start = summary_index + 1 if summary_index is not None else 0
         if keep_start <= candidate_start:

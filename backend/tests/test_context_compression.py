@@ -174,6 +174,26 @@ def test_context_compressor_rebuilds_messages_with_summary_and_latest_round() ->
     asyncio.run(run_case())
 
 
+def test_first_inclusion_preserves_pending_input_before_new_manual_message() -> None:
+    async def run_case() -> None:
+        session = build_session([
+            user_message("old", "旧要求"), assistant_message("answer", "旧结果"),
+            user_message("pending", "必须原样纳入的新约束"), user_message("manual", "人工继续"),
+        ])
+        client = StubLLMClient()
+        await ContextCompressor(token_estimator=FixedTokenEstimator(100)).compress(
+            session=session, config=compression_settings(),
+            llm_state=LLMState(provider="openai", model="gpt-5.3-codex", max_tokens=4096),
+            llm_client=client, protected_message_ids={"pending"},
+        )
+        assert client.summary_calls == 1
+        assert "必须原样纳入" not in str(client.summary_messages)
+        assert [message.info.id for message in session.messages[1:]] == ["pending", "manual"]
+        assert session.messages[1].text_content() == "必须原样纳入的新约束"
+
+    asyncio.run(run_case())
+
+
 def test_tool_result_placeholder_runs_before_summary() -> None:
     async def run_case() -> None:
         session = build_session(

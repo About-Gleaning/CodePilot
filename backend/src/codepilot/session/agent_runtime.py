@@ -21,6 +21,7 @@ from codepilot.gateway import GatewayInput, GatewayInputType
 from codepilot.memory import UserPartitionedSessionMemory
 from codepilot.session.agents import AgentProfile
 from codepilot.session.attachments import decode_image_attachment, sanitize_attachment_filename
+from codepilot.session.inbox import public_submission
 from codepilot.session.runtime_store import (
     RuntimeStateStore,
     RuntimeStoreCorrupt,
@@ -148,6 +149,8 @@ class AgentRuntimeBackend(Protocol):
         payload: GatewayInput,
     ) -> None: ...
 
+    async def append_message(self, handle: SessionExecutionHandle, request: GatewayInput, receipt: dict[str, Any]) -> dict[str, Any]: ...
+
     async def close_session(self, session_handle: SessionExecutionHandle) -> None: ...
 
     async def shutdown(self) -> None: ...
@@ -204,6 +207,9 @@ class InProcessAgentRuntimeBackend:
     def get_session_snapshot(self, session_handle: SessionExecutionHandle) -> dict[str, Any]:
         return session_handle.runner.get_status_snapshot()
 
+    async def append_message(self, handle: SessionExecutionHandle, request: GatewayInput, receipt: dict[str, Any]) -> dict[str, Any]:
+        return await handle.runner.append_message(request, receipt)
+
     async def wait_run(self, run_handle: RunExecutionHandle) -> RunExecutionResult:
         session = await run_handle.runner.wait_current_run()
         status = RunStatus.COMPLETED
@@ -214,7 +220,7 @@ class InProcessAgentRuntimeBackend:
         uncertain = bool(session and session.metadata.get("external_effect_uncertain"))
         return RunExecutionResult(
             status=status,
-            error_code="cancellation_uncertain" if uncertain else None,
+            error_code="cancellation_uncertain" if uncertain else session.stop_reason if session else None,
             external_effect_uncertain=uncertain,
         )
 
@@ -312,6 +318,89 @@ class AgentRuntimeManager:
         self._control_buses: dict[str, EventBus] = {}
         self._recovery_error: str | None = None
         self._recovered = False
+        self._submission_locks: dict[str, asyncio.Lock] = {}
+        self._submissions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._submission_users_loaded: set[str] = set()
+
+    async def submit_message(
+        self, user_id: str, agent_id: str, request: GatewayInput,
+        session_id: str | None, client_request_id: str, expected_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """发送入口统一分流；幂等判定先于活动 Run 判定，防止重试意外重启。"""
+        self._ensure_recovered()
+        _validate_resource_id(client_request_id, "client_request_id", max_length=128)
+        self._record(user_id, agent_id)
+        if session_id:
+            _validate_resource_id(session_id, "session_id")
+        if expected_run_id:
+            _validate_resource_id(expected_run_id, "expected_run_id")
+            if not session_id:
+                raise ValueError("expected_run_id 必须同时指定 session_id")
+        request = request.model_copy(update={"metadata": {**request.metadata, "expected_run_id": expected_run_id}})
+        fingerprint = _request_fingerprint(user_id, agent_id, session_id, request)
+        key = (user_id, client_request_id)
+        # 只串行同一用户的短提交阶段，模型和工具始终在独立后台任务中执行。
+        async with self._submission_locks.setdefault(user_id, asyncio.Lock()):
+            if user_id not in self._submission_users_loaded:
+                for summary in self._memory_list_sessions(user_id):
+                    replay = await self._memory_replay(user_id, summary["session_id"])
+                    for item in replay.get("submissions", []):
+                        self._submissions[(user_id, item["client_request_id"])] = {key: value for key, value in item.items() if key != "message"}
+                self._submission_users_loaded.add(user_id)
+            existing = self._submissions.get(key)
+            if existing:
+                if existing["fingerprint"] != fingerprint:
+                    raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
+                run = self._require_run(RunRef.model_validate(existing["ref"]))
+                return {**run.model_dump(), "submission": self._public_submission(existing)}
+            if key in self._idempotency:
+                old_fingerprint, run_key = self._idempotency[key]
+                if old_fingerprint != fingerprint:
+                    raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
+                return self._runs[run_key].model_dump()
+            session_key = (user_id, agent_id, session_id)
+            async with self._lock:
+                active_id = self._active_sessions.get(session_key)
+                run = self._runs.get((*session_key, active_id)) if active_id else None
+                handle = self._sessions.get(session_key)
+            if expected_run_id and active_id != expected_run_id:
+                raise RuntimeConflict("expected_run_conflict", "原执行已结束或发生变化，请刷新后再发送")
+            if run is not None:
+                if run.status != RunStatus.RUNNING or handle is None:
+                    raise RuntimeConflict("session_not_accepting", "当前正在启动、停止或等待人工处理，请稍后再发送")
+                if ((request.provider is not None and request.provider != run.provider)
+                    or (request.model is not None and request.model != run.model)
+                    or ("thinking_value" in request.metadata and request.metadata["thinking_value"] != run.thinking_value)):
+                    raise RuntimeConflict("active_model_conflict", "追加消息不能修改当前执行的模型设置")
+                state = self._runtimes.get((user_id, agent_id))
+                if state is None or state.lifecycle_state != AgentLifecycleState.RUNNING:
+                    raise RuntimeConflict("agent_not_running", "Agent 已停止或正在关闭")
+                receipt = {"mode": "appended", "client_request_id": client_request_id,
+                           "fingerprint": fingerprint, "ref": run.ref.model_dump()}
+                execution = self._executions.get(_run_key(run.ref))
+                if execution is None:
+                    raise RuntimeConflict("session_not_accepting", "当前执行正在结束，请刷新后再发送")
+                try:
+                    item = await self._backend.append_message(handle.execution, request, receipt)
+                except ValueError as exc:
+                    raise RuntimeConflict("session_not_accepting", str(exc)) from exc
+                self._submissions[key] = {field: value for field, value in item.items() if field != "message"}
+                await execution.event_scope.publish_stream_event(StreamEvent(
+                    event_type="message_submission", session_id=session_id,
+                    created_at=utc_now_iso(), data={"submissions": [self._public_submission(item, with_message=True)]},
+                ))
+                return {**run.model_dump(), "submission": self._public_submission(item)}
+            message_id = f"msg_{uuid4().hex}"
+            request = request.model_copy(update={"metadata": {**request.metadata, "_message_id": message_id}})
+            run = await self.start_run(user_id, agent_id, request, session_id, client_request_id)
+            return run.model_dump()
+
+    @staticmethod
+    def _public_submission(item: dict[str, Any], *, with_message: bool = False) -> dict[str, Any]:
+        result = public_submission(item)
+        if not with_message:
+            result.pop("message", None)
+        return result
 
     async def recover(self, enabled_user_ids: set[str]) -> None:
         """恢复期望启动状态与幂等索引，不重放任何旧副作用。"""
@@ -631,6 +720,8 @@ class AgentRuntimeManager:
             provider=provider,
             model=model,
             thinking_value=thinking,
+            submission={"mode": "started", "message_id": request.metadata["_message_id"], "status": "accepted"}
+            if request.metadata.get("_message_id") else None,
         )
         key = (*key_base, run_id)
         async with self._lock:
@@ -692,6 +783,7 @@ class AgentRuntimeManager:
                         "agent_id": agent_id,
                         "revision_id": profile.revision_id,
                         "run_id": run_id,
+                        "_message_id": request.metadata.get("_message_id"),
                     },
                 }
             )
@@ -826,6 +918,10 @@ class AgentRuntimeManager:
 
     async def handle_domain_event(self, event: DomainEvent) -> None:
         """把 Runner 的人工交互事件投影为四级资源索引。"""
+        if event.event_type.value == "message_submission" and event.user_id:
+            for item in event.data["submissions"]:
+                self._submissions[(event.user_id, item["client_request_id"])] = {key: value for key, value in item.items() if key != "message"}
+            return
         if not isinstance(event, HumanInteractionEvent):
             return
         if self._legacy_mode and not event.user_id:
@@ -1019,6 +1115,7 @@ class AgentRuntimeManager:
                 if active_run
                 else str(data.get("status") or live_snapshot.get("status") or "IDLE")
             ),
+            "stop_reason": last_run.error_code if last_run and not active_run else None,
             "provider": data.get("provider") or live_snapshot.get("provider"),
             "model": data.get("model") or live_snapshot.get("model"),
             "thinking_value": (
@@ -1447,6 +1544,11 @@ def _request_fingerprint(
         "model": request.model or "__agent_default__",
         "thinking_value": request.metadata.get("thinking_value", "__agent_default__"),
     }
+    # 空扩展维持旧指纹，已有 Run 的客户端重试仍然可识别。
+    if request.metadata.get("user_metadata"):
+        payload["user_metadata"] = request.metadata["user_metadata"]
+    if request.metadata.get("expected_run_id"):
+        payload["expected_run_id"] = request.metadata["expected_run_id"]
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -1478,5 +1580,7 @@ def _run_error_summary(error_code: str | None) -> str | None:
         "cancellation_uncertain": "取消结果不确定，重启服务后再试。",
         "runtime_state_persist_failed": "运行状态保存失败，已阻止继续执行。",
         "service_restarted": "服务重启中断了本次执行。",
+        "max_iterations": "已停止：达到轮数上限。",
+        "user_requested": "用户已停止本次执行。",
     }
     return summaries.get(error_code, "本次执行失败，请查看会话中的运行错误。" if error_code else None)

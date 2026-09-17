@@ -23,6 +23,7 @@ class RuntimeHandles:
     run_ref: Any | None = None
     # 仅保存安全摘要，禁止记录参数、返回正文或凭证。
     active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    inbox: Any | None = None
 
 
 @dataclass(slots=True)

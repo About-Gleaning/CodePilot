@@ -13,6 +13,7 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not records:
         return {"session": None, "messages": [], "records": []}
     messages: list[dict[str, Any]] = []
+    submissions: dict[str, dict[str, Any]] = {}
     pending_question: dict[str, Any] | None = None
     session_meta = require_session_meta(records)
     session_data: dict[str, Any] = {
@@ -35,6 +36,14 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
         "data": session_data,
     }
     for record in records:
+        if record["record_type"] == "message_submission":
+            for item in record["data"]["submissions"]:
+                submissions[item["message_id"]] = item
+                if item["status"] == "included":
+                    if not any(message["info"]["id"] == item["message_id"] for message in messages):
+                        before = next((index for index, message in enumerate(messages)
+                                       if message["info"]["id"] == item.get("before_message_id")), len(messages))
+                        messages.insert(before, item["message"])
         if record["record_type"] == "message":
             # 人工交互恢复后会重新写入同一条 assistant 消息，新的快照已补齐工具结果。
             upsert_message(messages, record["data"])
@@ -52,9 +61,11 @@ def replay_records(records: list[dict[str, Any]]) -> dict[str, Any]:
             session_snapshot = {**record, "data": session_data}
     return {
         "session": session_snapshot,
-        "messages": messages,
+        "messages": [message for message in messages
+                     if submissions.get(message["info"]["id"], {}).get("status") != "pending"],
         "records": records,
         "pending_question": pending_question,
+        "submissions": list(submissions.values()),
     }
 
 
@@ -147,6 +158,7 @@ def build_session_summary(records: list[dict[str, Any]]) -> dict[str, Any] | Non
         "created_at": created_at,
         "updated_at": updated_at or created_at,
         "status": status or session_data.get("status") or "UNKNOWN",
+        "stop_reason": session_data.get("stop_reason"),
         "agent_name": session_data.get("agent_name") or "",
         "provider": session_data.get("provider"),
         "model": session_data.get("model"),

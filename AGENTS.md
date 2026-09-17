@@ -43,6 +43,12 @@ MCP 连接必须使用官方 Python SDK，主进程和 scheduler worker 都要�
 
 ## Agent & Subagent Runtime Guidelines
 
+发送统一使用 `POST /api/agents/{agent_id}/runs`，经 Manager 的 `submit_message` 分流，底层 `start_run` 只启动。运行中追加返回原 Run，不能额外占容量或修改当前模型；`expected_run_id` 不匹配必须冲突。用户加请求 ID 幂等先于分流，指纹包含正文、图片摘要、模型、metadata 和预期 Run；旧追加重试不能开启新 Run。
+
+主 Agent 的 SessionInbox 接收、决策选取、人工等待、停止和正常收尾共用短临界区，不能跨模型或工具调用持锁。每 Session 最多 20 条待纳入消息，先追加 JSONL 并 fsync 后接收；选取后到请求构造前保护新输入原文，构造后记录纳入 Run 和轮次，准备期间新消息留到下一轮。已纳入仅表示进入本地请求上下文。等待人工与正在停止拒绝普通发送；服务重启不执行，旧待处理输入先于下次人工新消息纳入。
+
+轮数耗尽必须为 `CANCELLED` 且 `stop_reason=max_iterations`，最后允许的一轮正常完成仍为 `COMPLETED`；主 Agent、子 Agent、定时 worker 与前端回放均不能把超限当成功。停止后在原 Session 发送启动新 Run，不引入暂停状态或工具检查点。Session SSE 回执按消息 ID 去重、状态只前进；追加响应不能清空流式文本或重置 Run，正文与附件不得进入聚合事件。设计与验证见 `docs/agent-platform/message-submissions.md`。
+
 运行时控制接口必须使用完整的 `user_id + agent_id + session_id + run_id` 归属键；不得新增全局 current user/agent/run 作为事实来源。每个 SessionRunner 只能管理一个 Session 的可变执行状态，跨 Session 并发由运行时协调层控制。用户运行期期望启动状态写入 `workspace/users/<user_id>/agent-runtimes.json` 时必须原子替换并使用 0600 权限。重启时所有用户的活动 Run 统一转为 `CANCELLED/service_restarted`，但只恢复启用用户的 Agent；禁用用户的期望状态必须持久化为 `STOPPED`，不能重放 Tool、MCP 或 LLM 副作用。
 
 HTTP API 只能依赖 `AgentRuntimeManager`，不能直接持有 SessionRunner 的 Task、Event、审批或 Question holder。Manager 获取配置时必须使用 `AgentConfigService` 的不可变快照；Run 启动后固定 revision。Run 终态必须比较并更新，确保 cancel、Agent stop、watcher 和 shutdown 只释放一次容量。恢复期同样必须执行全服务与每用户 started Agent 上限；超限 Agent 不启动、不排队，必须持久化为带容量错误码的停止状态。`agent-runs.jsonl` 与控制事件必须追加、flush、fsync；末行截断可归档后恢复完整前缀，中间损坏必须拒绝新 Run。Session 历史索引需要识别 Scheduler 跨进程写入，外部 session ID 禁止拼入 glob。
