@@ -17,7 +17,6 @@ class Skill:
     path: Path
     skill_md_path: Path
     metadata: dict[str, Any] = field(default_factory=dict)
-    content: str | None = None
 
     def to_brief_dict(self) -> dict[str, str]:
         return {
@@ -26,9 +25,8 @@ class Skill:
         }
 
     def load_full_content(self) -> str:
-        if self.content is None:
-            self.content = self.skill_md_path.read_text(encoding="utf-8")
-        return self.content
+        from codepilot.skills.store import SkillStore
+        return SkillStore.read_shared_path(self.path, "SKILL.md").decode("utf-8")
 
 
 class SkillRegistry:

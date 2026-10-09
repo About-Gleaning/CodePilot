@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from codepilot.memory import read_user_long_memory
+from codepilot.memory.long_memory import LongMemoryError, append_user_long_memory, memory_snapshot, save_memory_snapshot
+import pytest
 from codepilot.session.agents import build_agent_profiles
 from codepilot.session.state import AgentState, LLMState, SessionState, SessionStatus
 from codepilot.session.system_prompt import build_system_prompt
@@ -19,6 +21,28 @@ applyTo:
   - life
 ---
 """
+
+
+def test_disabled_memory_rejects_tool_even_with_capability(tmp_path: Path) -> None:
+    context = _tool_context(tmp_path)
+    context.agent.memory_enabled = False
+    result = asyncio.run(LongMemoryWriteTool(timeout_seconds=5).execute(
+        {"old_string": "", "new_string": "不应保存"}, context=context,
+    ))
+    assert result["error_type"] == "LongMemoryDisabled"
+    assert not _memory_path(tmp_path).exists()
+
+
+def test_memory_editor_cannot_overwrite_runtime_append(tmp_path: Path) -> None:
+    initial = memory_snapshot(tmp_path, "agent-a")
+    append_user_long_memory(tmp_path, "agent-a", "运行中写入")
+    with pytest.raises(LongMemoryError) as error:
+        save_memory_snapshot(tmp_path, "agent-a", "旧页面修改", initial["revision"])
+    assert error.value.error_type == "LongMemoryRevisionConflict"
+    latest = memory_snapshot(tmp_path, "agent-a")
+    assert "运行中写入" in latest["content"]
+    cleared = save_memory_snapshot(tmp_path, "agent-a", "", latest["revision"])
+    assert cleared["content"] == ""
 
 
 def test_long_memory_write_creates_instruction_file_with_frontmatter(tmp_path: Path) -> None:

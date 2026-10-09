@@ -1,19 +1,30 @@
+export type ApiIssue = { code: string; field?: string | null; message: string; suggestion?: string;
+  resource_kind?: string; resource_id?: string; resource_name?: string | null;
+  referenced_by?: Array<{ agent_id: string; name: string }>; action?: 'publish' | 'restore' | null };
+export type PublicationProgress = { resource_id: string; resource_name: string; action: 'publish' | 'restore' | 'publish_agent'; status: 'pending' | 'completed' | 'failed' };
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly retryAfter: number | null;
+  readonly issues: ApiIssue[];
+  readonly progress: PublicationProgress[];
+  readonly retryable: boolean;
 
-  constructor(message: string, status: number, code = 'request_failed', retryAfter: number | null = null) {
+  constructor(message: string, status: number, code = 'request_failed', retryAfter: number | null = null, issues: ApiIssue[] = [], progress: PublicationProgress[] = [], retryable = false) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
     this.retryAfter = retryAfter;
+    this.issues = issues;
+    this.progress = progress;
+    this.retryable = retryable;
   }
 }
 
 type ErrorBody = {
-  detail?: string | { code?: string; message?: string };
+  detail?: string | { code?: string; message?: string; issues?: ApiIssue[]; progress?: PublicationProgress[]; retryable?: boolean };
 };
 
 export const AUTH_EXPIRED_EVENT = 'codepilot:auth-expired';
@@ -38,7 +49,10 @@ export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T>
     const retryAfterRaw = response.headers.get('Retry-After');
     const retryAfter = retryAfterRaw && Number.isFinite(Number(retryAfterRaw)) ? Number(retryAfterRaw) : null;
     if (response.status === 401) window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
-    throw new ApiError(message, response.status, code, retryAfter);
+    const issues = typeof detail === 'object' && Array.isArray(detail?.issues)
+      ? detail.issues.filter((item) => item && typeof item.code === 'string' && typeof item.message === 'string') : [];
+    const progress = typeof detail === 'object' && Array.isArray(detail?.progress) ? detail.progress : [];
+    throw new ApiError(message, response.status, code, retryAfter, issues, progress, typeof detail === 'object' && detail?.retryable === true);
   }
   if (response.status === 204) {
     return undefined as T;

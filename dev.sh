@@ -6,14 +6,20 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
 BACKEND_PID_FILE="$RUN_DIR/backend.pid"
 FRONTEND_PID_FILE="$RUN_DIR/frontend.pid"
+LAN_PROXY_PID_FILE="$RUN_DIR/lan-proxy.pid"
 BACKEND_LOG_FILE="$RUN_DIR/backend.log"
 FRONTEND_LOG_FILE="$RUN_DIR/frontend.log"
+LAN_PROXY_LOG_FILE="$RUN_DIR/lan-proxy.log"
 BACKEND_PORT=8000
 FRONTEND_PORT=5173
+LAN_PORT=5443
 BACKEND_GRACEFUL_SHUTDOWN_SECONDS=5
 DEV_HOST="${CODEPILOT_HOST:-127.0.0.1}"
+LAN_ENABLED="${CODEPILOT_LAN_ENABLED:-0}"
 NEW_BACKEND_PID=""
 NEW_FRONTEND_PID=""
+NEW_LAN_PROXY_PID=""
+LAN_ADDRESSES=()
 
 case "$DEV_HOST" in
   127.0.0.1|localhost|::1) ;;
@@ -22,11 +28,14 @@ case "$DEV_HOST" in
     exit 1
     ;;
 esac
+case "$LAN_ENABLED" in 0|1) ;; *) echo "错误: CODEPILOT_LAN_ENABLED 只能是 0 或 1。"; exit 1 ;; esac
 
 BACKEND_CMD=(
   uv run --no-sync --offline uvicorn codepilot.main:app
   --app-dir src
   --reload
+  # 只监听业务源码，避免 StatReload 递归扫描 .venv 导致持续高 CPU。
+  --reload-dir "$ROOT_DIR/backend/src"
   --host "$DEV_HOST"
   --port "$BACKEND_PORT"
   # 将 Uvicorn 的优雅退出时间限制在 stop 脚本等待窗口内，避免 SSE 长连接导致外部强杀。
@@ -175,14 +184,54 @@ start_frontend() {
   echo "前端进程已创建，等待就绪。"
 }
 
+discover_lan_addresses() {
+  local interface address seen=" "
+  LAN_ADDRESSES=()
+  for interface in $(ifconfig -l); do
+    address="$(ipconfig getifaddr "$interface" 2>/dev/null || true)"
+    [[ "$address" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ && "$address" != 127.* ]] || continue
+    [[ "$seen" == *" $address "* ]] && continue
+    LAN_ADDRESSES+=("$address"); seen+="$address "
+  done
+  ((${#LAN_ADDRESSES[@]})) || { echo "错误: 未检测到可用的局域网 IPv4 地址。"; return 1; }
+}
+
+prepare_lan_certificate() {
+  local certificate_dir key certificate san="" origins="" address
+  certificate_dir="$RUN_DIR/lan"
+  key="$certificate_dir/key.pem"
+  certificate="$certificate_dir/cert.pem"
+  mkdir -p "$certificate_dir" && chmod 700 "$certificate_dir" || return 1
+  for address in "${LAN_ADDRESSES[@]}"; do san+="IP:$address,"; origins+="https://$address:$LAN_PORT,"; done
+  umask 077
+  # 每次地址集合变化时重建，确保证书 SAN 与实际可分享地址一致。
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=${LAN_ADDRESSES[0]}" \
+    -addext "subjectAltName=${san%,}" -keyout "$key" -out "$certificate" >/dev/null 2>&1 || return 1
+  chmod 600 "$key" && chmod 644 "$certificate" || return 1
+  BACKEND_CMD=(env CODEPILOT_AUTH_MODE=lan_https CODEPILOT_PUBLIC_ORIGINS="${origins%,}" "${BACKEND_CMD[@]}")
+  LAN_PROXY_CMD=(node "$ROOT_DIR/frontend/scripts/lan-https-proxy.mjs" "$key" "$certificate" "$LAN_PORT" "$BACKEND_PORT" "$FRONTEND_PORT")
+}
+
+start_lan_proxy() {
+  local pid
+  pid="$(read_pid "$LAN_PROXY_PID_FILE")"
+  if [[ -n "${pid:-}" ]] && is_pid_running "$pid" && pid_matches_command "$pid" "lan-https-proxy.mjs"; then return; fi
+  [[ -z "$(find_listener_pid "$LAN_PORT")" ]] || { echo "错误: 局域网 HTTPS 代理启动前检查失败，端口 ${LAN_PORT} 已被占用。"; return 1; }
+  rm -f "$LAN_PROXY_PID_FILE"
+  launch_in_own_session "$ROOT_DIR/frontend" "$LAN_PROXY_LOG_FILE" "$LAN_PROXY_PID_FILE" "${LAN_PROXY_CMD[@]}" || return 1
+  NEW_LAN_PROXY_PID="$(read_pid "$LAN_PROXY_PID_FILE")"
+}
+
 cleanup_started() {
   local pid fragment pid_file index
   # 仅回收本次创建且仍与命令和独立进程组匹配的进程，不按端口兜底杀进程。
-  for index in 0 1; do
+  for index in 0 1 2; do
     if [[ "$index" == 0 ]]; then
       pid="$NEW_BACKEND_PID"; fragment="uvicorn codepilot.main:app"; pid_file="$BACKEND_PID_FILE"
-    else
+    elif [[ "$index" == 1 ]]; then
       pid="$NEW_FRONTEND_PID"; fragment="pnpm dev --host"; pid_file="$FRONTEND_PID_FILE"
+    else
+      pid="$NEW_LAN_PROXY_PID"; fragment="lan-https-proxy.mjs"; pid_file="$LAN_PROXY_PID_FILE"
     fi
     [[ -n "$pid" ]] || continue
     if is_pid_running "$pid" && pid_matches_command "$pid" "$fragment" \
@@ -205,19 +254,24 @@ listener_belongs_to() {
 }
 
 wait_until_ready() {
-  local deadline=$((SECONDS + 20)) backend_ready=0 frontend_ready=0 pid host="$DEV_HOST"
+  local deadline=$((SECONDS + 20)) backend_ready=0 frontend_ready=0 lan_ready=0 pid host="$DEV_HOST"
   [[ "$host" != "::1" ]] || host="[::1]"
   # 两个组件共享截止时间；不使用代理，也不读取可能包含敏感内容的响应正文。
   while (( SECONDS < deadline )); do
-    for component in backend frontend; do
+    local components=(backend frontend)
+    [[ "$LAN_ENABLED" == 0 ]] || components+=(lan)
+    for component in "${components[@]}"; do
       if [[ "$component" == backend ]]; then
         pid="$(read_pid "$BACKEND_PID_FILE")"
-      else
+      elif [[ "$component" == frontend ]]; then
         pid="$(read_pid "$FRONTEND_PID_FILE")"
+      else
+        pid="$(read_pid "$LAN_PROXY_PID_FILE")"
       fi
       if ! is_pid_running "$pid"; then
         if [[ "$component" == backend ]]; then echo "错误: 后端在就绪前退出，请查看本地后端日志。"
-        else echo "错误: 前端在就绪前退出，请查看本地前端日志。"; fi
+        elif [[ "$component" == frontend ]]; then echo "错误: 前端在就绪前退出，请查看本地前端日志。"
+        else echo "错误: 局域网 HTTPS 代理在就绪前退出，请查看本地代理日志。"; fi
         return 1
       fi
     done
@@ -227,11 +281,14 @@ wait_until_ready() {
     (( SECONDS < deadline )) || break
     if [[ "$(curl --noproxy '*' --connect-timeout 1 --max-time 1 -s -o /dev/null -w '%{http_code}' "http://${host}:${FRONTEND_PORT}/")" == 200 ]] \
       && listener_belongs_to "$FRONTEND_PORT" "$(read_pid "$FRONTEND_PID_FILE")"; then frontend_ready=1; fi
-    if (( backend_ready && frontend_ready && SECONDS < deadline )); then return 0; fi
+    if [[ "$LAN_ENABLED" == 1 ]] && [[ "$(curl -k --noproxy '*' --connect-timeout 1 --max-time 1 -s -o /dev/null -w '%{http_code}' "https://127.0.0.1:${LAN_PORT}/api/health/ready")" == 200 ]] \
+      && listener_belongs_to "$LAN_PORT" "$(read_pid "$LAN_PROXY_PID_FILE")"; then lan_ready=1; fi
+    if (( backend_ready && frontend_ready )) && { [[ "$LAN_ENABLED" == 0 ]] || (( lan_ready )); } && (( SECONDS < deadline )); then return 0; fi
     sleep 0.2
   done
   (( backend_ready )) || echo "错误: 后端就绪检查超时（两个组件共用 20 秒），请检查本地日志、模型配置和迁移状态。"
   (( frontend_ready )) || echo "错误: 前端就绪检查超时（两个组件共用 20 秒），请检查本地前端日志。"
+  [[ "$LAN_ENABLED" == 0 ]] || (( lan_ready )) || echo "错误: 局域网 HTTPS 代理就绪检查超时。"
   return 1
 }
 
@@ -301,6 +358,7 @@ start_all() {
   require_command "python3"
   require_command "curl"
   require_command "lsof"
+  if [[ "$LAN_ENABLED" == 1 ]]; then require_command "openssl"; require_command "ipconfig"; require_file "$ROOT_DIR/frontend/scripts/lan-https-proxy.mjs"; fi
   require_file "$ROOT_DIR/backend/pyproject.toml"
   require_file "$ROOT_DIR/backend/uv.lock"
   require_file "$ROOT_DIR/frontend/package.json"
@@ -315,19 +373,21 @@ start_all() {
 
   trap cleanup_started EXIT
   trap 'exit 1' INT TERM
-  start_backend && start_frontend && wait_until_ready || return 1
+  if [[ "$LAN_ENABLED" == 1 ]]; then
+    discover_lan_addresses && prepare_lan_certificate || { echo "错误: 无法准备局域网 HTTPS 入口。"; return 1; }
+  fi
+  start_backend && start_frontend && { [[ "$LAN_ENABLED" == 0 ]] || start_lan_proxy; } && wait_until_ready || return 1
   trap - EXIT INT TERM
 
   echo "启动完成。"
   echo "后端地址: http://${DEV_HOST}:8000"
   echo "前端地址: http://${DEV_HOST}:5173"
   echo "手机入口: http://${DEV_HOST}:5173/mobile"
-  if [[ "$DEV_HOST" == "0.0.0.0" ]]; then
-    echo "局域网访问时，请把 0.0.0.0 替换为本机局域网 IP。"
-  fi
+  if [[ "$LAN_ENABLED" == 1 ]]; then for address in "${LAN_ADDRESSES[@]}"; do echo "局域网入口: https://${address}:${LAN_PORT}"; done; fi
 }
 
 stop_all() {
+  stop_service "局域网 HTTPS 代理" "$LAN_PROXY_PID_FILE" "lan-https-proxy.mjs" "lan-https-proxy.mjs" "$LAN_PORT"
   stop_service "后端" "$BACKEND_PID_FILE" "uvicorn codepilot.main:app" "uvicorn codepilot.main:app" "$BACKEND_PORT"
   stop_service "前端" "$FRONTEND_PID_FILE" "pnpm dev --host" "vite.js --host" "$FRONTEND_PORT"
 }

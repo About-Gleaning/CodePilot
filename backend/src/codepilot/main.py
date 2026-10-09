@@ -11,7 +11,7 @@ import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,6 +61,8 @@ class AppContext:
     auth_store: AuthStore
     auth_service: AuthService
     migration_required: bool
+    hook_tests: Any = None
+    tool_tests: Any = None
 
 
 def create_app() -> FastAPI:
@@ -99,6 +101,7 @@ def create_app() -> FastAPI:
     )
     runtime.tool_registry.register(schedule_tool)
     agent_config_service = MultiUserAgentConfigService(
+        workspace_path=workspace.workspace_path,
         settings=settings,
         shared_root=workspace.codepilot_home / "agents" / "shared",
         users_root=workspace.codepilot_home / "users",
@@ -113,10 +116,13 @@ def create_app() -> FastAPI:
         settings=settings,
         workspace=workspace,
         profile_provider=agent_config_service,
+        session_memory=runtime.session_memory,
+        event_store=runtime.event_store,
     )
     schedule_tool._store = schedule_coordinator
     schedule_tool._runner = schedule_coordinator
     agent_runtime = AgentRuntimeManager(
+        schedule_coordinator=schedule_coordinator,
         workspace=workspace,
         config=settings,
         event_bus=runtime.event_bus,
@@ -168,6 +174,10 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            if app_state.tool_tests is not None:
+                await app_state.tool_tests.shutdown()
+            if app_state.hook_tests is not None:
+                await app_state.hook_tests.shutdown()
             await app_state.auth_service.shutdown()
             await app_state.schedule_coordinator.shutdown()
             await app_state.agent_runtime.shutdown()
@@ -178,9 +188,9 @@ def create_app() -> FastAPI:
     app.add_middleware(LocalAccessMiddleware)
     app.add_middleware(AuthenticationMiddleware)
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]"]
-    if settings.auth.public_origin:
+    for origin in {origin for origin in [settings.auth.public_origin, *settings.auth.public_origins] if origin}:
         from urllib.parse import urlsplit
-        public_host = urlsplit(settings.auth.public_origin).hostname
+        public_host = urlsplit(origin).hostname
         if public_host:
             allowed_hosts.append(public_host)
     app.add_middleware(

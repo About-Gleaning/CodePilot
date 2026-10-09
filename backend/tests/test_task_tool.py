@@ -157,6 +157,15 @@ def test_task_tool_rejects_subagent_caller(tmp_path: Path) -> None:
     assert loop.calls == []
 
 
+def test_task_tool_rejects_target_outside_explicit_selection(tmp_path: Path) -> None:
+    loop = FakeSubagentLoop()
+    tool = build_tool(loop)
+    context = build_context(tmp_path, agent=SimpleNamespace(name="build", kind="agent", can_call_subagent=True, subagent_ids=[]))
+    result = run_tool(tool, {"agent_id": "explore", "task": "读取文件"}, context)
+    assert result["error_type"] == "TaskTargetForbidden"
+    assert loop.calls == []
+
+
 def test_task_tool_rejects_non_subagent_target(tmp_path: Path) -> None:
     loop = FakeSubagentLoop()
     tool = build_tool(loop)

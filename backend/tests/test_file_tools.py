@@ -329,7 +329,7 @@ def test_write_plan_writes_fixed_session_plan_file(tmp_path: Path) -> None:
 
     result = run_tool(WritePlanTool(timeout_seconds=1), {"content": "# 执行计划\n"}, context)
 
-    plan_path = workspace_dir / "plans" / "session_1.md"
+    plan_path = tmp_path / ".codepilot" / "plans" / "session_1.md"
     assert result["status"] == "ok"
     assert result["plan_path"] == str(plan_path)
     assert plan_path.read_text(encoding="utf-8") == "# 执行计划\n"

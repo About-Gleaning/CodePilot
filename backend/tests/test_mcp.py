@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import asyncio
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -54,6 +55,123 @@ class FakeSession:
             structuredContent={"created": not self.is_error},
             isError=self.is_error,
         )
+
+
+@pytest.mark.asyncio
+async def test_discovery_rejects_code_tool_name_collision(monkeypatch, tmp_path):
+    from codepilot.session.agent_config import AgentConfigError
+    from codepilot.tools.code_store import ToolStore
+    from codepilot.tools.python_code_tool import PythonCodeTool
+    from test_python_tools import named_payload
+    from uuid import uuid4
+    user = str(uuid4())
+    store = ToolStore(tmp_path)
+    record = store.save(user, None, named_payload())
+    tool = PythonCodeTool(store, user, record['tool_id'], record['version'])
+    registry = ToolRegistry(); registry.register(tool)
+    @asynccontextmanager
+    async def open_fake(*args, **kwargs):
+        yield FakeSession()
+    monkeypatch.setattr('codepilot.tools.mcp._open_session', open_fake)
+    # 注入发现名称冲突，验证运行装配保护，而非依赖保留前缀永不冲突。
+    monkeypatch.setattr('codepilot.tools.mcp.build_mcp_tool_name', lambda *args: 'test_tool')
+    manager = McpClientManager(_settings(), SimpleNamespace(workspace_path=tmp_path), registry)
+    try:
+        with pytest.raises(AgentConfigError) as caught:
+            await manager.start()
+        assert caught.value.code == 'tool_name_conflict'
+        assert registry.get('test_tool') is tool
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_personal_mcp_schemas_and_revocation_are_isolated(monkeypatch, tmp_path):
+    calls = []
+    revoked = False
+
+    class IdentitySession(FakeSession):
+        def __init__(self, identity):
+            super().__init__()
+            self.identity = identity
+
+        async def list_tools(self):
+            return SimpleNamespace(tools=[SimpleNamespace(name=self.identity, description="专用工具", inputSchema={"type": "object"})])
+
+        async def call_tool(self, name, arguments):
+            calls.append(self.identity)
+            return SimpleNamespace(content=[], isError=False)
+
+    @asynccontextmanager
+    async def open_identity(config, workspace, credentials):
+        yield IdentitySession(credentials["identity"])
+
+    def guard():
+        if revoked:
+            raise ValueError("连接已撤销")
+
+    monkeypatch.setattr("codepilot.tools.mcp._open_session", open_identity)
+    registries = [ToolRegistry(), ToolRegistry()]
+    managers = [McpClientManager(_settings(), SimpleNamespace(workspace_path=tmp_path), registry,
+                 credentials={"github": {"identity": identity}}, guards={"github": guard})
+                for registry, identity in zip(registries, ["first", "second"])]
+    try:
+        for manager in managers:
+            await manager.start()
+        assert registries[0].get(build_mcp_tool_name("github", "first")) is not None
+        assert registries[0].get(build_mcp_tool_name("github", "second")) is None
+        assert registries[1].get(build_mcp_tool_name("github", "first")) is None
+        await managers[0].call_tool("github", "first", {})
+        revoked = True
+        with pytest.raises(RuntimeError, match="McpServerUnavailable"):
+            await managers[1].call_tool("github", "second", {})
+        assert calls == ["first"]
+    finally:
+        for manager in managers:
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_multiple_connection_identities_share_service_capacity(monkeypatch, tmp_path):
+    release = asyncio.Event()
+    five_started = asyncio.Event()
+    running = peak = 0
+
+    class BlockingSession(FakeSession):
+        async def call_tool(self, name, arguments):
+            nonlocal running, peak
+            running += 1
+            peak = max(peak, running)
+            if running == 5:
+                five_started.set()
+            try:
+                await release.wait()
+                return SimpleNamespace(content=[], isError=False)
+            finally:
+                running -= 1
+
+    @asynccontextmanager
+    async def open_session(config, workspace):
+        yield BlockingSession()
+
+    monkeypatch.setattr("codepilot.tools.mcp._open_session", open_session)
+    managers = [McpClientManager(_settings(), SimpleNamespace(workspace_path=tmp_path), ToolRegistry()) for _ in range(2)]
+    pending = []
+    try:
+        for manager in managers:
+            await manager.start()
+        pending = [asyncio.create_task(managers[index % 2].call_tool("github", "create.issue", {})) for index in range(25)]
+        await asyncio.wait_for(five_started.wait(), 2)
+        with pytest.raises(RuntimeError, match="McpCapacityExceeded"):
+            await managers[1].call_tool("github", "create.issue", {})
+        release.set()
+        await asyncio.gather(*pending)
+        assert peak == 5
+    finally:
+        release.set()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for manager in managers:
+            await manager.shutdown()
 
 
 def _settings(*, requires_approval: bool = False) -> McpSettings:

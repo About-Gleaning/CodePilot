@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from codepilot.config.settings import resolve_thinking_value
 from codepilot.events import HumanInteractionEvent, SessionLifecycleEvent, StreamEvent
 from codepilot.hooks import HookManager, HookType, RuntimeHandles
 from codepilot.llm import LiteLLMClient
@@ -115,6 +116,15 @@ class AgentLoop:
         这是会话层的主入口。它会先完成会话级 Hook，再进入按轮次推进的主循环。
         单轮内部如何调用模型、工具和局部 Hook，不在这里展开，而是交给 `TurnExecutor`。
         """
+        runtime.stop_event = stop_event
+        if not runtime.assembly_ready:
+            from codepilot.session.assembly import assemble_loop
+            runtime.assembly_ready = True
+            async with assemble_loop(self, agent_profile, workspace, config, runtime) as scoped:
+                return await scoped.run(session, workspace, agent_profile, runtime, config, approval_event,
+                                        approval_result_holder, stop_event, question_event, question_result_holder,
+                                        allow_manual_approval, allow_question_interaction)
+        self._prepare_skills(runtime, workspace, agent_profile)
         ctx = _RunContext(
             session=session,
             workspace=workspace,
@@ -131,6 +141,8 @@ class AgentLoop:
             allow_manual_approval=allow_manual_approval,
             allow_question_interaction=allow_question_interaction,
         )
+        self._bind_hook_approval(ctx)
+        await self._record_execution_config(ctx)
 
         try:
             should_continue = await self._run_session_before(ctx)
@@ -139,16 +151,7 @@ class AgentLoop:
         finally:
             if runtime.inbox is not None:
                 await runtime.inbox.close()
-            # SESSION_AFTER 放在 finally 中，保证无论是成功、失败还是取消，都能执行收尾 Hook。
-            await self._turn_executor.run_hook(
-                HookType.SESSION_AFTER,
-                session=session,
-                workspace=workspace,
-                agent_state=ctx.agent_state,
-                llm_state=ctx.llm_state,
-                runtime=runtime,
-                config=config,
-            )
+            await self._run_final_hooks(ctx)
         return await self._finish(session, runtime)
 
     async def run_subagent(
@@ -164,7 +167,27 @@ class AgentLoop:
         stop_event: Any,
     ) -> SessionState:
         """执行一次独立 subagent loop，只沉淀消息和工具事件，不发布父会话生命周期。"""
+        runtime.stop_event = stop_event
+        if not runtime.assembly_ready:
+            from codepilot.session.assembly import assemble_loop
+            runtime.assembly_ready = True
+            async with assemble_loop(self, agent_profile, workspace, config, runtime) as scoped:
+                return await scoped.run_subagent(parent_session=parent_session, workspace=workspace, agent_profile=agent_profile,
+                                                 task=task, parent_call_id=parent_call_id, runtime=runtime, config=config, stop_event=stop_event)
         context_id = new_context_id()
+        self._prepare_skills(runtime, workspace, agent_profile)
+        # 旧子配置未指定模型时继承父模型；显式选择则使用自己的完整模型配置。
+        provider = agent_profile.default_provider or parent_session.provider
+        model = agent_profile.default_model or parent_session.model
+        child_metadata = dict(parent_session.metadata)
+        if agent_profile.default_provider or agent_profile.default_model:
+            configured_provider = config.llm_runtime.activated_providers.get(provider)
+            if configured_provider is None or model not in configured_provider.models:
+                raise ValueError("子 Agent 的模型依赖不可用，请先完成配置")
+            child_metadata["thinking_value"] = resolve_thinking_value(
+                config, provider, model, {"thinking_value": agent_profile.default_thinking_value},
+            )
+            child_metadata["thinking_enabled"] = bool(child_metadata["thinking_value"])
         child_session = SessionState(
             user_id=parent_session.user_id,
             session_id=parent_session.session_id,
@@ -172,16 +195,20 @@ class AgentLoop:
             workspace_id=parent_session.workspace_id,
             workspace_path=parent_session.workspace_path,
             agent_name=agent_profile.name,
-            provider=parent_session.provider,
-            model=parent_session.model,
+            agent_id=agent_profile.agent_id,
+            provider=provider,
+            model=model,
             status=SessionStatus.RUNNING,
             created_at=utc_now_iso(),
             updated_at=utc_now_iso(),
             metadata={
-                **parent_session.metadata,
+                **child_metadata,
                 "agent_context_id": context_id,
                 "parent_call_id": parent_call_id,
-                "agent_kind": agent_profile.kind,
+                "agent_kind": "subagent",
+                "invocation_role": "delegate",
+                "agent_depth": int(parent_session.metadata.get("agent_depth", 0)) + 1,
+                "parent_agent_id": parent_session.agent_id,
             },
         )
         agent_state = self._build_agent_state(
@@ -190,8 +217,10 @@ class AgentLoop:
             context_id=context_id,
             parent_call_id=parent_call_id,
         )
+        if parent_session.metadata.get("allow_question_interaction") is False:
+            agent_state.allowed_tools = [name for name in agent_state.allowed_tools if name != "question"]
         child_session.messages.append(
-            self._build_subagent_task_message(parent_session, agent_state, task)
+            self._build_subagent_task_message(child_session, agent_state, task)
         )
         ctx = _RunContext(
             session=child_session,
@@ -199,17 +228,19 @@ class AgentLoop:
             agent_profile=agent_profile,
             runtime=runtime,
             config=config,
-            approval_event=None,
-            approval_result_holder={"result": None},
-            question_event=None,
-            question_result_holder={"result": None},
+            approval_event=runtime.interaction_channel.approval_event if runtime.interaction_channel else None,
+            approval_result_holder=runtime.interaction_channel.approval_result_holder if runtime.interaction_channel else {"result": None},
+            question_event=runtime.interaction_channel.question_event if runtime.interaction_channel else None,
+            question_result_holder=runtime.interaction_channel.question_result_holder if runtime.interaction_channel else {"result": None},
             stop_event=stop_event,
             agent_state=agent_state,
-            llm_state=self._build_llm_state(parent_session, config),
+            llm_state=self._build_llm_state(child_session, config),
             allow_manual_approval=parent_session.metadata.get("allow_manual_approval") is not False,
             allow_question_interaction=parent_session.metadata.get("allow_question_interaction") is not False,
         )
         task_message = child_session.messages.pop()
+        self._bind_hook_approval(ctx)
+        await self._record_execution_config(ctx)
         await self._message_appender.append(child_session, task_message, runtime)
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
@@ -219,8 +250,96 @@ class AgentLoop:
                 data={**self._agent_event_data(agent_state), "message": task_message.model_dump()},
             )
         )
-        await self._run_iterations(ctx)
+        try:
+            if await self._run_session_before(ctx):
+                await self._run_iterations(ctx)
+        finally:
+            await self._run_final_hooks(ctx)
         return child_session
+
+    def _bind_hook_approval(self, ctx: _RunContext) -> None:
+        async def wait(result):
+            if ctx.session.status in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
+                return result.model_copy(update={"requires_human_input": False, "human_request": None, "stop_loop": True})
+            # 消息和事件先落入历史；恢复时仅返回控制结果，避免调用方再次应用副作用。
+            effects = result.model_copy(update={"requires_human_input": False, "human_request": None})
+            await self._message_appender.apply_hook_result(ctx.session, effects, ctx.runtime)
+            if result.fail_session or result.stop_loop or result.human_request is None:
+                return effects.model_copy(update={"messages_to_append": [], "events_to_emit": [], "context_patch": {}})
+            import asyncio
+            waiting = asyncio.create_task(self._resolve_approval(ctx, PendingApproval(request=result.human_request, source="hook")))
+            stopping = asyncio.create_task(ctx.stop_event.wait())
+            try:
+                await asyncio.wait({waiting, stopping}, return_when=asyncio.FIRST_COMPLETED)
+                decision = waiting.result() if waiting.done() else None
+                if ctx.stop_event.is_set():
+                    ctx.session.status = SessionStatus.CANCELLED
+            finally:
+                for task in (waiting, stopping):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(waiting, stopping, return_exceptions=True)
+            approved = decision is not None and decision.approved and not ctx.stop_event.is_set()
+            return result.model_copy(update={
+                "messages_to_append": [], "events_to_emit": [], "context_patch": {},
+                "requires_human_input": False, "human_request": None,
+                "stop_loop": not approved, "fail_session": ctx.session.status == SessionStatus.FAILED,
+            })
+        ctx.runtime.hook_approval = wait
+
+    async def _record_execution_config(self, ctx: _RunContext) -> None:
+        from codepilot.events import DomainEvent
+        from codepilot.events.definitions import DomainEventType
+
+        # 只记录身份和确定版本；凭证正文、Prompt 和 Hook 的服务配置不进入记录。
+        await ctx.runtime.event_bus.publish_domain_event(DomainEvent(
+            event_type=DomainEventType.EXECUTION_CONFIG, session_id=ctx.session.session_id, created_at=utc_now_iso(),
+            data={"context_id": ctx.agent_state.context_id, "parent_call_id": ctx.agent_state.parent_call_id,
+                  "agent_id": ctx.agent_profile.agent_id, "revision_id": ctx.agent_profile.revision_id,
+                  "agent_kind": ctx.agent_profile.kind, "provider": ctx.session.provider, "model": ctx.session.model,
+                  "skill_ids": [skill.metadata.get("skill_id", skill.name) for skill in ctx.runtime.skill_registry.skills] if ctx.runtime.skill_registry else [],
+                  "tool_versions": ctx.agent_profile.resolved_tool_versions,
+                  "hook_versions": ctx.agent_profile.resolved_hook_versions,
+                  "platform_hook_versions": ctx.agent_profile.resolved_platform_hook_versions,
+                  "connection_versions": ctx.agent_profile.resolved_connection_versions},
+        ))
+
+    async def _run_final_hooks(self, ctx: _RunContext) -> None:
+        terminal = ctx.session.status
+        if ctx.stop_event.is_set() or terminal == SessionStatus.CANCELLED:
+            return
+        result = await self._turn_executor.run_hook(
+            HookType.SESSION_AFTER, session=ctx.session, workspace=ctx.workspace, agent_state=ctx.agent_state,
+            llm_state=ctx.llm_state, runtime=ctx.runtime, config=ctx.config,
+        )
+        if terminal in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
+            ctx.session.status = terminal
+            return
+        if terminal == SessionStatus.COMPLETED and ctx.session.status == SessionStatus.RUNNING:
+            ctx.session.status = terminal
+        if result.requires_human_input and result.human_request and ctx.session.status != SessionStatus.FAILED:
+            approval = await self._resolve_approval(ctx, PendingApproval(request=result.human_request, source="hook"))
+            if ctx.stop_event.is_set():
+                ctx.session.status = SessionStatus.CANCELLED
+            elif ctx.session.status != SessionStatus.FAILED:
+                ctx.session.status = terminal if approval is not None and approval.approved else SessionStatus.CANCELLED
+
+    def _prepare_skills(self, runtime: RuntimeHandles, workspace: Any, profile: AgentProfile) -> None:
+        from codepilot.skills.store import SkillStore
+
+        legacy = self._turn_executor.skill_registry
+        home = getattr(workspace, "codepilot_home", None)
+        if legacy is None or home is None:
+            if profile.skill_ids:
+                raise ValueError("Skill 运行环境不可用")
+            return
+        from codepilot.skills import SkillRegistry
+        legacy = SkillRegistry(legacy.skills_root)
+        if not profile.publication_id:
+            legacy.discover()
+        runtime.skill_registry = SkillStore(home).resolve(
+            getattr(workspace, "user_id", ""), profile.skill_ids, legacy,
+        )
 
     def _build_agent_state(
         self,
@@ -231,19 +350,30 @@ class AgentLoop:
         parent_call_id: str | None = None,
     ) -> AgentState:
         resolved_context_id = context_id or str(session.metadata.get("agent_context_id") or "main")
+        invocation_role = "delegate" if parent_call_id or session.metadata.get("invocation_role") == "delegate" else "root"
+        legacy_kind = "subagent" if invocation_role == "delegate" else "agent"
         return AgentState(
+            publication_children=agent_profile.publication_children,
             agent_id=agent_profile.agent_id,
             visibility=agent_profile.visibility,
             name=agent_profile.name,
-            role=agent_profile.kind,
-            kind=agent_profile.kind,
+            role=invocation_role,
+            kind=legacy_kind,
+            invocation_role=invocation_role,
             allowed_tools=agent_profile.allowed_tools,
+            tool_ids=agent_profile.tool_ids,
             readonly=agent_profile.readonly,
             context_id=resolved_context_id,
             parent_call_id=parent_call_id or session.metadata.get("parent_call_id"),
             depth=int(session.metadata.get("agent_depth", 0)),
             parent_agent_id=session.metadata.get("parent_agent_id"),
-            can_call_subagent=agent_profile.can_call_subagent,
+            can_call_subagent=agent_profile.can_delegate,
+            can_delegate=agent_profile.can_delegate,
+            memory_enabled=agent_profile.memory_enabled,
+            subagent_ids=agent_profile.delegate_agent_ids,
+            delegate_agent_ids=agent_profile.delegate_agent_ids,
+            hook_ids=agent_profile.hook_ids,
+            hook_parameters=agent_profile.hook_parameters,
         )
 
     def _build_subagent_task_message(self, session: SessionState, agent_state: AgentState, task: str) -> Message:
@@ -289,7 +419,7 @@ class AgentLoop:
             runtime=ctx.runtime,
             config=ctx.config,
         )
-        if ctx.session.status == SessionStatus.FAILED:
+        if ctx.session.status in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
             return False
 
         if session_before.requires_human_input and session_before.human_request:
@@ -368,6 +498,8 @@ class AgentLoop:
         if ctx.stop_event.is_set():
             ctx.session.status = SessionStatus.CANCELLED
             return False
+        if ctx.session.status in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
+            return False
         if turn_result.status == "completed" and ctx.runtime.inbox is not None:
             return await ctx.runtime.inbox.complete(ctx.session)
         if turn_result.status in {"completed", "stopped"}:
@@ -382,9 +514,6 @@ class AgentLoop:
                     ctx,
                     interaction_id=turn_result.pending_question.request.question_id,
                 )
-                return False
-            if ctx.agent_state.kind == "subagent":
-                await self._fail_subagent_question(ctx, turn_result.pending_question)
                 return False
             return await self._handle_pending_question(ctx, turn_result.pending_question, iteration, turn_result.resume_batch)
         if turn_result.status != "needs_approval" or turn_result.pending_approval is None:
@@ -408,7 +537,7 @@ class AgentLoop:
         stop_after_approval: bool = False,
     ) -> bool:
         """处理单轮执行产生的人工审批，并按原逻辑恢复可能挂起的工具调用。"""
-        if ctx.agent_state.kind == "subagent" and ctx.allow_manual_approval:
+        if ctx.agent_state.invocation_role == "delegate" and ctx.runtime.interaction_channel is None:
             await self._fail_subagent_human_approval(ctx, approval)
             return False
         result = await self._resolve_approval(ctx, approval)
@@ -497,6 +626,9 @@ class AgentLoop:
         resume_batch: ToolResumeBatch | None = None,
     ) -> bool:
         """处理 question 工具等待；回答后回填工具结果，拒答后结束当前 run。"""
+        if ctx.agent_state.invocation_role == "delegate" and ctx.runtime.interaction_channel is None:
+            await self._fail_subagent_question(ctx, question)
+            return False
         result = await self._wait_for_question(ctx, question)
         if result is None:
             return False
@@ -519,9 +651,6 @@ class AgentLoop:
                         interaction_id=batch.pending_question.request.question_id,
                     )
                     return False
-                if ctx.agent_state.kind == "subagent":
-                    await self._fail_subagent_question(ctx, batch.pending_question)
-                    return False
                 return await self._handle_pending_question(ctx, batch.pending_question, iteration, batch.resume_batch)
         return await self._run_loop_after_approved_tool(ctx, iteration)
 
@@ -540,6 +669,7 @@ class AgentLoop:
                 interaction_id=result.question_id,
                 created_at=result.created_at,
                 data={
+                    **self._agent_event_data(ctx.agent_state),
                     "kind": "question",
                     "status": status,
                     "interaction_id": result.question_id,
@@ -568,7 +698,29 @@ class AgentLoop:
 
     async def _resolve_approval(self, ctx: _RunContext, approval: PendingApproval) -> ApprovalResult | None:
         """按运行策略等待人工审批，或在自动模式下直接放行可审批操作。"""
+        if ctx.agent_state.invocation_role == "delegate" and ctx.runtime.interaction_channel is None:
+            await self._fail_subagent_human_approval(ctx, approval)
+            return ApprovalResult(
+                approval_id=approval.request.approval_id,
+                approved=False,
+                comment="当前运行环境不支持委派人工等待。",
+                created_at=utc_now_iso(),
+            )
+        if approval.source in {"hook", "hook_tool"}:
+            if not ctx.allow_question_interaction or ctx.approval_event is None:
+                ctx.session.status = SessionStatus.FAILED
+                ctx.session.stop_reason = "hook_requires_human"
+                return ApprovalResult(approval_id=approval.request.approval_id, approved=False,
+                                      comment="当前执行环境不支持 Hook 人工等待。", created_at=utc_now_iso())
+            return await self._approval_coordinator.wait(
+                session=ctx.session, approval=approval, agent_state=ctx.agent_state, runtime=ctx.runtime,
+                approval_event=ctx.approval_event, approval_result_holder=ctx.approval_result_holder,
+            )
         if not ctx.allow_manual_approval:
+            if approval.source in {"hook", "hook_tool"} and not ctx.allow_question_interaction:
+                ctx.session.status = SessionStatus.FAILED
+                return ApprovalResult(approval_id=approval.request.approval_id, approved=False,
+                                      comment="当前执行环境不支持 Hook 人工等待。", created_at=utc_now_iso())
             return ApprovalResult(
                 approval_id=approval.request.approval_id,
                 approved=True,
@@ -635,9 +787,22 @@ class AgentLoop:
             merge_approved_tool_results(ctx.session, batch.tool_parts)
             await self._message_appender._persist_snapshot(ctx.session, ctx.session.messages[-1], ctx.runtime)
             await self._turn_executor.publish_assistant_message_completed(ctx.session, ctx.session.messages[-1], ctx.runtime)
+        if batch.hook_result is not None:
+            ctx.runtime.tool_hook_control = batch.hook_result
         return batch
 
     async def _run_loop_after_approved_tool(self, ctx: _RunContext, iteration: int) -> bool:
+        control = ctx.runtime.tool_hook_control
+        ctx.runtime.tool_hook_control = None
+        if control is not None:
+            if control.fail_session:
+                return False
+            if control.requires_human_input and control.human_request:
+                result = await self._resolve_approval(ctx, PendingApproval(request=control.human_request, source="hook"))
+                if result is None or self._is_rejected(result):
+                    return False
+            if control.stop_loop:
+                return False
         loop_after = await self._turn_executor.run_loop_after(
             HookType.LOOP_AFTER,
             session=ctx.session,
@@ -665,7 +830,7 @@ class AgentLoop:
                 event_type="loop_started",
                 session_id=ctx.session.session_id,
                 created_at=utc_now_iso(),
-                data=self._agent_event_data(ctx.agent_state),
+                data={**self._agent_event_data(ctx.agent_state), "max_iterations": ctx.agent_profile.max_iterations},
             )
         )
 
@@ -703,7 +868,9 @@ class AgentLoop:
     def _agent_event_data(self, agent_state: AgentState) -> dict[str, Any]:
         return {
             "agent": agent_state.name,
+            "agent_id": agent_state.agent_id,
             "agent_kind": agent_state.kind,
+            "invocation_role": agent_state.invocation_role,
             "context_id": agent_state.context_id,
             "parent_call_id": agent_state.parent_call_id,
         }

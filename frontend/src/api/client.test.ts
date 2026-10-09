@@ -8,6 +8,11 @@ afterEach(() => {
 });
 
 describe('认证 API Client', () => {
+  it('保留配置问题和修复建议', async () => {
+    const issues = [{ code: 'tool_unavailable', field: 'tool_names', message: '工具不可用：old_tool', suggestion: '请移除旧工具。' }];
+    vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify({ detail: { code: 'agent_dependencies_missing', message: '依赖不可用', issues } }), { status: 409 }));
+    await expect(apiRequest('/api/agents/test/start')).rejects.toMatchObject({ code: 'agent_dependencies_missing', issues });
+  });
   it('写请求自动携带 Cookie 与 CSRF Header', async () => {
     document.cookie = 'codepilot_dev_csrf=csrf-token; Path=/';
     const fetchMock = vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), {
@@ -33,4 +38,11 @@ describe('认证 API Client', () => {
     expect(listener).toHaveBeenCalledOnce();
     window.removeEventListener(AUTH_EXPIRED_EVENT, listener);
   });
+});
+
+it('发布失败保留逐项结果与可重试标记', async () => {
+  const progress = [{ resource_id: 'tool', resource_name: '查询工具', action: 'restore', status: 'completed' }];
+  const issues = [{ code: 'publication_changed', message: '资源已变化', resource_kind: 'tool', resource_name: '查询工具', referenced_by: [{ agent_id: 'a', name: '助手' }] }];
+  vi.spyOn(window, 'fetch').mockResolvedValue(new Response(JSON.stringify({ detail: { code: 'publication_storage_error', message: '保存失败', progress, issues, retryable: true } }), { status: 503 }));
+  await expect(apiJson('/api/agent-publications/confirm', 'POST', {})).rejects.toMatchObject({ progress, issues, retryable: true });
 });

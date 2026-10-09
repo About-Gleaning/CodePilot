@@ -10,6 +10,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
+from weakref import WeakKeyDictionary
 
 import httpx
 from mcp import ClientSession, StdioServerParameters
@@ -19,6 +20,7 @@ from mcp.client.streamable_http import streamable_http_client
 from codepilot.config.settings import McpServerSettings, McpSettings, McpStdioServerSettings
 from codepilot.logging import get_logger
 from codepilot.session.attachments import AttachmentError, attachment_message_dir, decode_image_attachment
+from codepilot.session.agent_config import AgentConfigError
 from codepilot.tools.base import BaseTool, ToolExecutionContext, ToolSpec
 
 
@@ -39,19 +41,36 @@ class _ServerRuntime:
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
     error: str | None = None
+    registration_error: AgentConfigError | None = None
     discovered_tools: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _ServiceCapacity:
+    semaphore: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(5))
+    admitted: int = 0
+
+
+_CAPACITY: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def _capacity(server: str) -> _ServiceCapacity:
+    services = _CAPACITY.setdefault(asyncio.get_running_loop(), {})
+    return services.setdefault(server, _ServiceCapacity())
 
 
 class McpClientManager:
     """维护 MCP 连接，并把远端能力注册为 CodePilot 工具。"""
 
-    def __init__(self, settings: McpSettings, workspace: Any, tool_registry: Any) -> None:
+    def __init__(self, settings: McpSettings, workspace: Any, tool_registry: Any, *, credentials: dict[str, dict[str, str]] | None = None, guards: dict[str, Any] | None = None) -> None:
         self._settings = settings
         self._workspace = workspace
         self._tool_registry = tool_registry
         self._servers: dict[str, _ServerRuntime] = {}
         self._logger = get_logger("codepilot.mcp")
         self._started = False
+        self._credentials = credentials or {}
+        self._guards = guards or {}
 
     async def start(self) -> None:
         if self._started:
@@ -65,6 +84,9 @@ class McpClientManager:
             runtime.task = asyncio.create_task(self._run_server(runtime), name=f"mcp-{name}")
         if self._servers:
             await asyncio.gather(*(runtime.ready.wait() for runtime in self._servers.values()))
+            for runtime in self._servers.values():
+                if runtime.registration_error is not None:
+                    raise runtime.registration_error
 
     async def shutdown(self) -> None:
         if not self._started:
@@ -99,9 +121,14 @@ class McpClientManager:
         if runtime is None or runtime.error is not None or runtime.task is None or runtime.task.done():
             raise RuntimeError("McpServerUnavailable")
         future = asyncio.get_running_loop().create_future()
+        capacity = _capacity(server_name)
+        if capacity.admitted >= 25:
+            raise RuntimeError("McpCapacityExceeded")
+        capacity.admitted += 1
         try:
             runtime.queue.put_nowait(_CallRequest(tool_name=tool_name, arguments=arguments, future=future))
         except asyncio.QueueFull as exc:
+            capacity.admitted -= 1
             raise RuntimeError("McpCapacityExceeded") from exc
         try:
             return await future
@@ -114,7 +141,8 @@ class McpClientManager:
             async with AsyncExitStack() as stack:
                 async with asyncio.timeout(runtime.config.timeout_seconds):
                     session = await stack.enter_async_context(
-                        _open_session(runtime.config, self._workspace.workspace_path)
+                        _open_session(runtime.config, self._workspace.workspace_path, self._credentials[runtime.name])
+                        if runtime.name in self._credentials else _open_session(runtime.config, self._workspace.workspace_path)
                     )
                     await session.initialize()
                     tools = (await session.list_tools()).tools
@@ -130,6 +158,8 @@ class McpClientManager:
                 ]
                 await asyncio.gather(*workers)
         except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, AgentConfigError) and exc.code == 'tool_name_conflict':
+                runtime.registration_error = exc
             # 连接错误不包含底层地址或凭证；已经发出的调用绝不自动重放。
             runtime.error = exc.__class__.__name__
             self._logger.error(
@@ -142,6 +172,7 @@ class McpClientManager:
             while not runtime.queue.empty():
                 queued = runtime.queue.get_nowait()
                 if queued is not None:
+                    _capacity(runtime.name).admitted -= 1
                     _set_future_exception(queued.future, RuntimeError("McpServerUnavailable"))
 
     async def _consume_calls(self, runtime: _ServerRuntime, session: ClientSession) -> None:
@@ -150,21 +181,34 @@ class McpClientManager:
             if request is None:
                 return
             if request.future.cancelled():
+                _capacity(runtime.name).admitted -= 1
                 continue
+            sent = False
             try:
-                async with asyncio.timeout(runtime.config.timeout_seconds):
-                    result = await session.call_tool(request.tool_name, arguments=request.arguments)
+                async with _capacity(runtime.name).semaphore:
+                    if request.future.cancelled():
+                        continue
+                    guard = self._guards.get(runtime.name)
+                    if guard is not None:
+                        guard()
+                    async with asyncio.timeout(runtime.config.timeout_seconds):
+                        sent = True
+                        result = await session.call_tool(request.tool_name, arguments=request.arguments)
             except Exception:
-                _set_future_exception(request.future, RuntimeError("McpOutcomeUncertain"))
+                _set_future_exception(request.future, RuntimeError("McpOutcomeUncertain" if sent else "McpServerUnavailable"))
             else:
                 _set_future_result(request.future, result)
+            finally:
+                _capacity(runtime.name).admitted -= 1
 
     def _register_tools(self, runtime: _ServerRuntime, tools: list[Any]) -> None:
         used_names: set[str] = set()
         for remote_tool in tools:
             remote_name = str(remote_tool.name)
             local_name = build_mcp_tool_name(runtime.name, remote_name)
-            if local_name in used_names or self._tool_registry.get(local_name) is not None:
+            existing = self._tool_registry.get(local_name)
+            # 代码工具冲突交给注册表明确拒绝，不能按原 MCP 重名策略跳过。
+            if local_name in used_names or existing is not None and not getattr(existing, 'code_tool_id', None):
                 self._logger.error("mcp tool name collision", server=runtime.name, tool=remote_name)
                 continue
             used_names.add(local_name)
@@ -265,19 +309,20 @@ class McpToolAdapter(BaseTool):
 
 
 @asynccontextmanager
-async def _open_session(config: McpServerSettings, workspace_path: Path) -> AsyncIterator[ClientSession]:
+async def _open_session(config: McpServerSettings, workspace_path: Path, credentials: dict[str, str] | None = None) -> AsyncIterator[ClientSession]:
     if isinstance(config, McpStdioServerSettings):
         cwd = _resolve_stdio_cwd(config.cwd, workspace_path)
         # stdio MCP 服务通常依赖 PATH、HOME 等运行环境；仅覆盖显式映射的密钥变量。
-        env = dict(os.environ)
-        env.update(_resolve_env(config.env_from_process))
+        env = dict(os.environ) if credentials is None else {key: os.environ[key] for key in ("PATH", "HOME", "LANG", "TMPDIR") if key in os.environ}
+        env.pop("CODEPILOT_CONNECTION_KEY", None)
+        env.update(_resolve_env(config.env_from_process, credentials))
         parameters = StdioServerParameters(command=config.command, args=config.args, env=env, cwd=cwd)
         async with stdio_client(parameters) as (read, write):
             async with ClientSession(read, write) as session:
                 yield session
         return
 
-    headers = _resolve_env(config.headers_from_env)
+    headers = _resolve_env(config.headers_from_env, credentials)
     async with httpx.AsyncClient(headers=headers, timeout=config.timeout_seconds) as http_client:
         async with streamable_http_client(config.url, http_client=http_client) as (read, write, _):
             async with ClientSession(read, write) as session:
@@ -292,11 +337,11 @@ def _resolve_stdio_cwd(raw_cwd: str | None, workspace_path: Path) -> Path:
     return target
 
 
-def _resolve_env(mapping: dict[str, str]) -> dict[str, str]:
+def _resolve_env(mapping: dict[str, str], credentials: dict[str, str] | None = None) -> dict[str, str]:
     resolved: dict[str, str] = {}
     missing: list[str] = []
     for target_name, source_name in mapping.items():
-        value = os.environ.get(source_name)
+        value = os.environ.get(source_name) if credentials is None else credentials.get(source_name)
         if value is None:
             missing.append(source_name)
         else:

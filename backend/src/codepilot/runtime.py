@@ -191,9 +191,12 @@ def build_hook_manager(settings: AppSettings) -> HookManager:
         )
     )
     for plugin in settings.hooks.plugins:
+        execution_options = {"selectable": True, "on_error": plugin.on_error, "timeout_seconds": plugin.timeout_seconds,
+                             "parameter_definitions": {key: value.model_dump() for key, value in plugin.parameters.items()}}
         if plugin.plugin_type == "prompt":
             manager.register(
                 PromptPluginHook(
+                    **execution_options,
                     hook_id=plugin.hook_id,
                     hook_type=HookType(plugin.hook_type),
                     name=plugin.hook_id,
@@ -206,6 +209,7 @@ def build_hook_manager(settings: AppSettings) -> HookManager:
         elif plugin.plugin_type == "command":
             manager.register(
                 CommandPluginHook(
+                    **execution_options,
                     hook_id=plugin.hook_id,
                     hook_type=HookType(plugin.hook_type),
                     name=plugin.hook_id,
@@ -217,6 +221,7 @@ def build_hook_manager(settings: AppSettings) -> HookManager:
         elif plugin.plugin_type == "http":
             manager.register(
                 HttpPluginHook(
+                    **execution_options,
                     hook_id=plugin.hook_id,
                     hook_type=HookType(plugin.hook_type),
                     name=plugin.hook_id,
@@ -228,6 +233,7 @@ def build_hook_manager(settings: AppSettings) -> HookManager:
         elif plugin.plugin_type == "agent":
             manager.register(
                 AgentPluginHook(
+                    **execution_options,
                     hook_id=plugin.hook_id,
                     hook_type=HookType(plugin.hook_type),
                     name=plugin.hook_id,

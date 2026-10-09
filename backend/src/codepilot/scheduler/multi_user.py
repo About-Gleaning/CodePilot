@@ -13,10 +13,12 @@ from codepilot.scheduler.store import ScheduleStore
 class UserScheduleCoordinator:
     """按用户分区调度状态，并通过 run_id 反查可信 worker 归属。"""
 
-    def __init__(self, *, settings: Any, workspace: Any, profile_provider: Any) -> None:
+    def __init__(self, *, settings: Any, workspace: Any, profile_provider: Any, session_memory: Any = None, event_store: Any = None) -> None:
         self.settings = settings
         self.workspace = workspace
         self.profile_provider = profile_provider
+        self.session_memory = session_memory
+        self.event_store = event_store
         self._stores: dict[str, ScheduleStore] = {}
         self._runners: dict[str, ScheduleRunner] = {}
         self._lock = asyncio.Lock()
@@ -56,6 +58,7 @@ class UserScheduleCoordinator:
                 agent_profiles={},
                 user_id=user_id,
                 profile_provider=self.profile_provider,
+                session_memory=self.session_memory,
             )
             self._runners[user_id] = runner
         return runner
@@ -76,18 +79,45 @@ class UserScheduleCoordinator:
         session_id: str | None,
         summary: str | None,
         error: str | None,
+        user_id: str = "",
+        **progress: Any,
     ) -> Any:
-        async with self._lock:
-            for user_id in self._known_user_ids():
-                if self.store(user_id).get_run(run_id) is not None:
-                    return await self.runner(user_id).report(
+        if user_id in self._stores and self._stores[user_id].get_run(run_id) is not None:
+            return await self.runner(user_id).report(
                         run_id,
                         status=status,
                         session_id=session_id,
                         summary=summary,
                         error=error,
+                        **progress,
                     )
         raise ValueError(f"run `{run_id}` 不存在")
+
+    def session_run(self, user_id: str, agent_id: str, session_id: str):
+        run = self.store(user_id).session_run(session_id)
+        return run if run and run.agent_id == agent_id else None
+
+    def assert_session_idle(self, user_id: str, agent_id: str, session_id: str | None) -> None:
+        if not session_id:
+            return
+        run = self.session_run(user_id, agent_id, session_id)
+        if run and (not run.worker_exited or run.status in {ScheduleRunStatus.RUNNING, ScheduleRunStatus.STOPPING, ScheduleRunStatus.PENDING}):
+            from codepilot.session.agent_runtime import RuntimeConflict
+            raise RuntimeConflict("scheduled_session_busy", "定时执行尚未结束，请等待进程收尾后再发送消息。")
+
+    def runtime_snapshot(self, run):
+        busy = not run.worker_exited or run.status in {ScheduleRunStatus.PENDING, ScheduleRunStatus.RUNNING, ScheduleRunStatus.STOPPING}
+        status = {"pending": "STARTING", "running": "RUNNING", "stopping": "STOPPING",
+                  "timeout": "FAILED", "interrupted": "CANCELLED", "skipped": "CANCELLED"}.get(run.status.value, run.status.value.upper())
+        ref = {"agent_id": run.agent_id, "session_id": run.session_id, "run_id": run.id, "revision_id": run.revision_id}
+        return {"source": "schedule", "schedule_run_id": run.id, "schedule_task_name": run.task_name,
+                "worker_exited": run.worker_exited, "can_send": not busy, "can_stop": busy,
+                "status": status, "stop_reason": run.stop_reason, "provider": run.provider, "model": run.model,
+                "phase": run.phase, "iteration": run.iteration, "max_iterations": run.max_iterations,
+                "error_summary": run.error, "started_at": run.started_at, "finished_at": run.finished_at,
+                "active_run": {**ref, "status": status, "started_at": run.started_at} if busy else None,
+                "last_run": {"ref": ref, "status": status, "started_at": run.started_at, "ended_at": run.finished_at,
+                             "error_code": run.stop_reason, "error_summary": run.error}, "pending_interaction": None}
 
     async def disable_user(self, user_id: str) -> None:
         runner = self._runners.get(user_id)

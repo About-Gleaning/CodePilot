@@ -121,11 +121,14 @@ class SessionState(BaseModel):
 
 
 class AgentState(BaseModel):
+    publication_children: dict[str, dict[str, Any]] = Field(default_factory=dict)
     agent_id: str = ""
     visibility: Literal["builtin", "shared", "private"] = "private"
     name: str
     role: str = "agent"
     kind: Literal["agent", "subagent"] = "agent"
+    invocation_role: Literal["root", "delegate"] = "root"
+    tool_ids: list[str] = Field(default_factory=list)
     allowed_tools: list[str] = Field(default_factory=list)
     readonly: bool = False
     context_id: str | None = "main"
@@ -133,6 +136,12 @@ class AgentState(BaseModel):
     depth: int = 0
     parent_agent_id: str | None = None
     can_call_subagent: bool = False
+    can_delegate: bool = False
+    memory_enabled: bool = True
+    subagent_ids: list[str] | None = None
+    delegate_agent_ids: list[str] | None = None
+    hook_ids: list[str] | None = None
+    hook_parameters: dict[str, dict[str, str | int | bool]] = Field(default_factory=dict)
 
 
 class LLMState(BaseModel):

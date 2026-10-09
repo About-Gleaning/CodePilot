@@ -9,7 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from codepilot.hooks.contracts import HookContext, HookResult
 
@@ -44,6 +44,9 @@ class BaseHook(BaseModel, ABC):
     name: str
     description: str | None = None
     enabled: bool = True
+    selectable: bool = False
+    resource_version: str | None = None
+    parameter_definitions: dict = Field(default_factory=dict)
     order: int = 100
     on_error: HookErrorPolicy = HookErrorPolicy.CONTINUE
     timeout_seconds: float | None = None

@@ -9,6 +9,8 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse
 
 from codepilot.session.attachments import AttachmentError, SUPPORTED_IMAGE_MIMES, attachment_message_dir, detect_image_mime, sanitize_attachment_filename
+from codepilot.session.working_directory import resolve_working_directory
+from codepilot.session.agent_config import AgentConfigError
 
 _SKIPPED_FILE_DIRS = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__", "dist", "node_modules"}
 
@@ -28,8 +30,40 @@ def register_workspace_routes(router: APIRouter, app_state: Any) -> None:
         return JSONResponse({"workspace_id": app_state.workspace.workspace_id, "activated_providers": providers, "agents": agent_view, "skills": app_state.skill_registry.list_briefs() if hasattr(app_state, "skill_registry") else [], "sse": settings.sse.model_dump()})
 
     @router.get("/workspace/files")
-    async def get_workspace_files(q: str = "", limit: int = Query(default=40, ge=1, le=80)) -> JSONResponse:
-        return JSONResponse({"files": await asyncio.to_thread(list_workspace_files, app_state.workspace.workspace_path, q, limit)})
+    async def get_workspace_files(request: Request, q: str = "", limit: int = Query(default=40, ge=1, le=80), agent_id: str | None = None, session_id: str | None = None) -> JSONResponse:
+        directory = app_state.workspace.workspace_path
+        try:
+            if agent_id:
+                owner = request.state.principal.user_id
+                profile = app_state.agent_config_service.get(owner, agent_id)
+                selected = profile.get("working_directory")
+                if session_id:
+                    replay = await app_state.session_memory.replay(owner, session_id)
+                    session = replay.get("session") or replay.get("runtime") or {}
+                    session = session.get("data", session)
+                    if session.get("agent_id") != agent_id:
+                        raise AgentConfigError("会话归属不匹配", status=404)
+                    selected = session.get("workspace_path")
+                directory = resolve_working_directory(app_state.settings, directory, selected)
+        except AgentConfigError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
+        return JSONResponse({"files": await asyncio.to_thread(list_workspace_files, directory, q, limit)})
+
+    @router.get("/workspace/directories")
+    async def get_directories(path: str | None = None) -> JSONResponse:
+        roots = [app_state.workspace.workspace_path, *(Path(item) for item in app_state.settings.agent.allowed_working_roots)]
+        try:
+            selected = resolve_working_directory(app_state.settings, app_state.workspace.workspace_path, path)
+            children = []
+            with os.scandir(selected) as entries:
+                for entry in entries:
+                    if len(children) == 100:
+                        break
+                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                        children.append(str(Path(entry.path).resolve()))
+            return JSONResponse({"roots": [str(root.resolve()) for root in roots], "selected": str(selected), "directories": sorted(children)}, headers={"Cache-Control": "no-store"})
+        except AgentConfigError as exc:
+            raise HTTPException(exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
 
     @router.get("/attachments/{session_id}/{message_id}/{filename}")
     async def get_attachment(session_id: str, message_id: str, filename: str, request: Request) -> FileResponse:

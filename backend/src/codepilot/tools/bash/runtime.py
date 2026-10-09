@@ -60,7 +60,7 @@ async def run_bash_command(
         "-lc",
         request.command,
         cwd=str(cwd),
-        env=dict(os.environ),
+        env={key: value for key, value in os.environ.items() if key != "CODEPILOT_CONNECTION_KEY"},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,

@@ -49,6 +49,7 @@ describe('useAgentCatalog', () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/api/agents?')) return json({ agents: [AGENT] });
+      if (url.includes('/api/agent-sessions/recent')) return json({ sessions: [] });
       return json({
         runtimes: [RUNTIME],
         capacity: { started_agents: 1, max_started_agents: 5, active_runs: 0, max_active_runs: 5 },

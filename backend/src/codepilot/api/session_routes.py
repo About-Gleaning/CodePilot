@@ -69,6 +69,11 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
     async def get_agent_runtimes(request: Request) -> JSONResponse:
         return JSONResponse(await app_state.agent_runtime.get_runtime_overview(_user_id(request)))
 
+    @router.get("/agent-sessions/recent")
+    async def get_recent_agent_sessions(request: Request) -> JSONResponse:
+        sessions = app_state.agent_runtime.list_recent_sessions(_user_id(request))
+        return JSONResponse({"sessions": sessions}, headers={"Cache-Control": "no-store"})
+
     @router.get("/agent-runtimes/stream")
     async def get_agent_runtime_stream(request: Request, cursor: str | None = None) -> StreamingResponse:
         user_id = _user_id(request)
@@ -116,7 +121,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
         except KeyError as exc:
             raise HTTPException(status_code=404, detail={"code": "agent_not_found"}) from exc
         except RuntimeConflict as exc:
-            raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)}) from exc
+            raise HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc), "issues": exc.issues}) from exc
 
     @router.post("/agents/{agent_id}/stop")
     async def stop_agent(agent_id: str, request: Request) -> JSONResponse:
@@ -150,7 +155,7 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
             raise HTTPException(
                 status_code=exc.status,
-                detail={"code": exc.code, "message": str(exc)},
+                detail={"code": exc.code, "message": str(exc), "issues": exc.issues},
                 headers=headers,
             ) from exc
         except ValueError as exc:
@@ -192,7 +197,8 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
         try:
             user_id = _user_id(request)
             # 先固定已持久化事件边界；其后的事件由 SSE 重放，重复部分由 event_id 去重。
-            latest_event_seq = app_state.event_store.latest_seq(user_id, session_id)
+            events = _event_replay(app_state.event_store, user_id, session_id, 0)
+            latest_event_seq = events[-1].seq if events else 0
             replay = await app_state.agent_runtime.validate_session_owner(user_id, agent_id, session_id)
             replay["latest_event_seq"] = latest_event_seq
             replay["runtime"] = await app_state.agent_runtime.get_session_runtime_snapshot(
@@ -201,9 +207,34 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
                 session_id,
                 replay,
             )
+            from codepilot.session.workbench import decorate_message
+            ownership = {record.get("message_id"): record.get("run_id") for record in replay.get("records", []) if record.get("record_type") == "message"}
+            data = ((replay.get("session") or {}).get("data") or {})
+            root = Path(data.get("workspace_path") or app_state.workspace.workspace_path)
+            replay["messages"] = [decorate_message(message, run_id=ownership.get(message.get("info", {}).get("id")),
+                agent_id=agent_id, session_id=session_id, root=root) for message in replay.get("messages", [])[-1000:]]
+            replay["workbench_events"] = [event.model_dump() for event in events if event.event_type in {
+                "loop_started", "loop_iteration_started", "loop_finished", "tool_call_started", "tool_call_finished", "tool_call_failed",
+            }][-240:]
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
         return JSONResponse(_safe_replay(replay))
+
+    @router.get("/agents/{agent_id}/sessions/{session_id}/artifacts/{message_id}/{call_id}")
+    async def get_session_artifact(agent_id: str, session_id: str, message_id: str, call_id: str, request: Request):
+        from codepilot.session.workbench import artifact_target
+        from fastapi.responses import FileResponse
+        try:
+            replay = await app_state.agent_runtime.validate_session_owner(_user_id(request), agent_id, session_id)
+            root = Path(replay["session"]["data"]["workspace_path"])
+            message = next(item for item in replay["messages"] if item["info"]["id"] == message_id)
+            part = next(item for item in message["parts"] if item.get("call_id") == call_id)
+            target = artifact_target(part, root)
+            if target is None:
+                raise ValueError("不可读取")
+            return FileResponse(target, filename=target.name, media_type="application/octet-stream", headers={"Cache-Control": "no-store"})
+        except (KeyError, StopIteration, ValueError, RuntimeConflict, OSError):
+            raise HTTPException(404, detail={"code": "artifact_unavailable", "message": "成果文件不存在或不允许访问。"})
 
     @router.get("/agents/{agent_id}/sessions/{session_id}/stream")
     async def get_agent_session_stream(agent_id: str, session_id: str, request: Request, after_seq: int = 0) -> StreamingResponse:
@@ -211,10 +242,11 @@ def register_session_routes(router: APIRouter, app_state: Any) -> None:
             raise HTTPException(status_code=422, detail={"code": "invalid_after_seq"})
         try:
             user_id = _user_id(request)
-            await app_state.agent_runtime.validate_session_owner(user_id, agent_id, session_id)
+            replay = await app_state.agent_runtime.validate_session_owner(user_id, agent_id, session_id)
         except (KeyError, RuntimeConflict, ValueError) as exc:
             raise HTTPException(status_code=404, detail={"code": "session_not_found", "message": str(exc)}) from exc
-        return _stream_response(request, app_state, user_id, session_id, after_seq)
+        root = Path(((replay.get("session") or {}).get("data") or {}).get("workspace_path") or app_state.workspace.workspace_path)
+        return _stream_response(request, app_state, user_id, session_id, after_seq, root=root, agent_id=agent_id)
 
     @router.post("/session/input")
     async def post_session_input(payload: GatewayInput, request: Request) -> JSONResponse:
@@ -342,6 +374,7 @@ def _safe_replay(replay: dict[str, Any]) -> dict[str, Any]:
             _redact_local_paths(public_submission(item)) for item in replay.get("submissions", [])[-240:]
         ],
         "runtime": _redact_local_paths(replay.get("runtime")) if isinstance(replay.get("runtime"), dict) else {},
+        "workbench_events": _redact_local_paths(replay.get("workbench_events", [])),
     }
 
 
@@ -363,13 +396,21 @@ def _to_control_sse(event: StreamEvent, cursor: str) -> str:
     return f"id: {cursor}\nevent: {event.event_type}\ndata: {json.dumps(event.model_dump(), ensure_ascii=False)}\n\n"
 
 
-def _stream_response(request: Request, app_state: Any, user_id: str, session_id: str, after_seq: int) -> StreamingResponse:
+def _stream_response(request: Request, app_state: Any, user_id: str, session_id: str, after_seq: int, *, root: Path | None = None, agent_id: str = "") -> StreamingResponse:
     """按明确 Session 建立 SSE；队列被总线移除时客户端自行重连回放。"""
+    def encode(event):
+        if root is not None and isinstance(event.data.get("message"), dict):
+            from codepilot.session.workbench import decorate_message
+            data = {**event.data, "message": decorate_message(event.data["message"], run_id=event.run_id,
+                    agent_id=agent_id, session_id=session_id, root=root)}
+            event = event.model_copy(update={"data": data})
+        return _to_sse(event)
+
     async def event_generator() -> AsyncIterator[str]:
         subscription = _create_subscription(app_state.event_bus, user_id=user_id, session_id=session_id)
         if app_state.settings.sse.replay_on_connect:
             for event in _event_replay(app_state.event_store, user_id, session_id, after_seq):
-                yield _to_sse(event)
+                yield encode(event)
         try:
             while True:
                 if await request.is_disconnected():
@@ -380,7 +421,7 @@ def _stream_response(request: Request, app_state: Any, user_id: str, session_id:
                         break
                     event = await asyncio.wait_for(subscription.queue.get(), timeout=app_state.settings.sse.heartbeat_seconds)
                     if event.session_id == session_id:
-                        yield _to_sse(event)
+                        yield encode(event)
                 except TimeoutError:
                     yield _to_sse_comment(f"heartbeat {utc_now_iso()}")
         finally:

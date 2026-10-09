@@ -38,6 +38,7 @@ export type MessagePart = Record<string, unknown> & { type?: string };
 export type MessageRecord = {
   info?: {
     id?: string;
+    run_id?: string;
     session_id?: string;
     role?: string;
     time?: { created?: number; completed?: number };

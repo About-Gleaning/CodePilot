@@ -25,10 +25,13 @@ def build_system_prompt(
 ) -> str:
     """按分层策略组装最终发送给模型的 system prompt。"""
     workspace_path = Path(workspace.workspace_path)
+    plan_path = workspace_path / ".codepilot" / "plans" / f"{session.session_id}.md"
     sections = [
-        _section("常驻层：Agent 角色说明", agent_profile.system_prompt),
+        _section("运行方式", "本轮为无人值守定时执行。请自主使用已授权能力完成任务，不请求人工确认或提问。缺少必要信息且无法自行解决时，明确报告未完成原因，不编造事实或宣称完成。"
+                 if session.metadata.get("allow_question_interaction") is False else None),
+        _section("常驻层：Agent 角色说明", agent_profile.system_prompt.replace("{plan_path}", str(plan_path))),
         _section("常驻层：工作区 AGENTS.md", _read_workspace_agents(workspace_path)),
-        _section("常驻层：长期记忆", _read_long_memory_for_agent(workspace, agent_state)),
+        _section("常驻层：长期记忆", _read_long_memory_for_agent(workspace, agent_state) if agent_profile.memory_enabled else None),
         _section("按需加载层：Skills 与领域知识", _build_skills_context(skill_registry)),
         _section(
             "运行时注入层：当前上下文",

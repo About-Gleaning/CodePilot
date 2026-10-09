@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { LogOut, ShieldCheck } from 'lucide-react';
+import { ShieldCheck } from 'lucide-react';
 
 import { AUTH_EXPIRED_EVENT, apiJson, apiRequest } from './api/client';
 import AgentStudio from './features/agent-studio/AgentStudio';
@@ -36,18 +36,7 @@ export default function AuthGate() {
     }
   };
 
-  return (
-    <div className="authenticated-app">
-      <div className="identity-bar">
-        <span><ShieldCheck size={15} aria-hidden="true" />{user.username}</span>
-        <span className="identity-role">{user.role === 'admin' ? '管理员' : '用户'}</span>
-        <button type="button" className="identity-logout" onClick={() => void logout()} title="退出登录" aria-label="退出登录">
-          <LogOut size={16} aria-hidden="true" />
-        </button>
-      </div>
-      <AgentStudio />
-    </div>
-  );
+  return <div className="authenticated-app"><AgentStudio user={user} onLogout={() => void logout()} /></div>;
 }
 
 function LoginView({ error, onError, onAuthenticated }: {

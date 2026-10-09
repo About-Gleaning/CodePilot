@@ -5,10 +5,11 @@ from typing import Any
 
 from dataclasses import dataclass, field
 
-from codepilot.hooks import HookContext, HookManager, HookType, RuntimeHandles
+from codepilot.hooks import HookContext, HookManager, HookResult, HookType, RuntimeHandles
 from codepilot.logging import get_logger
 from codepilot.session import AgentState, ApprovalRequest, PendingApproval, PendingQuestion, QuestionRequest, SessionState
 from codepilot.session.message import ToolPart
+from codepilot.session.interactions import SessionMessageAppender
 from codepilot.tools.base import BaseTool, ToolExecutionContext
 from codepilot.tools.registry import ToolRegistry
 from codepilot.tools.results import ToolEventPublisher, ToolResultBuilder
@@ -30,6 +31,7 @@ class ToolExecutionBatch:
     pending_approval: PendingApproval | None = None
     pending_question: PendingQuestion | None = None
     resume_batch: ToolResumeBatch | None = None
+    hook_result: HookResult | None = None
 
 
 class ToolDispatcher:
@@ -106,6 +108,14 @@ class ToolDispatcher:
     ) -> ToolExecutionBatch:
         result_parts: list[ToolPart] = []
         groups = self._group_tool_calls(tool_calls)
+        selected = getattr(agent, "hook_ids", None)
+        hooks = [hook for stage in (HookType.TOOL_BEFORE, HookType.TOOL_AFTER)
+                 for hook in self._hook_manager.get_hooks(stage)
+                 if hook.selectable and (selected is None or hook.hook_id in selected)]
+        if any(not hook.applies_to_tools or item["tool_name"] in hook.applies_to_tools
+               for hook in hooks for item in tool_calls):
+            # 工具本身只读不代表其 Hook 无副作用；命中时保留原调用顺序。
+            groups = [[item] for item in tool_calls]
         for group_index, group in enumerate(groups):
             if any(item["spec"] is None or not item["spec"].can_parallel for item in group):
                 for item_index, item in enumerate(group):
@@ -122,7 +132,7 @@ class ToolDispatcher:
                     if approval:
                         return ToolExecutionBatch(
                             tool_parts=result_parts,
-                            pending_approval=PendingApproval(request=approval, source="tool", resume_item=item),
+                            pending_approval=PendingApproval(request=approval, source="hook_tool" if approval.action.get("hook_origin") else "tool", resume_item=item),
                             resume_batch=ToolResumeBatch(
                                 items=self._remaining_items(groups, group_index, item_index),
                                 approved_call_id=item.get("tool_call_id"),
@@ -135,6 +145,12 @@ class ToolDispatcher:
                             resume_batch=ToolResumeBatch(items=self._remaining_items(groups, group_index, item_index + 1)),
                         )
                     result_parts.append(part)
+                    if runtime.tool_hook_control is not None:
+                        control = runtime.tool_hook_control
+                        runtime.tool_hook_control = None
+                        for remaining in self._remaining_items(groups, group_index, item_index + 1):
+                            result_parts.append(self._hook_blocked_part(remaining))
+                        return ToolExecutionBatch(tool_parts=result_parts, hook_result=control)
             else:
                 group_results = await asyncio.gather(
                     *[
@@ -173,13 +189,19 @@ class ToolDispatcher:
                 if len(group_parts) > 1:
                     self._mark_parallel_group(group_parts, group_index)
                 result_parts.extend(group_parts)
+                if runtime.tool_hook_control is not None:
+                    control = runtime.tool_hook_control
+                    runtime.tool_hook_control = None
+                    for remaining in unresolved_items + self._remaining_items(groups, group_index + 1, 0):
+                        result_parts.append(self._hook_blocked_part(remaining))
+                    return ToolExecutionBatch(tool_parts=result_parts, hook_result=control)
                 if pending_index is not None:
                     remaining_groups = self._remaining_items(groups, group_index + 1, 0)
                     pending_item = group[pending_index]
                     if pending_approval:
                         return ToolExecutionBatch(
                             tool_parts=result_parts,
-                            pending_approval=PendingApproval(request=pending_approval, source="tool", resume_item=pending_item),
+                            pending_approval=PendingApproval(request=pending_approval, source="hook_tool" if pending_approval.action.get("hook_origin") else "tool", resume_item=pending_item),
                             resume_batch=ToolResumeBatch(
                                 items=unresolved_items + remaining_groups,
                                 approved_call_id=pending_item.get("tool_call_id"),
@@ -280,6 +302,9 @@ class ToolDispatcher:
         )
         if hook_approval is not None:
             return self._result_builder.pending_part(tool_call_id, tool_name, tool_args), hook_approval, None
+        if runtime.tool_hook_control is not None:
+            return self._hook_blocked_part(item), None, None
+        runtime.completed_tool_hooks.pop((getattr(agent, "context_id", None) or "main", tool_call_id), None)
 
         if tool.spec.side_effect == "workspace_mutation" and runtime.run_ref is not None:
             try:
@@ -355,8 +380,7 @@ class ToolDispatcher:
             config=config,
             runtime=runtime,
         )
-        await self._hook_manager.run(HookType.TOOL_AFTER, context)
-
+        # 已发生的工具结果先发布，再进入可能等待人工的后置 Hook。
         await self._event_publisher.publish_finished(
             session=session,
             runtime=runtime,
@@ -365,6 +389,8 @@ class ToolDispatcher:
             tool_call_id=tool_call_id,
             result=result,
         )
+        hook_result = await self._hook_manager.run(HookType.TOOL_AFTER, context)
+        await self._apply_tool_hook(session, runtime, hook_result)
         return self._result_builder.completed_part(tool_call_id, tool_name, result, tool_args=tool_args)
 
     def _forbidden_tool_part(
@@ -376,6 +402,12 @@ class ToolDispatcher:
         tool_args: dict[str, Any],
     ) -> ToolPart | None:
         """在执行层重复校验权限，阻止重放或手工调用绕过 Agent 配置。"""
+        code_id = getattr(tool, "code_tool_id", None)
+        if code_id:
+            if code_id in getattr(agent, "tool_ids", []) and not agent.readonly:
+                return None
+            return self._result_builder.completed_part(tool_call_id, tool_name,
+                self._result_builder.error_result(tool_name, "ToolAgentForbidden", "当前 Agent 无权执行代码工具"), tool_args=tool_args)
         required_permission = f"mcp:{tool.mcp_server_name}" if getattr(tool, "mcp_server_name", None) else tool_name
         allowed_tools = getattr(agent, "allowed_tools", []) or []
         if required_permission in allowed_tools:
@@ -479,10 +511,36 @@ class ToolDispatcher:
             config=config,
             runtime=runtime,
         )
-        result = await self._hook_manager.run(HookType.TOOL_BEFORE, context)
-        if result.requires_human_input and result.human_request and not (skip_approval or is_manual_approval_disabled(config)):
-            return result.human_request
+        key = (getattr(agent, "context_id", None) or "main", tool_call_id)
+        result = runtime.completed_tool_hooks.get(key)
+        if result is None:
+            result = await self._hook_manager.run(HookType.TOOL_BEFORE, context)
+            runtime.completed_tool_hooks[key] = result
+            await self._append_hook_effects(session, runtime, result)
+        if result.stop_loop or result.fail_session:
+            runtime.tool_hook_control = result
+            return None
+        if result.requires_human_input and result.human_request and not skip_approval:
+            return result.human_request.model_copy(update={"action": {**result.human_request.action, "hook_origin": True}})
         return None
+
+    async def _apply_tool_hook(self, session: SessionState, runtime: RuntimeHandles, result: HookResult) -> None:
+        await self._append_hook_effects(session, runtime, result)
+        if result.stop_loop or result.fail_session or result.requires_human_input:
+            previous = runtime.tool_hook_control
+            runtime.tool_hook_control = self._hook_manager._merge_results(previous, result) if previous else result
+
+    async def _append_hook_effects(self, session: SessionState, runtime: RuntimeHandles, result: HookResult) -> None:
+        if result.messages_to_append or result.events_to_emit or result.context_patch or result.fail_session or result.stop_loop:
+            await SessionMessageAppender().apply_hook_result(session, result, runtime)
+
+    def _hook_blocked_part(self, item: dict[str, Any]) -> ToolPart:
+        name = item["tool_name"]
+        return self._result_builder.completed_part(
+            item["tool_call_id"], name,
+            self._result_builder.error_result(name, "HookBlocked", "Hook 已阻止后续工具执行"),
+            tool_args=item.get("arguments", {}),
+        )
 
     def _question_request(
         self,

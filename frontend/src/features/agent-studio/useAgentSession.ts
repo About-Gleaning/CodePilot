@@ -19,6 +19,7 @@ const SESSION_EVENTS = [
   'human_question_required', 'human_question_resolved', 'error',
   'message_submission',
   'loop_started',
+  'loop_iteration_started', 'loop_finished',
 ];
 
 const EMPTY_VIEW: SessionViewState = {
@@ -65,6 +66,7 @@ export function useAgentSession(
   const onCatalogRefreshRef = useRef(onCatalogRefresh);
   const requestPayloadsRef = useRef(new Map<string, Record<string, unknown>>());
   const runtimeVersionRef = useRef(0);
+  const schedulePollRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     onSessionCreatedRef.current = onSessionCreated;
@@ -72,6 +74,8 @@ export function useAgentSession(
   }, [onCatalogRefresh, onSessionCreated]);
 
   const closeStream = useCallback(() => {
+    schedulePollRef.current?.abort();
+    schedulePollRef.current = null;
     sourceRef.current?.close();
     sourceRef.current = null;
     if (reconnectTimerRef.current !== null) window.clearTimeout(reconnectTimerRef.current);
@@ -149,8 +153,9 @@ export function useAgentSession(
         (event.event_type === 'assistant_message_completed' || event.event_type === 'user_message_created')
         && event.data.message && typeof event.data.message === 'object'
       ) {
-        const message = event.data.message as MessageRecord;
-        const messages = upsertMessage(current.messages, message);
+        const incoming = event.data.message as MessageRecord;
+        const message = { ...incoming, info: { ...incoming.info, run_id: event.run_id || incoming.info?.run_id } };
+        const messages = upsertMessage(current.messages, message).slice(-1000);
         if (message.info?.agent_kind === 'subagent') {
           const key = String(message.info.context_id || message.info.parent_call_id || 'subagent');
           const text = { ...current.subagentLiveDeltas };
@@ -205,6 +210,14 @@ export function useAgentSession(
       setRuntime((current) => current ? {
         ...current, status: String(event.data.status || (event.event_type === 'session_failed' ? 'FAILED' : 'COMPLETED')),
         stop_reason: typeof event.data.stop_reason === 'string' ? event.data.stop_reason : null,
+        last_run: {
+          run_id: event.run_id || current.active_run?.run_id || '',
+          status: String(event.data.status || (event.event_type === 'session_failed' ? 'FAILED' : 'COMPLETED')),
+          revision_id: event.revision_id || current.active_run?.revision_id || '',
+          started_at: current.active_run?.started_at || null, ended_at: event.created_at,
+          error_code: typeof event.data.stop_reason === 'string' ? event.data.stop_reason : null,
+          error_summary: typeof event.data.message === 'string' ? event.data.message : null,
+        },
         active_run: null, pending_interaction: null,
       } : current);
       onCatalogRefreshRef.current();
@@ -275,12 +288,36 @@ export function useAgentSession(
     latestSeqRef.current = replay.latest_event_seq;
     seenEventIdsRef.current.clear();
     seenEventOrderRef.current = [];
-    setView({ ...EMPTY_VIEW, messages: replay.messages, submissions: mergeSubmissions([], replay.submissions || []) });
+    setView({ ...EMPTY_VIEW, messages: replay.messages.slice(-1000), events: replay.workbench_events || [], submissions: mergeSubmissions([], replay.submissions || []) });
     runtimeVersionRef.current += 1;
     setRuntime(replay.runtime);
     setLoading(false);
-    connect(selectedAgentId, selectedSessionId, generation);
-  }, [closeStream, connect]);
+    if (replay.runtime.source === 'schedule' && replay.runtime.schedule_run_id) {
+      const controller = new AbortController();
+      schedulePollRef.current = controller;
+      const runId = replay.runtime.schedule_run_id;
+      let cursor = '';
+      const poll = async () => {
+        if (controller.signal.aborted || generation !== generationRef.current) return;
+        let delay = 3000;
+        try {
+          const batch = await apiRequest<{ events: StreamEvent[]; cursor: string; has_more: boolean; runtime: SessionRuntime }>(
+            `/api/schedule-runs/${encodeURIComponent(runId)}/events?cursor=${encodeURIComponent(cursor)}`, { signal: controller.signal });
+          if (controller.signal.aborted || generation !== generationRef.current) return;
+          for (const event of batch.events) handleEvent(event, selectedAgentId, selectedSessionId);
+          cursor = batch.cursor;
+          setRuntime(batch.runtime);
+          setStreamOffline(false);
+          if (!batch.has_more && batch.runtime.worker_exited) return;
+          if (batch.has_more) delay = 100;
+        } catch {
+          if (!controller.signal.aborted && generation === generationRef.current) setStreamOffline(true);
+        }
+        if (!controller.signal.aborted) reconnectTimerRef.current = window.setTimeout(() => void poll(), delay);
+      };
+      void poll();
+    } else connect(selectedAgentId, selectedSessionId, generation);
+  }, [closeStream, connect, handleEvent]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -371,21 +408,29 @@ export function useAgentSession(
       } : null,
       pending_interaction: null,
     }));
+    if (runtime?.source === 'schedule' && sessionId) await loadReplay(agentId, sessionId);
     await loadSessions(agentId);
     onCatalogRefreshRef.current();
     return run;
-  }, [agentId, loadSessions, loadReplay, sessionId, runtime?.active_run?.run_id]);
+  }, [agentId, loadSessions, loadReplay, sessionId, runtime?.active_run?.run_id, runtime?.source]);
 
   const cancel = useCallback(async () => {
     if (!agentId || !sessionId || !runtime?.active_run) return;
+    const generation = generationRef.current;
     const runId = runtime.active_run.run_id;
+    if (runtime.source === 'schedule') {
+      await apiJson(`/api/schedule-runs/${encodeURIComponent(runId)}/stop`, 'POST');
+      if (generation === generationRef.current) await loadReplay(agentId, sessionId);
+      return;
+    }
     await apiJson(
       `/api/agents/${encodeURIComponent(agentId)}/sessions/${encodeURIComponent(sessionId)}/runs/${encodeURIComponent(runId)}/cancel`,
       'POST',
     );
+    if (generation !== generationRef.current) return;
     setRuntime((current) => current ? { ...current, status: 'CANCELLED', active_run: null, pending_interaction: null } : current);
     onCatalogRefreshRef.current();
-  }, [agentId, runtime?.active_run, sessionId]);
+  }, [agentId, runtime?.active_run, runtime?.source, sessionId, loadReplay]);
 
   const replyInteraction = useCallback(async (payload: Record<string, unknown>) => {
     const pending = runtime?.pending_interaction;

@@ -1,9 +1,9 @@
 写入当前 plan agent 会话的执行计划 Markdown。
 
 使用规则：
-- 只能由 `plan` agent 调用；其他 agent 调用会被拒绝。
+- 内置 plan 或显式获得 write_plan 能力的个人 Agent 可以调用。
 - `content` 是完整计划 Markdown，会覆盖当前 session 已保存的计划文件。
-- 计划写入运行目录中的当前 session 文件，不写入用户源码目录。
+- 计划写入当前任务目录下 `.codepilot/plans/` 中的当前 session 文件。
 - 该工具用于沉淀最终执行计划，不用于修改项目代码。
 
 适合场景：

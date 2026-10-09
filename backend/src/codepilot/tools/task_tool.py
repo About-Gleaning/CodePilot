@@ -49,14 +49,30 @@ class TaskTool(BaseTool):
         return f"{self.spec.description}\n\n可用 subagent：\n{available_subagents}"
 
     def _available_subagents_description(self) -> str:
+        return self._describe_profiles(list(self._agent_profiles.values()))
+
+    def get_scoped_description(self, profile: AgentProfile, user_id: str) -> str:
+        profiles = list(self._agent_profiles.values())
+        if profile.publication_id:
+            profiles = [AgentProfile.model_validate(p) for p in profile.publication_children.values()]
+        elif self._profile_provider is not None:
+            profiles = self._profile_provider.list_active_delegated_profile_snapshots(user_id)
+        if profile.delegate_agent_ids is not None:
+            selected = set(profile.delegate_agent_ids)
+            profiles = [item for item in profiles if item.agent_id in selected]
+        description = self._describe_profiles(profiles)
+        return self.spec.description.replace(_AVAILABLE_SUBAGENTS_PLACEHOLDER, description)
+
+    @staticmethod
+    def _describe_profiles(profiles: list[AgentProfile]) -> str:
         subagent_lines = [
             (
                 f"- {profile.agent_id}: {profile.name}，{profile.description or '未提供用途说明。'}"
                 if profile.agent_id
                 else f"- {profile.name}: {profile.description or '未提供用途说明。'}"
             )
-            for profile in self._agent_profiles.values()
-            if profile.kind == "subagent"
+            for profile in profiles
+            if profile.supports_delegated
         ]
         if not subagent_lines:
             return "当前没有可用 subagent。"
@@ -67,8 +83,13 @@ class TaskTool(BaseTool):
         self._profile_provider = provider
         shared = getattr(provider, "shared", None)
         if shared is not None:
+            list_profiles = getattr(
+                shared,
+                "list_active_delegated_profile_snapshots",
+                shared.list_active_subagent_profile_snapshots,
+            )
             self._agent_profiles = {
-                profile.agent_id: profile for profile in shared.list_active_subagent_profile_snapshots()
+                profile.agent_id: profile for profile in list_profiles()
             }
 
     async def execute(
@@ -81,10 +102,15 @@ class TaskTool(BaseTool):
                 raise FileToolError("task 缺少运行上下文。", error_type="ToolContextMissing")
             if context.runtime is None or context.config is None or not context.tool_call_id:
                 raise FileToolError("task 缺少调度运行时。", error_type="TaskRuntimeMissing")
-            if getattr(context.agent, "kind", "agent") != "agent" or not getattr(context.agent, "can_call_subagent", False):
-                raise FileToolError("当前 Agent 不允许分派 subagent。", error_type="TaskAgentForbidden")
+            if getattr(context.agent, "invocation_role", "root") != "root" or not getattr(
+                context.agent, "can_delegate", getattr(context.agent, "can_call_subagent", False)
+            ):
+                raise FileToolError("当前执行不允许继续委派 Agent。", error_type="TaskAgentForbidden")
 
             target_id = str(args.get("agent_id") or "").strip()
+            allowed = getattr(context.agent, "delegate_agent_ids", getattr(context.agent, "subagent_ids", None))
+            if allowed is not None and target_id not in allowed:
+                raise FileToolError("该子 Agent 不在当前委派清单中。", error_type="TaskTargetForbidden")
             if not target_id and context.run_ref is None:
                 # 仅兼容未进入资源化运行时的旧单元测试。
                 target_name = str(args.get("agent") or "").strip()
@@ -96,9 +122,12 @@ class TaskTool(BaseTool):
                 raise FileToolError("agent_id 和 task 均不能为空。", error_type="TaskInputInvalid")
 
             if target_profile is None:
-                raise FileToolError(f"subagent 不存在：{target_id}", error_type="TaskTargetNotFound")
-            if target_profile.kind != "subagent":
-                raise FileToolError(f"task 只能调用 subagent，不能调用：{target_id}", error_type="TaskTargetForbidden")
+                raise FileToolError(f"委派 Agent 不存在：{target_id}", error_type="TaskTargetNotFound")
+            caller_id = getattr(context.agent, "agent_id", "")
+            if caller_id and target_profile.agent_id == caller_id:
+                raise FileToolError("Agent 不能委派调用自身。", error_type="TaskTargetForbidden")
+            if not target_profile.supports_delegated:
+                raise FileToolError(f"目标 Agent 未启用 delegated 模式：{target_id}", error_type="TaskTargetForbidden")
 
             scoped_runtime = RuntimeHandles(
                 event_bus=_SubagentEventBus(
@@ -108,6 +137,8 @@ class TaskTool(BaseTool):
                 ),
                 run_ref=context.runtime.run_ref,
                 active_tools=context.runtime.active_tools,
+                interaction_channel=context.runtime.interaction_channel,
+                stop_event=context.runtime.stop_event or context.stop_event,
             )
             child_session = await self._agent_loop.run_subagent(
                 parent_session=context.session,
@@ -120,6 +151,8 @@ class TaskTool(BaseTool):
                 stop_event=context.stop_event or asyncio.Event(),
             )
             if child_session.status != SessionStatus.COMPLETED:
+                if child_session.stop_reason == "delegation_rejected":
+                    raise FileToolError("用户拒绝了本次委派请求。", error_type="TaskDelegationRejected")
                 raise FileToolError(
                     _subagent_failure_message(target_profile.name, child_session),
                     error_type=_subagent_failure_type(child_session.status),
@@ -139,6 +172,9 @@ class TaskTool(BaseTool):
             return build_tool_failure(self.spec.name, exc)
 
     def _resolve_target(self, context: ToolExecutionContext, agent_id: str) -> AgentProfile | None:
+        children = getattr(context.agent, "publication_children", {})
+        if children:
+            return AgentProfile.model_validate(children[agent_id]) if agent_id in children else None
         if self._profile_provider is not None and context.run_ref is not None:
             try:
                 return self._profile_provider.get_active_profile_snapshot(context.run_ref.user_id, agent_id)

@@ -1,200 +1,215 @@
-import { FormEvent, useEffect, useRef, useState } from 'react';
-import { Activity, Bot, Eye, Pin, Play, Send, Square, X } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { ArrowRight, Bot, Clock3, Play, Plus, Search, Settings2 } from 'lucide-react';
 
-import { apiRequest } from '../../api/client';
-import type { MessageRecord } from '../../types';
-import type { AgentRuntime, AgentSummary, ReplayResponse, SessionSummary } from './types';
-
-export type CardSnapshot = {
-  sessionId: string | null;
-  activeRunId?: string | null;
-  result: string;
-  lastTool: string | null;
-  updatedAt: string | null;
-};
+import type { AgentRuntime, AgentSummary, SessionSummary } from './types';
 
 type Props = {
   agents: AgentSummary[];
   runtimes: Record<string, AgentRuntime>;
-  snapshots: Record<string, CardSnapshot>;
-  pinnedAgentIds: string[];
-  sendingAgentIds: Set<string>;
+  recentSessions: Record<string, SessionSummary>;
+  mutatingAgentIds: Set<string>;
+  onCreate: () => void;
   onOpen: (agentId: string, sessionId: string | null) => void;
-  onTogglePin: (agentId: string) => void;
-  onSend: (agentId: string, content: string) => Promise<void>;
+  onConfigure: (agentId: string) => void;
   onStart: (agentId: string) => void;
-  onStop: (agent: AgentSummary) => void;
 };
 
-const LANES = [
-  { id: 'waiting', label: '等待处理', description: '需要你的审批或回答' },
-  { id: 'running', label: '执行中', description: 'Agent 正在推进任务' },
-  { id: 'idle', label: '空闲', description: '可立即接收新任务' },
-  { id: 'stopped', label: '异常 / 已停止', description: '需要启动或检查配置' },
-] as const;
+type AgentTone = 'waiting' | 'running' | 'error' | 'idle' | 'stopped' | 'delegated';
 
-export function AgentTaskBoard(props: Props) {
-  const ordered = [...props.agents].sort((left, right) => {
-    const pin = Number(props.pinnedAgentIds.includes(right.agent_id)) - Number(props.pinnedAgentIds.includes(left.agent_id));
-    return pin || left.name.localeCompare(right.name, 'zh-CN');
-  });
+export function AgentTaskBoard({
+  agents,
+  runtimes,
+  recentSessions,
+  mutatingAgentIds,
+  onCreate,
+  onOpen,
+  onConfigure,
+  onStart,
+}: Props) {
+  const [query, setQuery] = useState('');
+  const [scope, setScope] = useState<'active' | 'archived' | 'all'>('active');
+  const directAgents = useMemo(() => agents.filter(supportsDirect), [agents]);
+  const visibleAgents = useMemo(() => {
+    const normalized = query.trim().toLocaleLowerCase('zh-CN');
+    return agents
+      .filter((agent) => scope === 'all' || (scope === 'archived' ? agent.archived : !agent.archived))
+      .filter((agent) => !normalized || `${agent.name} ${agent.description || ''}`.toLocaleLowerCase('zh-CN').includes(normalized))
+      .sort((left, right) => {
+        const modePriority = Number(!supportsDirect(left)) - Number(!supportsDirect(right));
+        if (modePriority) return modePriority;
+        const priority = tonePriority(agentTone(left, runtimes[left.agent_id])) - tonePriority(agentTone(right, runtimes[right.agent_id]));
+        if (priority) return priority;
+        const leftTime = recentSessions[left.agent_id]?.updated_at || '';
+        const rightTime = recentSessions[right.agent_id]?.updated_at || '';
+        return rightTime.localeCompare(leftTime) || left.name.localeCompare(right.name, 'zh-CN');
+      });
+  }, [agents, query, recentSessions, runtimes, scope]);
+
+  const waiting = directAgents.filter((agent) => runtimes[agent.agent_id]?.waiting_human_count).length;
+  const running = directAgents.filter((agent) => runtimes[agent.agent_id]?.active_run_count).length;
+
   return (
-    <section className="task-board" aria-label="Agent 任务看板">
-      <header className="task-board-header">
+    <section className="agent-overview" aria-label="Agent 总览">
+      <header className="agent-overview-header">
         <div>
-          <span className="eyebrow">MULTI-AGENT COMMAND</span>
-          <h1>任务看板</h1>
-          <p>在卡片内独立派发任务，打开详情查看实时过程与人工交互。</p>
+          <span className="eyebrow">AGENT DIRECTORY</span>
+          <h1>Agent</h1>
+          <p><strong>{agents.length}</strong> 个 Agent · <b>{waiting}</b> 个等待处理 · <b>{running}</b> 个正在执行</p>
         </div>
-        <div className="task-board-legend" aria-label="看板说明">
-          <span><Activity size={13} />全局状态实时同步</span>
-          <span><Eye size={13} />详情保留唯一实时流</span>
-        </div>
+        <button type="button" className="studio-button primary" onClick={onCreate}><Plus size={15} />新建 Agent</button>
       </header>
-      <div className="task-board-lanes">
-        {LANES.map((lane) => {
-          const agents = ordered.filter((agent) => laneFor(props.runtimes[agent.agent_id]) === lane.id);
+
+      <div className="agent-overview-toolbar">
+        <label className="agent-overview-search">
+          <Search size={15} aria-hidden="true" />
+          <span className="sr-only">搜索 Agent</span>
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称或职责" />
+        </label>
+        <label className="agent-overview-scope">
+          <span>显示</span>
+          <select aria-label="Agent 范围" value={scope} onChange={(event) => setScope(event.target.value as typeof scope)}>
+            <option value="active">当前 Agent</option>
+            <option value="archived">已归档</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="agent-module-grid">
+        {visibleAgents.map((agent) => {
+          const direct = supportsDirect(agent);
+          const runtime = direct ? runtimes[agent.agent_id] || stoppedRuntime(agent.agent_id) : undefined;
+          const session = direct ? recentSessions[agent.agent_id] : undefined;
           return (
-            <section className={`task-lane lane-${lane.id} ${agents.length ? '' : 'is-empty'}`} key={lane.id} aria-label={lane.label}>
-              <header><div><span className="eyebrow">{String(agents.length).padStart(2, '0')}</span><h2>{lane.label}</h2></div><small>{lane.description}</small></header>
-              <div className="task-lane-cards">
-                {agents.map((agent) => <AgentWorkCard
-                  key={agent.agent_id}
-                  agent={agent}
-                  runtime={props.runtimes[agent.agent_id] || stoppedRuntime(agent.agent_id)}
-                  snapshot={props.snapshots[agent.agent_id]}
-                  pinned={props.pinnedAgentIds.includes(agent.agent_id)}
-                  sending={props.sendingAgentIds.has(agent.agent_id)}
-                  onOpen={() => props.onOpen(agent.agent_id, props.snapshots[agent.agent_id]?.sessionId || props.runtimes[agent.agent_id]?.recent_session_id || null)}
-                  onTogglePin={() => props.onTogglePin(agent.agent_id)}
-                  onSend={(content) => props.onSend(agent.agent_id, content)}
-                  onStart={() => props.onStart(agent.agent_id)}
-                  onStop={() => props.onStop(agent)}
-                />)}
-                {!agents.length ? <p className="task-lane-empty">暂无 Agent</p> : null}
-              </div>
-            </section>
+            <AgentModule
+              key={agent.agent_id}
+              agent={agent}
+              runtime={runtime}
+              session={session}
+              mutating={mutatingAgentIds.has(agent.agent_id)}
+              onOpen={() => runtime && onOpen(agent.agent_id, session?.session_id || runtime.recent_session_id)}
+              onConfigure={() => onConfigure(agent.agent_id)}
+              onStart={() => onStart(agent.agent_id)}
+            />
           );
         })}
       </div>
+      {!visibleAgents.length ? <div className="agent-overview-empty"><Bot size={24} /><strong>没有符合条件的 Agent</strong><span>调整搜索或显示范围。</span></div> : null}
     </section>
   );
 }
 
-function AgentWorkCard({ agent, runtime, snapshot, pinned, sending, onOpen, onTogglePin, onSend, onStart, onStop }: {
+function AgentModule({ agent, runtime, session, mutating, onOpen, onConfigure, onStart }: {
   agent: AgentSummary;
-  runtime: AgentRuntime;
-  snapshot?: CardSnapshot;
-  pinned: boolean;
-  sending: boolean;
+  runtime?: AgentRuntime;
+  session?: SessionSummary;
+  mutating: boolean;
   onOpen: () => void;
-  onTogglePin: () => void;
-  onSend: (content: string) => Promise<void>;
+  onConfigure: () => void;
   onStart: () => void;
-  onStop: () => void;
 }) {
-  const [content, setContent] = useState('');
-  const [error, setError] = useState('');
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    if (!content.trim()) return;
-    setError('');
-    try { await onSend(content.trim()); setContent(''); } catch (reason) { setError(reason instanceof Error ? reason.message : '发送失败'); }
-  };
-  const canSend = runtime.lifecycle_state === 'RUNNING' && !agent.archived;
+  const direct = supportsDirect(agent);
+  const tone = agentTone(agent, runtime);
+  const waiting = Boolean(runtime?.waiting_human_count);
+  const canStart = direct && !agent.archived && runtime?.lifecycle_state !== 'RUNNING' && runtime?.lifecycle_state !== 'STARTING';
+  const configReadonly = isConfigReadonly(agent);
+  const configAction = configReadonly ? '查看' : '配置';
   return (
-    <article className={`agent-work-card state-${cardTone(runtime)} ${pinned ? 'is-pinned' : ''}`}>
-      <header className="agent-work-card-header">
-        <button type="button" className="card-open-button" onClick={onOpen} aria-label="查看详情">
-          <span className={`runtime-dot state-${cardTone(runtime)}`} />
-          <span><strong>{agent.name}</strong><small>{agent.description || '未填写描述'}</small></span>
-        </button>
-        <button type="button" className={`card-pin-button ${pinned ? 'is-pinned' : ''}`} onClick={onTogglePin} aria-label={pinned ? '取消固定观察' : '固定观察'} title={pinned ? '取消固定' : '固定观察'}><Pin size={14} /></button>
-      </header>
-      <div className="card-runtime-line"><span>{runtimeLabel(runtime)}</span>{runtime.active_run_count ? <b>{runtime.active_run_count} Run</b> : null}{runtime.waiting_human_count ? <b>等待你</b> : null}</div>
-      <button type="button" className="card-snapshot" onClick={onOpen}>
-        <span><Bot size={13} />{snapshot?.lastTool ? `最后工具：${snapshot.lastTool}` : '暂无可用工具摘要'}</span>
-        <strong>{snapshot?.result || '尚无已完成结果。打开详情可查看会话与执行过程。'}</strong>
+    <article className={`agent-module tone-${tone}`}>
+      <button type="button" className="agent-module-main" onClick={direct ? onOpen : onConfigure} aria-label={direct ? `打开 ${agent.name}` : `打开 ${agent.name} 配置`}>
+        <header>
+          <span className="agent-module-index" aria-hidden="true">{agent.name.slice(0, 2).toUpperCase()}</span>
+          <span className="agent-module-identity">
+            <strong>{agent.name}</strong>
+            <small>{agent.description || '未填写 Agent 职责'}</small>
+          </span>
+          <span className={`agent-status-label tone-${tone}`}><i />{agentStatusLabel(agent, runtime)}</span>
+        </header>
+        {direct && runtime ? <div className="agent-module-task">
+          <span className="agent-module-kicker">最新任务</span>
+          {session ? (
+            <>
+              <strong>{session.title || session.preview || '未命名任务'}</strong>
+              <p>{session.preview || '该任务暂无目标摘要。'}</p>
+              <footer>
+                <span>{taskStatusLabel(session, runtime)}</span>
+                <span><Clock3 size={12} />{formatDate(session.updated_at)}</span>
+                <span>{session.source === 'schedule' ? '自动化' : '网页'}</span>
+              </footer>
+            </>
+          ) : (
+            <div className="agent-module-no-task"><strong>暂无任务</strong><span>进入 Agent 创建第一个会话。</span></div>
+          )}
+        </div> : <div className="agent-module-task agent-module-delegated">
+          <span className="agent-module-kicker">运行配置</span>
+          <strong>Agent 委派</strong>
+          <p>{agent.default_provider || '-'} / {agent.default_model || '-'}</p>
+          <footer><span>{agent.readonly ? '只读执行' : '按授权执行'}</span><span>独立上下文</span></footer>
+        </div>}
       </button>
-      <form className="card-composer" onSubmit={submit}>
-        <textarea rows={2} value={content} onChange={(event) => setContent(event.target.value)} disabled={!canSend || sending} placeholder={canSend ? `向 ${agent.name} 下达任务` : '启动 Agent 后可派发任务'} />
-        {error ? <p role="alert">{error}</p> : null}
-        <footer>
-          <button type="button" className="card-detail-link" onClick={onOpen}><Eye size={13} />详情</button>
-          {canSend ? <button type="submit" className="card-send-button" disabled={!content.trim() || sending}><Send size={13} />{sending ? '发送中' : '派发'}</button> : runtime.lifecycle_state === 'RUNNING' ? null : <button type="button" className="card-send-button" disabled={agent.archived} onClick={onStart}><Play size={13} />启动</button>}
-          {runtime.lifecycle_state === 'RUNNING' ? <button type="button" className="card-stop-button" onClick={onStop} aria-label="关闭 Agent" title="关闭 Agent"><X size={14} /></button> : null}
-        </footer>
-      </form>
+      <footer className="agent-module-actions">
+        <span>{agent.visibility === 'shared' ? '共享' : agent.source === 'builtin' ? '内置' : '个人'} · {agent.validation_status === 'valid' ? '配置可用' : '需要检查'}</span>
+        <div>
+          {direct ? <>
+            <button type="button" className="studio-icon-button" onClick={onConfigure} aria-label={`配置 ${agent.name}`} title="配置 Agent"><Settings2 size={14} /></button>
+            {canStart ? <button type="button" className="agent-module-action" disabled={mutating} onClick={onStart}><Play size={13} />{mutating ? '启动中' : '启动'}</button> : null}
+            <button type="button" className={`agent-module-action ${waiting ? 'is-attention' : ''}`} onClick={onOpen}>{waiting ? '处理' : session ? '进入' : '新任务'}<ArrowRight size={13} /></button>
+          </> : <button type="button" className="agent-module-action" onClick={onConfigure} aria-label={`${configAction} ${agent.name}`}><Settings2 size={13} />{configAction}</button>}
+        </div>
+      </footer>
     </article>
   );
 }
 
-export function useCardSnapshots(agents: AgentSummary[], runtimes: Record<string, AgentRuntime>) {
-  const [snapshots, setSnapshots] = useState<Record<string, CardSnapshot>>({});
-  const requested = useRef(new Set<string>());
-  const runtimeSignature = agents.map((agent) => {
-    const runtime = runtimes[agent.agent_id];
-    return `${agent.agent_id}:${runtime?.recent_session_id || ''}:${runtime?.active_run_count || 0}:${runtime?.waiting_human_count || 0}:${runtime?.lifecycle_state || ''}`;
-  }).join('|');
-
-  useEffect(() => {
-    agents.forEach((agent) => {
-      const sessionId = runtimes[agent.agent_id]?.recent_session_id;
-      if (!sessionId) return;
-      const key = `${agent.agent_id}:${sessionId}:${runtimes[agent.agent_id]?.active_run_count || 0}:${runtimes[agent.agent_id]?.waiting_human_count || 0}`;
-      if (requested.current.has(key)) return;
-      // 状态往返后必须重新观察 Run 身份，旧活动快照不能永久用于追加预期。
-      for (const previous of requested.current) {
-        if (previous.startsWith(`${agent.agent_id}:`)) requested.current.delete(previous);
-      }
-      requested.current.add(key);
-      void apiRequest<ReplayResponse>(`/api/agents/${encodeURIComponent(agent.agent_id)}/sessions/${encodeURIComponent(sessionId)}/replay`)
-        .then((replay) => setSnapshots((current) => ({ ...current, [agent.agent_id]: {
-          ...snapshotFromReplay(sessionId, replay.messages), activeRunId: replay.runtime?.active_run?.run_id,
-        } })))
-        .catch(() => undefined);
-    });
-  }, [agents, runtimeSignature, runtimes]);
-
-  return snapshots;
+function agentTone(agent: AgentSummary, runtime?: AgentRuntime): AgentTone {
+  if (agent.validation_status === 'invalid' || agent.validation_status === 'needs_configuration' || runtime?.lifecycle_state === 'ERROR') return 'error';
+  if (!supportsDirect(agent)) return 'delegated';
+  if (runtime?.waiting_human_count) return 'waiting';
+  if (runtime?.active_run_count || runtime?.lifecycle_state === 'STARTING') return 'running';
+  if (runtime?.lifecycle_state === 'RUNNING') return 'idle';
+  return 'stopped';
 }
 
-function snapshotFromReplay(sessionId: string, messages: MessageRecord[]): CardSnapshot {
-  let result = '';
-  let lastTool: string | null = null;
-  for (const message of messages) {
-    for (const part of message.parts || []) {
-      if (part.type === 'tool' && part.tool) lastTool = String(part.tool);
-      if (message.info?.role === 'assistant' && part.type === 'text' && part.text) result = String(part.text);
-    }
+function tonePriority(tone: AgentTone) {
+  return { waiting: 0, running: 1, error: 2, idle: 3, stopped: 4, delegated: 5 }[tone];
+}
+
+function agentStatusLabel(agent: AgentSummary, runtime?: AgentRuntime) {
+  if (agent.validation_status === 'invalid' || agent.validation_status === 'needs_configuration') return '配置异常';
+  if (!supportsDirect(agent)) return '仅委派';
+  if (runtime?.lifecycle_state === 'ERROR') return '运行异常';
+  if (runtime?.waiting_human_count) return '等待处理';
+  if (runtime?.active_run_count) return '正在执行';
+  if (runtime?.lifecycle_state === 'STARTING') return '启动中';
+  if (runtime?.lifecycle_state === 'RUNNING') return '可用';
+  if (runtime?.lifecycle_state === 'STOPPING') return '正在停止';
+  return '已停止';
+}
+
+function supportsDirect(agent: AgentSummary) {
+  return (agent.launch_modes || (agent.kind === 'subagent' ? ['delegated'] : ['direct'])).includes('direct');
+}
+
+function isConfigReadonly(agent: AgentSummary) {
+  return (agent.visibility || (agent.source === 'builtin' ? 'builtin' : 'private')) !== 'private';
+}
+
+function taskStatusLabel(session: SessionSummary, runtime: AgentRuntime) {
+  if (runtime.recent_session_id === session.session_id) {
+    if (runtime.waiting_human_count) return '任务等待处理';
+    if (runtime.active_run_count) return '任务执行中';
   }
-  return { sessionId, result: compact(result, 240), lastTool, updatedAt: null };
+  const labels: Record<string, string> = {
+    STARTING: '任务准备中', RUNNING: '任务执行中', WAITING_HUMAN: '任务等待处理',
+    COMPLETED: '任务已完成', FAILED: '任务失败', CANCELLED: '任务已停止', IDLE: '任务空闲',
+  };
+  return labels[session.status] || session.status || '状态未知';
 }
 
-function compact(value: string, limit: number) {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  return normalized.length > limit ? `${normalized.slice(0, limit)}...` : normalized;
-}
-
-function laneFor(runtime: AgentRuntime | undefined) {
-  if (!runtime || runtime.lifecycle_state === 'STOPPED' || runtime.lifecycle_state === 'ERROR' || runtime.lifecycle_state === 'STOPPING') return 'stopped';
-  if (runtime.waiting_human_count > 0) return 'waiting';
-  if (runtime.active_run_count > 0 || runtime.lifecycle_state === 'STARTING') return 'running';
-  return 'idle';
-}
-
-function cardTone(runtime: AgentRuntime) {
-  if (runtime.lifecycle_state === 'ERROR') return 'error';
-  if (runtime.waiting_human_count) return 'waiting';
-  if (runtime.active_run_count || runtime.lifecycle_state === 'STARTING') return 'running';
-  return runtime.lifecycle_state.toLowerCase();
-}
-
-function runtimeLabel(runtime: AgentRuntime) {
-  if (runtime.lifecycle_state === 'ERROR') return '运行异常';
-  if (runtime.waiting_human_count) return '等待人工处理';
-  if (runtime.active_run_count) return '正在执行';
-  return runtime.lifecycle_state === 'RUNNING' ? '空闲可用' : runtime.lifecycle_state === 'STARTING' ? '启动中' : '已停止';
+function formatDate(value: string) {
+  if (!value) return '时间未知';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
 function stoppedRuntime(agentId: string): AgentRuntime {

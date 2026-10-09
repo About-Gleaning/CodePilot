@@ -375,6 +375,68 @@ def test_subagent_approval_request_fails_without_human_waiting() -> None:
     assert [event.event_type for event in event_bus.stream_events].count("error") == 1
 
 
+def test_delegated_approval_uses_root_channel_and_rejection_only_stops_branch() -> None:
+    from codepilot.hooks.contracts import RootInteractionChannel
+    from codepilot.session.state import ApprovalResult
+    from codepilot.utils import utc_now_iso
+
+    async def scenario() -> tuple[SessionState, SessionState, RecordingEventBus]:
+        settings = build_settings()
+        root_session = build_session()
+        workspace = SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot"))
+        event_bus = RecordingEventBus()
+        loop = AgentLoop(
+            llm_client=StubLiteLLMClient(),
+            tool_registry=StubToolRegistry(),
+            tool_dispatcher=StubToolDispatcher(),
+            hook_manager=_build_hook_manager(settings),
+        )
+        approval_event = asyncio.Event()
+        approval_holder = {"result": None}
+        runtime = RuntimeHandles(
+            event_bus=event_bus,
+            interaction_channel=RootInteractionChannel(
+                root_session=root_session,
+                approval_event=approval_event,
+                approval_result_holder=approval_holder,
+                question_event=asyncio.Event(),
+                question_result_holder={"result": None},
+            ),
+        )
+        task = asyncio.create_task(loop.run_subagent(
+            parent_session=root_session,
+            workspace=workspace,
+            agent_profile=AgentProfile(name="explore", agent_id="explore-id", system_prompt="test", kind="subagent", max_iterations=3),
+            task="读取文件前先 [[approve]]",
+            parent_call_id="call_task_1",
+            runtime=runtime,
+            config=settings,
+            stop_event=asyncio.Event(),
+        ))
+        for _ in range(100):
+            if root_session.status == SessionStatus.WAITING_HUMAN:
+                break
+            await asyncio.sleep(0)
+        interaction_id = str(root_session.metadata["pending_human_interaction_id"])
+        approval_holder["result"] = ApprovalResult(
+            approval_id=interaction_id,
+            approved=False,
+            comment="拒绝本次委派",
+            created_at=utc_now_iso(),
+        )
+        approval_event.set()
+        return root_session, await task, event_bus
+
+    root, child, events = asyncio.run(scenario())
+    assert root.status == SessionStatus.RUNNING
+    assert child.status == SessionStatus.CANCELLED
+    assert child.stop_reason == "delegation_rejected"
+    pending = next(event for event in events.stream_events if event.event_type == "human_approval_required")
+    assert pending.data["invocation_role"] == "delegate"
+    assert pending.data["agent_id"] == "explore-id"
+    assert pending.data["parent_call_id"] == "call_task_1"
+
+
 def test_agent_loop_llm_state_carries_thinking_enabled_metadata() -> None:
     settings = build_settings()
     session = build_session()
@@ -420,6 +482,36 @@ def test_subagent_inherits_parent_thinking_enabled_metadata() -> None:
     )
 
     assert result.metadata["thinking_enabled"] is True
+
+
+def test_subagent_uses_own_model_and_parent_working_directory() -> None:
+    settings = build_settings()
+    parent = build_session()
+    original = settings.llm_runtime.activated_providers[parent.provider]
+    settings.llm_runtime.activated_providers["child-provider"] = original.model_copy(update={"provider": "child-provider", "models": ["child-model"]})
+    loop = AgentLoop(llm_client=StubLiteLLMClient(), tool_registry=StubToolRegistry(),
+                     tool_dispatcher=StubToolDispatcher(), hook_manager=HookManager())
+    captured = []
+
+    async def capture(ctx):
+        captured.append(ctx)
+        ctx.session.status = SessionStatus.COMPLETED
+
+    loop._run_iterations = capture
+    workspace = SimpleNamespace(workspace_path=Path(parent.workspace_path))
+    result = asyncio.run(loop.run_subagent(
+        parent_session=parent, workspace=workspace,
+        agent_profile=AgentProfile(name="specialist", agent_id="child-id", system_prompt="测试", kind="subagent",
+                                   default_provider="child-provider", default_model="child-model", memory_enabled=False),
+        task="检查资料", parent_call_id="call-child", runtime=RuntimeHandles(event_bus=EventBus()),
+        config=settings, stop_event=asyncio.Event(),
+    ))
+    assert result.provider == "child-provider"
+    assert result.model == "child-model"
+    assert result.agent_id == "child-id"
+    assert captured[0].llm_state.model == "child-model"
+    assert captured[0].workspace is workspace
+    assert captured[0].agent_state.memory_enabled is False
 
 
 def test_agent_loop_runs_session_hooks_around_loop() -> None:
@@ -1721,6 +1813,75 @@ def test_subagent_rejects_question_without_user_answer_panel() -> None:
     assert result.metadata["subagent_error"] == "subagent 不支持向用户提问，请由父 Agent 收集所需信息。"
     assert "human_question_required" not in [event.event_type for event in stream_events]
     assert any(event.event_type == "error" for event in stream_events)
+
+
+def test_delegated_question_decline_only_stops_branch() -> None:
+    from codepilot.hooks.contracts import RootInteractionChannel
+    from codepilot.session.state import QuestionResult
+    from codepilot.utils import utc_now_iso
+
+    async def scenario() -> tuple[SessionState, SessionState, list[Any]]:
+        settings = build_settings()
+        root_session = build_session()
+        root_session.metadata["allow_question_interaction"] = True
+        event_bus = EventBus()
+        stream_events: list[Any] = []
+        event_bus.subscribe_stream(stream_events.append)
+        hook_manager = HookManager()
+        tools = ToolRegistry()
+        tools.register(QuestionTool(timeout_seconds=1))
+        loop = AgentLoop(
+            llm_client=QuestionToolCallLiteLLMClient(),
+            tool_registry=tools,
+            tool_dispatcher=ToolDispatcher(tools, hook_manager),
+            hook_manager=hook_manager,
+        )
+        question_event = asyncio.Event()
+        question_holder = {"result": None}
+        runtime = RuntimeHandles(
+            event_bus=event_bus,
+            interaction_channel=RootInteractionChannel(
+                root_session=root_session,
+                approval_event=asyncio.Event(),
+                approval_result_holder={"result": None},
+                question_event=question_event,
+                question_result_holder=question_holder,
+            ),
+        )
+        task = asyncio.create_task(loop.run_subagent(
+            parent_session=root_session,
+            workspace=SimpleNamespace(workspace_id="ws_1", workspace_path=Path("/tmp/codepilot")),
+            agent_profile=AgentProfile(
+                name="explore", agent_id="explore-id", system_prompt="test", kind="subagent",
+                allowed_tools=["question"], max_iterations=3,
+            ),
+            task="需要澄清目标",
+            parent_call_id="call_task_1",
+            runtime=runtime,
+            config=settings,
+            stop_event=asyncio.Event(),
+        ))
+        for _ in range(100):
+            if root_session.status == SessionStatus.WAITING_HUMAN:
+                break
+            await asyncio.sleep(0)
+        question_id = str(root_session.metadata["pending_question_id"])
+        question_holder["result"] = QuestionResult(
+            question_id=question_id,
+            declined=True,
+            comment="不回答本次委派",
+            created_at=utc_now_iso(),
+        )
+        question_event.set()
+        return root_session, await task, stream_events
+
+    root, child, events = asyncio.run(scenario())
+    assert root.status == SessionStatus.RUNNING
+    assert child.status == SessionStatus.CANCELLED
+    assert child.stop_reason == "delegation_rejected"
+    pending = next(event for event in events if event.event_type == "human_question_required")
+    assert pending.data["invocation_role"] == "delegate"
+    assert pending.data["agent_name"] == "explore"
 
 
 def test_agent_loop_question_decline_appends_user_message_and_stops() -> None:

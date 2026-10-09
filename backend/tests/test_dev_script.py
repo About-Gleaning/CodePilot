@@ -143,3 +143,44 @@ printf '%s\\n' "${BACKEND_CMD[*]}" "${FRONTEND_CMD[*]}"
     assert "--no-sync --offline" in result.stdout
     assert "--port 5173 --strictPort" in result.stdout
     assert "COREPACK_ENABLE_NETWORK=0" in result.stdout
+
+
+def test_lan_proxy_uses_only_loopback_upstreams(tmp_path: Path) -> None:
+    result = run_functions(tmp_path, '''
+LAN_ADDRESSES=(192.168.1.8 10.0.0.8)
+mkdir() { :; }
+chmod() { :; }
+openssl() { :; }
+prepare_lan_certificate
+printf '%s\\n' "${BACKEND_CMD[*]}" "${LAN_PROXY_CMD[*]}"
+''')
+    assert result.returncode == 0
+    assert "CODEPILOT_AUTH_MODE=lan_https" in result.stdout
+    assert "https://192.168.1.8:5443,https://10.0.0.8:5443" in result.stdout
+    assert "lan-https-proxy.mjs" in result.stdout
+    assert "8000 5173" in result.stdout
+
+
+def test_lan_readiness_requires_proxy(tmp_path: Path) -> None:
+    result = run_functions(tmp_path, '''
+LAN_ENABLED=1
+read_pid() { echo 123; }
+is_pid_running() { return 0; }
+curl() { echo 200; }
+listener_belongs_to() { return 0; }
+wait_until_ready
+''')
+    assert result.returncode == 0
+
+
+def test_reload_watches_only_source_directory(tmp_path: Path) -> None:
+    root = tmp_path / "project with spaces"
+    root.mkdir()
+    result = run_functions(root, '''
+printf '%s\\n' "${BACKEND_CMD[@]}"
+''')
+    assert result.returncode == 0
+    arguments = result.stdout.splitlines()
+    assert "--reload" in arguments
+    assert arguments.count("--reload-dir") == 1
+    assert arguments[arguments.index("--reload-dir") + 1] == str(root / "backend/src")

@@ -33,7 +33,7 @@ export function MessageItem({ message, index, renderParts, renderStepFinish, for
   };
 
   return <>
-    {bodyParts.length > 0 || stepFinishParts.length === 0 ? <article className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
+    {bodyParts.length > 0 || stepFinishParts.length === 0 ? <article id={`message-${message.info?.id}`} className={`message-card ${isAssistant ? 'assistant' : 'user'} ${agentKind === 'subagent' ? 'subagent-card' : ''}`}>
       <div className="message-meta">
         <span className={`role-badge ${isAssistant ? 'assistant' : 'user'}`}>{isAssistant ? <Bot size={13} /> : <Terminal size={13} />}{agentKind === 'subagent' ? 'subagent' : role}</span>
         {agentName ? <span className="muted-inline">{agentName}</span> : null}<span className="muted-inline">#{index + 1}</span>

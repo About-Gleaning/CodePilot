@@ -72,6 +72,34 @@ def test_parse_agent_markdown_requires_task_when_agent_can_call_subagent(tmp_pat
         parse_agent_markdown(path, max_iterations=5, subagent_max_iterations=2)
 
 
+def test_parse_agent_markdown_supports_direct_and_delegated_modes(tmp_path: Path) -> None:
+    path = tmp_path / "hybrid.md"
+    path.write_text(
+        """---
+name: hybrid
+launch_modes: [direct, delegated]
+description: 双模式 Agent
+tools: [read_file, task]
+readonly: false
+can_delegate: true
+delegate_agent_ids: []
+---
+执行任务。
+""",
+        encoding="utf-8",
+    )
+
+    profile = parse_agent_markdown(path, max_iterations=5, subagent_max_iterations=2)
+
+    assert profile.launch_modes == ["direct", "delegated"]
+    assert profile.supports_direct is True
+    assert profile.supports_delegated is True
+    assert profile.can_delegate is True
+    assert profile.delegate_agent_ids == []
+    assert "kind" not in profile.model_dump()
+    assert "subagent_ids" not in profile.model_dump()
+
+
 def _write_agent(
     root: Path,
     filename: str,

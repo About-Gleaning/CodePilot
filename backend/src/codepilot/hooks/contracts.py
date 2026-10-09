@@ -7,12 +7,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from codepilot.events import StreamEvent
 from codepilot.session import AgentState, ApprovalRequest, LLMState, Message, SessionState
+
+
+@dataclass(slots=True)
+class RootInteractionChannel:
+    """根 Run 唯一的人工交互通道，委派执行只共享句柄而不改变归属。"""
+
+    root_session: SessionState
+    approval_event: Any
+    approval_result_holder: dict[str, Any]
+    question_event: Any
+    question_result_holder: dict[str, Any]
 
 
 @dataclass(slots=True)
@@ -24,6 +35,17 @@ class RuntimeHandles:
     # 仅保存安全摘要，禁止记录参数、返回正文或凭证。
     active_tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     inbox: Any | None = None
+    hook_instances: dict[tuple[str, str], Any] = field(default_factory=dict)
+    completed_tool_hooks: dict[tuple[str, str], Any] = field(default_factory=dict)
+    tool_hook_control: Any | None = None
+    skill_registry: Any | None = None
+    assembly_ready: bool = False
+    hook_connections: dict[str, Any] = field(default_factory=dict)
+    explicit_connections: bool = False
+    stop_event: Any | None = None
+    hook_approval: Any | None = None
+    interaction_channel: RootInteractionChannel | None = None
+    iteration: int = 0
 
 
 @dataclass(slots=True)
@@ -56,10 +78,12 @@ class HookError(BaseModel):
 class HookResult(BaseModel):
     """描述 Hook 对消息、事件、上下文和控制流产生的影响。"""
 
-    status: str = "ok"
-    messages_to_append: list[Message] = Field(default_factory=list)
-    events_to_emit: list[StreamEvent] = Field(default_factory=list)
-    context_patch: dict[str, Any] = Field(default_factory=dict)
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    status: Literal["ok", "error", "need_human"] = "ok"
+    messages_to_append: list[Message] = Field(default_factory=list, max_length=64)
+    events_to_emit: list[StreamEvent] = Field(default_factory=list, max_length=64)
+    context_patch: dict[str, Any] = Field(default_factory=dict, max_length=100)
     stop_loop: bool = False
     fail_session: bool = False
     requires_human_input: bool = False

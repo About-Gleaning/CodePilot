@@ -42,6 +42,7 @@ class DomainEventType(str, Enum):
     SESSION_LIFECYCLE = "session_lifecycle"
     SESSION_COMPACTED = "session_compacted"
     MESSAGE_SUBMISSION = "message_submission"
+    EXECUTION_CONFIG = "execution_config"
 
 
 class DomainEvent(BaseModel):

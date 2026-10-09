@@ -64,7 +64,10 @@ class SessionMessageAppender:
             await runtime.event_bus.publish_stream_event(event)
         session.metadata.update(result.context_patch)
         session.updated_at = utc_now_iso()
-        if result.fail_session:
+        if result.stop_loop and result.error and result.error.code == "hook_stopped" and session.status not in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
+            session.status = SessionStatus.CANCELLED
+            session.stop_reason = "hook_stopped"
+        if result.fail_session and session.status not in {SessionStatus.CANCELLED, SessionStatus.FAILED}:
             session.status = SessionStatus.FAILED
 
 
@@ -84,10 +87,13 @@ class ApprovalCoordinator:
         approval_result_holder: dict[str, ApprovalResult | None],
     ) -> ApprovalResult | None:
         """统一处理审批等待、结果广播与拒绝后的系统消息沉淀。"""
+        root_session = runtime.interaction_channel.root_session if runtime.interaction_channel else session
         approval_event.clear()
         approval_result_holder["result"] = None
         await _publish_waiting_human(
-            session=session,
+            session=root_session,
+            context_session=session,
+            agent_state=agent_state,
             runtime=runtime,
             kind="approval",
             interaction_id=approval.request.approval_id,
@@ -108,7 +114,7 @@ class ApprovalCoordinator:
 
         await runtime.event_bus.publish_domain_event(
             HumanInteractionEvent(
-                session_id=session.session_id,
+                session_id=root_session.session_id,
                 interaction_id=result.approval_id,
                 created_at=utc_now_iso(),
                 data={
@@ -125,14 +131,15 @@ class ApprovalCoordinator:
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
                 event_type="human_approval_resolved",
-                session_id=session.session_id,
+                session_id=root_session.session_id,
                 created_at=utc_now_iso(),
-                data=result.model_dump(),
+                data={**_interaction_source(agent_state), **result.model_dump()},
             )
         )
 
         if result.approved:
-            _mark_human_wait_finished(session, SessionStatus.RUNNING)
+            _mark_human_wait_finished(root_session, SessionStatus.RUNNING)
+            session.status = SessionStatus.RUNNING
             return result
 
         await self.message_appender.append(
@@ -140,13 +147,19 @@ class ApprovalCoordinator:
             self._build_human_refusal_message(session, agent_state, approval.request, result),
             runtime,
         )
-        _mark_human_wait_finished(session, SessionStatus.CANCELLED)
+        if agent_state.invocation_role == "delegate":
+            _mark_human_wait_finished(root_session, SessionStatus.RUNNING)
+            session.status = SessionStatus.CANCELLED
+            session.stop_reason = "delegation_rejected"
+            session.metadata["subagent_error"] = "用户拒绝了本次委派请求。"
+        else:
+            _mark_human_wait_finished(root_session, SessionStatus.CANCELLED)
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
                 event_type="session_status_changed",
-                session_id=session.session_id,
+                session_id=root_session.session_id,
                 created_at=utc_now_iso(),
-                data={"status": SessionStatus.CANCELLED.value},
+                data={"status": root_session.status.value},
             )
         )
         return result
@@ -191,10 +204,13 @@ class QuestionCoordinator:
         question_event: Any,
         question_result_holder: dict[str, QuestionResult | None],
     ) -> QuestionResult | None:
+        root_session = runtime.interaction_channel.root_session if runtime.interaction_channel else session
         question_event.clear()
         question_result_holder["result"] = None
         await _publish_waiting_human(
-            session=session,
+            session=root_session,
+            context_session=session,
+            agent_state=agent_state,
             runtime=runtime,
             kind="question",
             interaction_id=question.request.question_id,
@@ -211,9 +227,9 @@ class QuestionCoordinator:
         await runtime.event_bus.publish_stream_event(
             StreamEvent(
                 event_type="human_question_resolved",
-                session_id=session.session_id,
+                session_id=root_session.session_id,
                 created_at=utc_now_iso(),
-                data={**result.model_dump(), "continue_loop": not result.declined},
+                data={**_interaction_source(agent_state), **result.model_dump(), "continue_loop": not result.declined},
             )
         )
         if result.declined:
@@ -223,10 +239,17 @@ class QuestionCoordinator:
                 self._build_question_decline_message(session, agent_state, question, result),
                 runtime,
             )
-            _mark_human_wait_finished(session, SessionStatus.COMPLETED)
+            if agent_state.invocation_role == "delegate":
+                _mark_human_wait_finished(root_session, SessionStatus.RUNNING)
+                session.status = SessionStatus.CANCELLED
+                session.stop_reason = "delegation_rejected"
+                session.metadata["subagent_error"] = "用户拒绝回答本次委派提出的问题。"
+            else:
+                _mark_human_wait_finished(root_session, SessionStatus.COMPLETED)
             return result
 
-        _mark_human_wait_finished(session, SessionStatus.RUNNING)
+        _mark_human_wait_finished(root_session, SessionStatus.RUNNING)
+        session.status = SessionStatus.RUNNING
         return result
 
     def _build_question_decline_message(
@@ -259,6 +282,8 @@ class QuestionCoordinator:
 async def _publish_waiting_human(
     *,
     session: SessionState,
+    context_session: SessionState,
+    agent_state: AgentState,
     runtime: RuntimeHandles,
     kind: str,
     interaction_id: str,
@@ -276,7 +301,8 @@ async def _publish_waiting_human(
         # 回复必须绑定当前等待请求，拒绝陈旧页面或手工构造的错误交互 ID。
         session.metadata["pending_question_id"] = interaction_id
     session.metadata["pending_human_interaction_id"] = interaction_id
-    session.metadata["pending_human_request"] = request
+    source = _interaction_source(agent_state)
+    session.metadata["pending_human_request"] = {**source, **request}
     session.updated_at = utc_now_iso()
     await runtime.event_bus.publish_domain_event(
         HumanInteractionEvent(
@@ -287,9 +313,10 @@ async def _publish_waiting_human(
                 "kind": kind,
                 "status": "pending",
                 "interaction_id": interaction_id,
-                "message_id": find_tool_message_id(session, resume_item.get("tool_call_id")),
+                "message_id": find_tool_message_id(context_session, resume_item.get("tool_call_id")),
                 "call_id": resume_item.get("tool_call_id"),
                 "request": request,
+                **source,
             },
         )
     )
@@ -306,7 +333,7 @@ async def _publish_waiting_human(
             event_type=stream_event_type,
             session_id=session.session_id,
             created_at=utc_now_iso(),
-            data=request,
+            data={**source, **request},
         )
     )
 
@@ -319,3 +346,14 @@ def _mark_human_wait_finished(session: SessionState, status: SessionStatus) -> N
     session.metadata.pop("pending_human_request", None)
     session.status = status
     session.updated_at = utc_now_iso()
+
+
+def _interaction_source(agent_state: AgentState) -> dict[str, Any]:
+    return {
+        "invocation_role": agent_state.invocation_role,
+        "agent_id": agent_state.agent_id,
+        "agent_name": agent_state.name,
+        "agent_kind": agent_state.kind,
+        "context_id": agent_state.context_id,
+        "parent_call_id": agent_state.parent_call_id,
+    }

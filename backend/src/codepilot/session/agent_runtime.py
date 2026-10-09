@@ -46,11 +46,12 @@ from codepilot.utils import utc_now_iso
 class RuntimeConflict(ValueError):
     """资源归属、幂等、恢复或容量冲突。"""
 
-    def __init__(self, code: str, message: str, *, status: int = 409, retry_after: int | None = None) -> None:
+    def __init__(self, code: str, message: str, *, status: int = 409, retry_after: int | None = None, issues: list[dict[str, Any]] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
         self.retry_after = retry_after
+        self.issues = issues or []
 
 
 UserAgentKey = tuple[str, str]
@@ -287,8 +288,11 @@ class AgentRuntimeManager:
         max_started_agents: int = 5,
         max_active_runs_per_user: int = 2,
         max_started_agents_per_user: int = 3,
+        schedule_coordinator: Any = None,
     ) -> None:
         self._config = config
+        self._schedule_coordinator = schedule_coordinator
+        self._workspace = workspace
         self._event_bus = event_bus
         self._session_memory = session_memory
         self._legacy_mode = not isinstance(session_memory, UserPartitionedSessionMemory)
@@ -359,6 +363,8 @@ class AgentRuntimeManager:
                     raise RuntimeConflict("client_request_conflict", "client_request_id 已用于不同请求")
                 return self._runs[run_key].model_dump()
             session_key = (user_id, agent_id, session_id)
+            if self._schedule_coordinator is not None:
+                self._schedule_coordinator.assert_session_idle(user_id, agent_id, session_id)
             async with self._lock:
                 active_id = self._active_sessions.get(session_key)
                 run = self._runs.get((*session_key, active_id)) if active_id else None
@@ -527,6 +533,11 @@ class AgentRuntimeManager:
         profile = self._active_profile(user_id, agent_id)
         if profile.kind != "agent":
             raise RuntimeConflict("agent_not_runnable", "subagent 不能直接启动")
+        if profile.publication_id:
+            publications = self._profile_provider.publications
+            settings = publications.settings(user_id, profile.publication_id)
+            if settings["revision"] is None:
+                publications.save_settings(user_id, profile.publication_id, {"working_directory": None, "connections": {}}, None)
         async with self._lock:
             key = (user_id, agent_id)
             current = self._runtimes.get(key)
@@ -695,6 +706,8 @@ class AgentRuntimeManager:
         fingerprint: str,
     ) -> RunState:
         """执行首个幂等请求；调用方已持有 workspace 级请求预留。"""
+        if self._schedule_coordinator is not None:
+            self._schedule_coordinator.assert_session_idle(user_id, agent_id, target_session)
         profile = self._active_profile(user_id, agent_id)
         runtime_key = (user_id, agent_id)
         state = self._runtimes.get(runtime_key)
@@ -703,6 +716,11 @@ class AgentRuntimeManager:
 
         if target_session:
             replay = await self._memory_replay(user_id, target_session)
+            if self._schedule_coordinator is not None and self._schedule_coordinator.session_run(user_id, agent_id, target_session):
+                store = self._schedule_coordinator.event_store
+                if store is not None:
+                    # 人工接续切换进程后仍保持 Session SSE 序号单调，不丢掉新消息。
+                    self._event_bus.set_initial_seq(store.latest_seq(user_id, target_session), user_id)
             provider, model, thinking = self._locked_session_llm(user_id, agent_id, profile, replay, request)
             session_id_value = target_session
         else:
@@ -726,6 +744,10 @@ class AgentRuntimeManager:
         key = (*key_base, run_id)
         async with self._lock:
             # stop 与容量/Session 预留共享同一线性化点，STOPPING 后不会漏启动 Run。
+            if profile.publication_id:
+                publication = self._profile_provider.publications.get(profile.publication_id)
+                if publication["status"] != "published":
+                    raise RuntimeConflict("publication_unavailable", "公共 Agent 已撤回或下架")
             state = self._runtimes.get(runtime_key)
             if (
                 state is None
@@ -985,6 +1007,8 @@ class AgentRuntimeManager:
         )
 
     async def load_session(self, user_id: str, agent_id: str, session_id: str) -> SessionExecutionHandle:
+        if self._schedule_coordinator is not None:
+            self._schedule_coordinator.assert_session_idle(user_id, agent_id, session_id)
         _validate_resource_id(session_id, "session_id")
         profile = self._record_profile(user_id, agent_id)
         key = (user_id, agent_id, session_id)
@@ -1103,6 +1127,10 @@ class AgentRuntimeManager:
             handle = self._sessions.get(session_key)
         live_snapshot = self._backend.get_session_snapshot(handle.execution) if handle else {}
         last_run = _latest_session_run(self._runs.values(), user_id, agent_id, session_id)
+        if self._schedule_coordinator is not None and last_run is None:
+            scheduled = self._schedule_coordinator.session_run(user_id, agent_id, session_id)
+            if scheduled is not None:
+                return self._schedule_coordinator.runtime_snapshot(scheduled)
         pending_request = (
             live_snapshot.get("pending_human_request")
             if pending
@@ -1155,6 +1183,43 @@ class AgentRuntimeManager:
             if item.get("agent_id") == agent_id
             or (not item.get("agent_id") and item.get("agent_name") == profile.name)
         ]
+
+    def list_recent_sessions(self, user_id: str) -> list[dict[str, Any]]:
+        """一次聚合每个 Agent 的最新 Session，避免首页逐 Agent 回放完整消息。"""
+        public_fields = {
+            "session_id", "title", "created_at", "updated_at", "status", "stop_reason",
+            "agent_name", "provider", "model", "message_count", "preview", "source",
+            "schedule_task_id", "schedule_run_id", "schedule_task_name",
+        }
+        profiles = [profile for profile in self._list_profiles(user_id) if profile.supports_direct]
+        active_agent_ids = {profile.agent_id for profile in profiles}
+        ids_by_name: dict[str, list[str]] = {}
+        for profile in profiles:
+            ids_by_name.setdefault(profile.name, []).append(profile.agent_id)
+
+        recent: dict[str, dict[str, Any]] = {}
+        for item in self._memory_list_sessions(user_id):
+            agent_id = str(item.get("agent_id") or "")
+            if not agent_id:
+                candidates = ids_by_name.get(str(item.get("agent_name") or ""), [])
+                if len(candidates) == 1:
+                    agent_id = candidates[0]
+            if agent_id not in active_agent_ids:
+                continue
+            current = recent.get(agent_id)
+            item_time = str(item.get("updated_at") or item.get("created_at") or "")
+            current_time = str((current or {}).get("updated_at") or (current or {}).get("created_at") or "")
+            if current is not None and current_time >= item_time:
+                continue
+            recent[agent_id] = {
+                **{key: item.get(key) for key in public_fields if key in item},
+                "agent_id": agent_id,
+            }
+        return sorted(
+            recent.values(),
+            key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""),
+            reverse=True,
+        )
 
     def find_active_agent_id(self, user_id: str, agent_name: str) -> str:
         matches = [
@@ -1343,13 +1408,23 @@ class AgentRuntimeManager:
     def _active_profile(self, user_id: str, agent_id: str) -> AgentProfile:
         try:
             try:
-                return self._profile_provider.get_active_profile_snapshot(user_id, agent_id)
+                profile = self._profile_provider.get_active_profile_snapshot(user_id, agent_id)
             except TypeError:
-                return self._profile_provider.get_active_profile_snapshot(agent_id)  # type: ignore[call-arg]
+                profile = self._profile_provider.get_active_profile_snapshot(agent_id)  # type: ignore[call-arg]
+            if not profile.supports_direct:
+                raise RuntimeConflict(
+                    "agent_direct_launch_forbidden",
+                    "该 Agent 未启用 direct 模式，不能直接启动。",
+                    status=409,
+                )
+            if profile.working_directory:
+                from codepilot.session.working_directory import resolve_working_directory
+                resolve_working_directory(self._config, self._workspace.workspace_path, profile.working_directory)
+            return profile
         except Exception as exc:
             code = getattr(exc, "code", "agent_not_found")
             status = getattr(exc, "status", 404)
-            raise RuntimeConflict(code, str(exc), status=status) from exc
+            raise RuntimeConflict(code, str(exc) if hasattr(exc, "code") else "Agent 配置加载失败，请联系管理员", status=status, issues=getattr(exc, "issues", [])) from exc
 
     def _record(self, user_id: str, agent_id: str) -> dict[str, Any]:
         try:
@@ -1449,6 +1524,9 @@ class AgentRuntimeManager:
         request: GatewayInput,
     ) -> tuple[str, str, str | None]:
         self._assert_session_owner(replay, user_id, agent_id, profile)
+        if profile.publication_id:
+            # 公共发布的模型变化在新 Run 生效；私人 Session 继续沿用原有模型锁定规则。
+            return self._resolve_new_session_llm(profile, request)
         data = replay["session"]["data"]
         provider, model = data.get("provider"), data.get("model")
         if request.provider and request.model and (request.provider != provider or request.model != model):

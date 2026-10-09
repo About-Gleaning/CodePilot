@@ -809,7 +809,8 @@ async def test_report_updates_running_run(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_shutdown_terminates_worker_and_marks_run_cancelled(tmp_path) -> None:
+async def test_shutdown_terminates_worker_and_marks_run_cancelled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("codepilot.scheduler.runner.worker_descendants", lambda _: {})
     store = ScheduleStore(tmp_path)
     run = ScheduleRun(
         task_id="scht_1",
@@ -824,6 +825,7 @@ async def test_shutdown_terminates_worker_and_marks_run_cancelled(tmp_path) -> N
     runner = build_runner(tmp_path, store)
 
     class FakeProcess:
+        pid = 12345
         returncode = None
         terminated = False
 

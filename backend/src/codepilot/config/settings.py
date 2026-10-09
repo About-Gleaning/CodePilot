@@ -23,6 +23,7 @@ class AuthSettings(BaseModel):
     enabled: Literal[True] = True
     mode: Literal["local_dev", "lan_https"] = "local_dev"
     public_origin: str | None = None
+    public_origins: list[str] = Field(default_factory=list)
     trusted_proxy_addresses: list[str] = Field(default_factory=lambda: ["127.0.0.1", "::1"])
     idle_timeout_seconds: int = Field(default=12 * 60 * 60, ge=300)
     absolute_timeout_seconds: int = Field(default=7 * 24 * 60 * 60, ge=3600)
@@ -40,13 +41,16 @@ class AuthSettings(BaseModel):
                 raise ValueError("auth.trusted_proxy_addresses 只能包含 IP 地址") from exc
         if self.mode == "local_dev":
             return self
-        if not self.public_origin:
-            raise ValueError("auth.mode=lan_https 时必须配置 auth.public_origin")
-        parsed = urlsplit(self.public_origin)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"}:
-            raise ValueError("auth.public_origin 必须是无路径的 HTTPS Origin")
-        if parsed.username or parsed.password or parsed.query or parsed.fragment:
-            raise ValueError("auth.public_origin 不能包含认证信息、查询或 fragment")
+        origins = list(dict.fromkeys([origin for origin in [self.public_origin, *self.public_origins] if origin]))
+        if not origins:
+            raise ValueError("auth.mode=lan_https 时必须配置 auth.public_origin 或 auth.public_origins")
+        for origin in origins:
+            parsed = urlsplit(origin)
+            if parsed.scheme != "https" or not parsed.hostname or parsed.path not in {"", "/"}:
+                raise ValueError("auth.public_origins 必须是无路径的 HTTPS Origin")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ValueError("auth.public_origins 不能包含认证信息、查询或 fragment")
+        self.public_origins = origins
         return self
 
 
@@ -138,6 +142,7 @@ class LLMSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
+    allowed_working_roots: list[str] = Field(default_factory=list)
     default_agent_name: str = "build"
     max_loop_iterations: int = 50
     subagent_max_loop_iterations: int = 8
@@ -218,6 +223,7 @@ class ToolSettings(BaseModel):
 
 
 class McpServerBaseSettings(BaseModel):
+    credential_fields: list[str] = Field(default_factory=list)
     enabled: bool = True
     requires_approval: bool = True
     timeout_seconds: int = Field(default=120, gt=0)
@@ -274,12 +280,22 @@ class HookPluginPromptConfig(BaseModel):
     content: str
 
 
+class HookParameterDefinition(BaseModel):
+    type: Literal["string", "integer", "boolean"] = "string"
+    required: bool = False
+    choices: list[str] = Field(default_factory=list)
+
+
 class HookPluginDefinition(BaseModel):
+    parameters: dict[str, HookParameterDefinition] = Field(default_factory=dict)
+    credential_fields: list[str] = Field(default_factory=list)
     hook_id: str
     hook_type: str
     plugin_type: str
     order: int = 100
     enabled: bool = True
+    on_error: Literal["continue", "break_loop", "fail_session", "require_human"] = "continue"
+    timeout_seconds: float = Field(default=30, gt=0, le=300)
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -446,11 +462,13 @@ def load_settings(
         merged["storage"] = {**merged.get("storage", {}), "codepilot_home": codepilot_home}
     auth_mode = source_env.get("CODEPILOT_AUTH_MODE")
     public_origin = source_env.get("CODEPILOT_PUBLIC_ORIGIN")
-    if auth_mode or public_origin:
+    public_origins = source_env.get("CODEPILOT_PUBLIC_ORIGINS")
+    if auth_mode or public_origin or public_origins:
         merged["auth"] = {
             **merged.get("auth", {}),
             **({"mode": auth_mode} if auth_mode else {}),
             **({"public_origin": public_origin} if public_origin else {}),
+            **({"public_origins": [value for value in public_origins.split(",") if value]} if public_origins else {}),
         }
     resolved_settings = AppSettings.model_validate(merged)
     runtime = build_llm_runtime_settings(resolved_settings.llm, environ=source_env)

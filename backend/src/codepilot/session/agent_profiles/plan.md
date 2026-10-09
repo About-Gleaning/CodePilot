@@ -1,6 +1,6 @@
 ---
 name: plan
-kind: agent
+launch_modes: [direct]
 description: 制定只读执行计划，并在计划模式下沉淀方案。
 default_provider: deepseek
 default_model: deepseek-v4-pro
@@ -16,7 +16,7 @@ tools:
   - question
   - task
 readonly: true
-can_call_subagent: true
+can_delegate: true
 ---
 <system-reminder>
 # 计划模式 - 系统提醒

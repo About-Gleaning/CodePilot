@@ -1,7 +1,8 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { PendingInteraction } from './types';
+import { ApiError } from '../../api/client';
 
 const mocks = vi.hoisted(() => ({
   catalog: {
@@ -70,6 +71,7 @@ const mocks = vi.hoisted(() => ({
         error_code: null,
       },
     },
+    recentSessions: {},
     capacity: { started_agents: 2, max_started_agents: 5, active_runs: 0, max_active_runs: 5 },
     loading: false,
     offline: false,
@@ -128,6 +130,15 @@ vi.mock('./useAgentSession', () => ({
 
 import AgentStudio from './AgentStudio';
 
+beforeEach(() => {
+  window.history.replaceState(null, '', '#/agents/agent-a/new');
+});
+
+function navigateHash(hash: string) {
+  window.history.pushState(null, '', hash);
+  window.dispatchEvent(new HashChangeEvent('hashchange'));
+}
+
 afterEach(() => {
   cleanup();
   mocks.catalog.error = '';
@@ -136,14 +147,68 @@ afterEach(() => {
   mocks.session.send.mockClear();
   mocks.sessionHook.mockClear();
   mocks.catalog.refresh.mockReset().mockResolvedValue(undefined);
+  mocks.catalog.startAgent.mockReset().mockResolvedValue(undefined);
   vi.unstubAllGlobals();
 });
 
 describe('Agent Studio 底部交互区', () => {
+  it('总览不选择 Agent，也不启动会话级数据生命周期', async () => {
+    window.history.replaceState(null, '', '#/agents');
+    render(<AgentStudio />);
+
+    expect(await screen.findByRole('region', { name: 'Agent 总览' })).toBeInTheDocument();
+    expect(mocks.sessionHook.mock.calls[mocks.sessionHook.mock.calls.length - 1]?.[0]).toBeNull();
+    expect(document.querySelector('.studio-agent-workspace')).not.toBeInTheDocument();
+  });
+
+  it('无效 Agent 和 Session 地址展示错误，不静默切换', async () => {
+    window.history.replaceState(null, '', '#/agents/agent-missing');
+    const view = render(<AgentStudio />);
+    expect(await screen.findByRole('heading', { name: '无法打开这个工作区' })).toBeInTheDocument();
+    expect(view.container.querySelector('.studio-agent-workspace')).not.toBeInTheDocument();
+
+    navigateHash('#/agents/agent-a/sessions/session-missing');
+    expect(await screen.findByText('该 Session 不存在，或不属于当前 Agent。')).toBeInTheDocument();
+  });
+
+  it('Agent 使用独立交互页并可返回模块总览', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ providers: [], skills: [] }), { status: 200 })));
+    const view = render(<AgentStudio />);
+
+    expect(view.container.querySelector('.studio-agent-workspace')).toBeInTheDocument();
+    expect(view.container.querySelector('.studio-detail-drawer')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '返回 Agent 总览' }));
+    expect(await screen.findByRole('region', { name: 'Agent 总览' })).toBeInTheDocument();
+  });
+
+  it('切换 Agent 后忽略迟到的启动错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ providers: [], skills: [] }), { status: 200 })));
+    let rejectStart!: (reason: Error) => void;
+    mocks.catalog.startAgent.mockImplementationOnce(() => new Promise<undefined>((_, reject) => { rejectStart = reject; }));
+    window.history.replaceState(null, '', '#/agents/agent-c/new');
+    render(<AgentStudio />);
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }));
+    navigateHash('#/agents/agent-b/new');
+    rejectStart(new ApiError('旧 Agent 的错误', 422, 'agent_invalid'));
+    await waitFor(() => expect(mocks.catalog.startAgent).toHaveBeenCalled());
+    expect(screen.queryByText(/旧 Agent 的错误/)).not.toBeInTheDocument();
+  });
+  it('启动失败显示原因和配置入口，切换 Agent 清除旧错误', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ providers: [], skills: [] }), { status: 200 })));
+    mocks.catalog.startAgent.mockRejectedValueOnce(new ApiError('Agent 配置无效', 422, 'agent_invalid', null, [{ code: 'agent_revision_mismatch', message: '配置版本校验失败', suggestion: '请修复配置文件。' }]));
+    window.history.replaceState(null, '', '#/agents/agent-c/new');
+    render(<AgentStudio />);
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }));
+    expect(await screen.findByText('配置版本校验失败')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看 Agent 配置' })).toBeInTheDocument();
+    navigateHash('#/agents/agent-b/new');
+    await waitFor(() => expect(screen.queryByText('配置版本校验失败')).not.toBeInTheDocument());
+  });
   it('新建 Agent 在主内容区打开，并从检查器移除配置页签', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      providers: [], tools: [], mcp_servers: [],
+      providers: [], tools: [], mcp_servers: [], catalog: [], connections: [], skills: [], shared: [], roots: [], directories: [], selected: '',
     }), { status: 200 })));
+    window.history.replaceState(null, '', '#/agents');
     const view = render(<AgentStudio />);
 
     fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
@@ -159,7 +224,7 @@ describe('Agent Studio 底部交互区', () => {
       const url = String(input);
       const body = url.includes('/api/agents/agent-a')
         ? mocks.catalog.agents[0]
-        : { providers: [], tools: [], mcp_servers: [] };
+        : { providers: [], tools: [], mcp_servers: [], catalog: [], connections: [], skills: [], shared: [], roots: [], directories: [], selected: '' };
       return new Response(JSON.stringify(body), { status: 200 });
     }));
     const view = render(<AgentStudio />);
@@ -173,17 +238,18 @@ describe('Agent Studio 底部交互区', () => {
 
   it('未保存配置在返回和切换 Agent 前要求确认', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
-      providers: [], tools: [], mcp_servers: [],
+      providers: [], tools: [], mcp_servers: [], catalog: [], connections: [], skills: [], shared: [], roots: [], directories: [], selected: '',
     }), { status: 200 })));
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    window.history.replaceState(null, '', '#/agents');
     render(<AgentStudio />);
 
     fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
     const name = await screen.findByPlaceholderText('agent-name');
     fireEvent.change(name, { target: { value: 'draft-agent' } });
-    fireEvent.click(screen.getByRole('button', { name: /plan/ }));
+    navigateHash('#/agents/agent-b/config');
 
-    expect(confirm).toHaveBeenCalledWith('当前配置存在未保存修改，仍要切换 Agent 吗？');
+    expect(confirm).toHaveBeenCalledWith('当前配置存在未保存修改，仍要离开配置吗？');
     expect(name).toHaveValue('draft-agent');
     fireEvent.click(screen.getByRole('button', { name: '返回会话' }));
     expect(confirm).toHaveBeenLastCalledWith('当前配置存在未保存修改，仍要返回会话吗？');
@@ -202,11 +268,12 @@ describe('Agent Studio 底部交互区', () => {
       if (init?.method === 'POST') return new Response(JSON.stringify(created), { status: 200 });
       if (init?.method === 'PUT') return new Response(JSON.stringify({ ...mocks.catalog.agents[2], revision_id: 'revision-c2' }), { status: 200 });
       if (url.includes('/api/agents/agent-c')) return new Response(JSON.stringify(mocks.catalog.agents[2]), { status: 200 });
-      return new Response(JSON.stringify({ providers: [], tools: [], mcp_servers: [] }), { status: 200 });
+      return new Response(JSON.stringify({ providers: [], tools: [], mcp_servers: [], catalog: [], connections: [], skills: [], shared: [], roots: [], directories: [], selected: '' }), { status: 200 });
     }));
     mocks.catalog.refresh.mockImplementation(async () => {
       mocks.catalog.agentsById[created.agent_id] = created;
     });
+    window.history.replaceState(null, '', '#/agents');
     render(<AgentStudio />);
 
     fireEvent.click(await screen.findByRole('button', { name: '新建 Agent' }));
@@ -216,13 +283,13 @@ describe('Agent Studio 底部交互区', () => {
     expect(screen.getAllByText('new-agent').length).toBeGreaterThan(0);
     expect(screen.queryByRole('heading', { name: '创建 Agent' })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole('button', { name: /custom/ }));
-    fireEvent.click(await screen.findByRole('button', { name: '配置 custom' }));
+    navigateHash('#/agents/agent-c/config');
     fireEvent.change(await screen.findByLabelText('描述'), { target: { value: '新的描述' } });
     fireEvent.click(screen.getByRole('button', { name: '保存 revision' }));
     expect(await screen.findByRole('heading', { name: 'custom' })).toBeInTheDocument();
     expect(screen.getByText('revision-c2')).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole('button', { name: '更多 Agent 操作' }));
     fireEvent.click(screen.getByRole('button', { name: '复制为新 Agent' }));
     expect(screen.getByPlaceholderText('agent-name')).toHaveValue('');
     fireEvent.change(screen.getByPlaceholderText('agent-name'), { target: { value: 'fork-agent' } });
@@ -233,22 +300,19 @@ describe('Agent Studio 底部交互区', () => {
   it('无错误提示时消息区与底部输入区保持稳定顺序', async () => {
     const view = render(<AgentStudio />);
 
-    expect(await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。')).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText('描述目标、限制和期望结果')).toBeInTheDocument();
     expect(view.container.querySelector('.studio-message-scroll')?.nextElementSibling).toHaveClass('studio-composer');
     expect(view.container.querySelector('.studio-chat > .chat-local-error')).not.toBeInTheDocument();
   });
 
-  it('详情顶部可切换到新会话草稿并聚焦输入框', async () => {
-    const view = render(<AgentStudio />);
-    const detailButton = screen.getAllByRole('button', { name: '查看详情' })[0];
-
-    fireEvent.click(detailButton);
-    await waitFor(() => expect(view.container.querySelector('.studio-detail-drawer')).toHaveClass('is-detail-open'));
+  it('交互页顶部可切换到新会话草稿并聚焦输入框', async () => {
+    render(<AgentStudio />);
     fireEvent.click(screen.getByRole('button', { name: '新建会话' }));
 
-    const input = screen.getByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。');
+    const input = screen.getByPlaceholderText('描述目标、限制和期望结果');
     await waitFor(() => expect(input).toHaveFocus());
     expect(screen.getByText('草稿 / 首条消息后创建 Session')).toBeInTheDocument();
+    expect(window.location.hash).toBe('#/agents/agent-a/new');
     expect(mocks.sessionHook.mock.calls[mocks.sessionHook.mock.calls.length - 1]?.[1]).toBeNull();
   });
 
@@ -256,11 +320,11 @@ describe('Agent Studio 底部交互区', () => {
     mocks.catalog.error = '测试错误';
     const view = render(<AgentStudio />);
 
-    expect(await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。')).toBeInTheDocument();
+    expect(await screen.findByPlaceholderText('描述目标、限制和期望结果')).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('测试错误');
 
-    fireEvent.click(screen.getByRole('button', { name: /plan/ }));
-    expect(screen.getByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。')).toBeInTheDocument();
+    navigateHash('#/agents/agent-b/new');
+    expect(screen.getByPlaceholderText('描述目标、限制和期望结果')).toBeInTheDocument();
     expect(view.container.querySelector('.studio-message-scroll')?.nextElementSibling).toHaveClass('studio-composer');
   });
 
@@ -274,14 +338,14 @@ describe('Agent Studio 底部交互区', () => {
     const view = render(<AgentStudio />);
 
     expect(await screen.findByText('等待人工审批')).toBeInTheDocument();
-    expect(screen.queryByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。')).not.toBeInTheDocument();
+    expect(screen.queryByPlaceholderText('描述目标、限制和期望结果')).not.toBeInTheDocument();
     expect(view.container.querySelector('.studio-message-scroll')?.nextElementSibling).toHaveClass('studio-composer');
   });
 
   it('支持 $ Skill 补全、键盘选择和 Escape 关闭', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ skills: [{ name: 'deploy', description: '发布流程' }] }), { status: 200 })));
     render(<AgentStudio />);
-    const input = await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。');
+    const input = await screen.findByPlaceholderText('描述目标、限制和期望结果');
     fireEvent.change(input, { target: { value: '$de', selectionStart: 3 } });
     expect(await screen.findByRole('option', { name: /deploy/ })).toBeInTheDocument();
     fireEvent.keyDown(input, { key: 'Enter' });
@@ -295,7 +359,7 @@ describe('Agent Studio 底部交互区', () => {
   it('支持 @ 文件补全并用鼠标替换触发词', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => new Response(JSON.stringify(String(input).includes('/workspace/files') ? { files: [{ path: 'src/main.py' }] } : { skills: [] }), { status: 200 })));
     render(<AgentStudio />);
-    const input = await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。');
+    const input = await screen.findByPlaceholderText('描述目标、限制和期望结果');
     fireEvent.change(input, { target: { value: '@src', selectionStart: 4 } });
     expect(await screen.findByRole('option', { name: /src\/main.py/ })).toBeInTheDocument();
     fireEvent.mouseDown(screen.getByRole('option', { name: /src\/main.py/ }));
@@ -307,7 +371,7 @@ describe('Agent Studio 底部交互区', () => {
       skills: [], activated_providers: [{ provider: 'deepseek', label: 'DeepSeek', models: ['deepseek-v4-pro'] }],
     }), { status: 200 })));
     render(<AgentStudio />);
-    const input = await screen.findByPlaceholderText('输入任务；Enter 发送，Shift+Enter 换行。');
+    const input = await screen.findByPlaceholderText('描述目标、限制和期望结果');
     fireEvent.click(screen.getByLabelText('覆盖 Agent 默认模型'));
     expect(await screen.findByLabelText('Provider')).toHaveValue('deepseek');
     fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'deepseek-v4-pro' } });

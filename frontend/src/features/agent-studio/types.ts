@@ -7,16 +7,30 @@ export type AgentSummary = {
   description?: string;
   source: 'builtin' | 'custom';
   visibility?: 'builtin' | 'shared' | 'private';
+  publication_id?: string | null;
   archived: boolean;
   readonly?: boolean;
-  validation_status: 'valid' | 'legacy_warning' | 'invalid';
-  validation_issues?: Array<{ code: string; field?: string | null; message: string }>;
+  kind?: 'agent' | 'subagent';
+  launch_modes?: Array<'direct' | 'delegated'>;
+  can_delegate?: boolean;
+  validation_status: 'valid' | 'legacy_warning' | 'invalid' | 'needs_configuration';
+  validation_issues?: Array<{ code: string; field?: string | null; message: string; suggestion?: string }>;
   default_provider?: string | null;
   default_model?: string | null;
   default_thinking_value?: string | null;
 };
 
 export type AgentDetail = AgentSummary & {
+  tool_ids?: string[];
+  skill_ids?: string[] | null;
+  working_directory?: string | null;
+  connection_ids?: string[] | null;
+  max_iterations?: number;
+  memory_enabled?: boolean;
+  hook_ids?: string[] | null;
+  hook_parameters?: Record<string, Record<string, string | number | boolean>>;
+  delegate_agent_ids?: string[] | null;
+  subagent_ids?: string[] | null;
   system_prompt?: string;
   tool_names?: string[];
   mcp_server_names?: string[];
@@ -52,6 +66,7 @@ export type SessionSummary = {
   created_at: string;
   updated_at: string;
   status: string;
+  stop_reason?: string | null;
   agent_name: string;
   provider: string | null;
   model: string | null;
@@ -78,6 +93,7 @@ export type ActiveRun = {
 };
 
 export type RecentRun = ActiveRun & {
+  ref?: RunRef;
   ended_at: string | null;
   error_code: string | null;
   error_summary: string | null;
@@ -91,6 +107,18 @@ export type PendingInteraction = {
 };
 
 export type SessionRuntime = {
+  source?: 'schedule' | 'web';
+  schedule_run_id?: string;
+  schedule_task_name?: string;
+  worker_exited?: boolean;
+  can_send?: boolean;
+  can_stop?: boolean;
+  phase?: string;
+  iteration?: number;
+  max_iterations?: number;
+  error_summary?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
   status: string;
   stop_reason?: string | null;
   provider: string | null;
@@ -111,6 +139,7 @@ export type ProviderConfig = {
 };
 
 export type ReplayResponse = {
+  workbench_events?: StreamEvent[];
   session: { data?: Record<string, unknown> } | null;
   messages: MessageRecord[];
   latest_event_seq: number;
@@ -139,6 +168,9 @@ export type ProviderCapability = {
 };
 
 export type AgentCapabilities = {
+  hooks?: Array<{ hook_id: string; name?: string; hook_type: string; plugin_type: string; available: boolean; parameters?: Record<string, { type: 'string' | 'integer' | 'boolean'; required: boolean; choices: string[] }> }>;
+  subagents?: Array<{ agent_id: string; name: string; description: string }>;
+  delegates?: Array<{ agent_id: string; name: string; description: string; launch_modes?: Array<'direct' | 'delegated'> }>;
   providers: ProviderCapability[];
   tools: Array<{
     name: string;

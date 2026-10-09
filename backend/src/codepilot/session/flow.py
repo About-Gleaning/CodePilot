@@ -84,6 +84,7 @@ class TurnExecutor:
     ) -> TurnResult:
         """按固定顺序执行 Hook、LLM、工具与后置 Hook，并返回下一步控制信号。"""
 
+        runtime.iteration = iteration
         loop_before_result = await self._run_loop_before_stage(
             session=session,
             workspace=workspace,
@@ -276,7 +277,7 @@ class TurnExecutor:
             agent_state=agent_state,
             agent_profile=agent_profile,
             llm_state=llm_state,
-            skill_registry=self.skill_registry,
+            skill_registry=runtime.skill_registry if runtime.skill_registry is not None else self.skill_registry,
         )
         context_messages = self._messages_for_context(session, agent_state.context_id)
         provider_messages = self.llm_client.build_provider_messages(
@@ -302,6 +303,13 @@ class TurnExecutor:
         )
         try:
             tool_schemas = self.tool_registry.get_llm_tool_schemas(agent_profile.allowed_tools, agent_profile=agent_profile)
+            # 描述按本次用户和配置生成，不能改写跨会话共享的 task 实例。
+            if runtime.run_ref is not None and any(schema["function"]["name"] == "task" for schema in tool_schemas):
+                task_tool = self.tool_registry.get("task")
+                if task_tool is not None and hasattr(task_tool, "get_scoped_description"):
+                    for schema in tool_schemas:
+                        if schema["function"]["name"] == "task":
+                            schema["function"]["description"] = task_tool.get_scoped_description(agent_profile, runtime.run_ref.user_id)
             stream_result = await self.llm_client.stream_chat(
                 session=session,
                 llm_state=llm_state,
@@ -387,6 +395,13 @@ class TurnExecutor:
             self._append_step_finish(assistant_message, reason="completed")
             await self.message_appender.append(session, assistant_message, runtime)
             await self.publish_assistant_message_completed(session, assistant_message, runtime)
+            result = await self.run_loop_after(
+                HookType.LOOP_AFTER, session=session, workspace=workspace, agent_state=agent_state,
+                llm_state=llm_state, runtime=runtime, config=config, metadata={"iteration": iteration},
+            )
+            controlled = self._turn_result_from_hook(session, result)
+            if controlled:
+                return controlled
             return TurnResult(status="completed")
 
         tool_batch = await self.tool_dispatcher.execute_tool_calls(
@@ -407,6 +422,10 @@ class TurnExecutor:
         )
         await self.message_appender.append(session, assistant_message, runtime)
         await self.publish_assistant_message_completed(session, assistant_message, runtime)
+        if getattr(tool_batch, "hook_result", None) is not None:
+            hook_turn = self._turn_result_from_hook(session, tool_batch.hook_result)
+            if hook_turn is not None:
+                return hook_turn
         if any(
             part.state.output.get("error_type") == "McpOutcomeUncertain"
             for part in tool_batch.tool_parts
@@ -454,6 +473,8 @@ class TurnExecutor:
     ) -> TurnResult | None:
         """把 Hook 的控制信号转换成单轮结果，判断顺序必须与原主流程一致。"""
 
+        if session.status == SessionStatus.FAILED:
+            return TurnResult(status="failed")
         if hook_result.requires_human_input and hook_result.human_request:
             return TurnResult(
                 status="needs_approval",

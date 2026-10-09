@@ -74,6 +74,51 @@ def build_manager(tmp_path: Path) -> tuple[AgentRuntimeManager, FakeBackend]:
 
 
 @pytest.mark.asyncio
+async def test_config_issues_survive_manager_translation(tmp_path):
+    from codepilot.session.agent_config import AgentConfigError, AgentIssue
+    manager, _ = build_manager(tmp_path)
+    def reject(*args):
+        raise AgentConfigError("Agent 配置无效", code="agent_invalid", issues=[AgentIssue("agent_revision_mismatch", "revision_id", "配置版本校验失败")])
+    manager._profile_provider.get_active_profile_snapshot = reject
+    with pytest.raises(RuntimeConflict) as caught:
+        await manager.start_agent("agent-0")
+    assert caught.value.code == "agent_invalid"
+    assert caught.value.issues[0]["code"] == "agent_revision_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_delegated_only_agent_cannot_start_directly(tmp_path: Path) -> None:
+    manager, backend = build_manager(tmp_path)
+    manager._profile_provider.profiles["agent-0"] = manager._profile_provider.profiles["agent-0"].model_copy(
+        update={"launch_modes": ["delegated"]}
+    )
+
+    with pytest.raises(RuntimeConflict) as caught:
+        await manager.start_agent("agent-0")
+
+    assert caught.value.code == "agent_direct_launch_forbidden"
+    assert backend.started == set()
+
+
+def test_start_and_run_api_preserve_config_issues():
+    class FailingManager:
+        async def start_agent(self, *args):
+            raise RuntimeConflict("agent_invalid", "Agent 配置无效", status=422, issues=[{"code": "agent_revision_mismatch", "field": "revision_id", "message": "配置版本校验失败", "suggestion": "请修复配置文件。"}])
+
+        submit_message = start_agent
+
+    app = FastAPI()
+    router = APIRouter()
+    register_session_routes(router, SimpleNamespace(agent_runtime=FailingManager()))
+    app.include_router(router)
+    with TestClient(app) as client:
+        for suffix, body in [("start", {}), ("runs", {"content": "测试", "client_request_id": "config-error-test"})]:
+            response = client.post(f"/agents/test/{suffix}", json=body)
+            assert response.status_code == 422
+            assert response.json()["detail"]["issues"][0]["code"] == "agent_revision_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_five_agents_start_independently_and_sixth_is_rejected(tmp_path: Path) -> None:
     manager, backend = build_manager(tmp_path)
     for index in range(5):
@@ -128,6 +173,75 @@ def test_resource_api_enforces_started_capacity_and_cursor_validation(tmp_path: 
         invalid_cursor = client.get("/api/agent-runtimes/stream?cursor=not-a-cursor")
         assert invalid_cursor.status_code == 422
         assert invalid_cursor.json()["detail"]["code"] == "invalid_runtime_cursor"
+
+
+def test_recent_sessions_returns_one_safe_summary_per_agent(tmp_path: Path) -> None:
+    manager, _ = build_manager(tmp_path)
+    manager._memory_list_sessions = lambda _user_id: [
+        {
+            "session_id": "session-new",
+            "agent_id": "agent-0",
+            "agent_name": "agent_0",
+            "title": "最新任务",
+            "preview": "检查发布结果",
+            "status": "RUNNING",
+            "updated_at": "2026-09-23T10:00:00Z",
+        },
+        {
+            "session_id": "session-missing-agent",
+            "agent_id": "agent-missing",
+            "agent_name": "missing",
+            "preview": "不得返回不存在 Agent 的历史",
+            "updated_at": "2026-09-24T10:00:00Z",
+        },
+        {
+            "session_id": "session-old",
+            "agent_id": "agent-0",
+            "agent_name": "agent_0",
+            "preview": "旧任务",
+            "status": "COMPLETED",
+            "updated_at": "2026-09-22T10:00:00Z",
+            "messages": [{"secret": "不能返回完整消息"}],
+        },
+        {
+            "session_id": "session-legacy",
+            "agent_id": "",
+            "agent_name": "agent_1",
+            "preview": "旧格式任务",
+            "status": "COMPLETED",
+            "updated_at": "2026-09-21T10:00:00Z",
+        },
+    ]
+
+    sessions = manager.list_recent_sessions("legacy")
+
+    assert [item["session_id"] for item in sessions] == ["session-new", "session-legacy"]
+    assert [item["agent_id"] for item in sessions] == ["agent-0", "agent-1"]
+    assert all("messages" not in item for item in sessions)
+
+
+def test_recent_sessions_api_uses_current_user_partition() -> None:
+    class RecentManager:
+        def __init__(self) -> None:
+            self.user_id = ""
+
+        def list_recent_sessions(self, user_id: str):
+            self.user_id = user_id
+            return [{"agent_id": "agent-a", "session_id": "session-a"}]
+
+    manager = RecentManager()
+    app = FastAPI()
+    router = APIRouter(prefix="/api")
+    register_session_routes(router, SimpleNamespace(agent_runtime=manager))
+    app.include_router(router)
+
+    with TestClient(app) as client:
+        response = client.get("/api/agent-sessions/recent")
+
+    assert response.status_code == 200
+    assert response.json() == {"sessions": [{"agent_id": "agent-a", "session_id": "session-a"}]}
+    assert response.headers["cache-control"] == "no-store"
+    assert manager.user_id == "legacy"
 
 
 @pytest.mark.asyncio

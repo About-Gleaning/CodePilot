@@ -22,6 +22,8 @@ class ScheduleRunStatus(str, Enum):
     TIMEOUT = "timeout"
     INTERRUPTED = "interrupted"
     CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+    STOPPING = "stopping"
 
 
 TERMINAL_RUN_STATUSES = {
@@ -30,6 +32,7 @@ TERMINAL_RUN_STATUSES = {
     ScheduleRunStatus.TIMEOUT,
     ScheduleRunStatus.INTERRUPTED,
     ScheduleRunStatus.CANCELLED,
+    ScheduleRunStatus.SKIPPED,
 }
 
 
@@ -91,6 +94,8 @@ class ScheduleTask(BaseModel):
     revision_id: str = ""
     provider: str
     model: str
+    follow_agent_model: bool = False
+    follow_agent_directory: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
     trigger: ScheduleTrigger
     working_dir: str
@@ -120,6 +125,15 @@ class ScheduleRun(BaseModel):
     working_dir: str
     error: str | None = None
     summary: str | None = None
+    report_seq: int = 0
+    phase: str = "pending"
+    iteration: int = 0
+    max_iterations: int = 0
+    provider: str | None = None
+    model: str | None = None
+    stop_reason: str | None = None
+    worker_exited: bool = True
+    external_effect_uncertain: bool = False
 
 
 def utc_now() -> datetime:
@@ -200,8 +214,8 @@ def compute_following_run_at(trigger: ScheduleTrigger, scheduled_at: str, *, now
         return None
     if trigger.kind == "interval":
         assert trigger.interval_seconds is not None
-        candidate = parse_iso_datetime(scheduled_at) + timedelta(seconds=trigger.interval_seconds)
-        while candidate <= current:
-            candidate += timedelta(seconds=trigger.interval_seconds)
+        previous = parse_iso_datetime(scheduled_at)
+        steps = max(1, int((current - previous).total_seconds() // trigger.interval_seconds) + 1)
+        candidate = previous + timedelta(seconds=steps * trigger.interval_seconds)
         return to_iso(candidate)
     return compute_next_run_at(trigger, now=current)

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import httpx
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ def main() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="执行 CodePilot 定时任务 worker")
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--session-id", required=True)
     parser.add_argument("--task-id", required=True)
     parser.add_argument("--task-name", required=True)
     parser.add_argument("--execution-bundle-file", required=True)
@@ -47,8 +49,12 @@ def parse_args() -> argparse.Namespace:
 
 
 async def run_worker(args: argparse.Namespace) -> None:
-    session_id: str | None = None
+    session_id: str | None = args.session_id
     runtime: Any | None = None
+    progress_task: asyncio.Task | None = None
+    current_task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, current_task.cancel)
     try:
         backend_dir = _resolve_backend_dir()
         load_dotenv(dotenv_path=backend_dir / ".env", override=False)
@@ -65,6 +71,8 @@ async def run_worker(args: argparse.Namespace) -> None:
             absolute_timeout_seconds=settings.auth.absolute_timeout_seconds,
         )
         principal = auth_store.find_enabled_user(args.user_id)
+        if principal is None:
+            raise ValueError("定时任务用户已禁用或不存在")
         runtime = build_runtime_bundle(
             settings=settings,
             workspace=workspace,
@@ -73,12 +81,55 @@ async def run_worker(args: argparse.Namespace) -> None:
             principal_resolver=lambda user_id: principal if user_id == principal.user_id else auth_store.find_enabled_user(user_id),
         )
         await runtime.start()
+        from codepilot.scheduler.remote_tool import WorkerScheduleTool
+        runtime.tool_registry.register(WorkerScheduleTool(args, settings))
+        from codepilot.session.agent_config import MultiUserAgentConfigService
+        provider = MultiUserAgentConfigService(
+            workspace_path=workspace.workspace_path,
+            settings=settings, shared_root=workspace.codepilot_home / "agents" / "shared",
+            users_root=workspace.codepilot_home / "users", builtin_profiles=runtime.agent_profiles,
+            tool_registry=runtime.tool_registry, mcp_manager=runtime.mcp_manager,
+        )
+        runtime.tool_registry.get("task").set_profile_provider(provider)
         _prepare_worker_runtime(runtime)
         prompt, profile = _read_execution_bundle(Path(args.execution_bundle_file))
+        stored = provider.get_profile_revision_snapshot(args.user_id, profile.agent_id, profile.revision_id, resolve_resources=False)
+        excluded = {"resolved_connection_versions", "resolved_hook_versions", "resolved_platform_hook_versions", "resolved_tool_versions"}
+        def comparable(value):
+            result = value.model_dump(exclude=excluded)
+            if value.publication_id:
+                # 公共配置由发布记录校验，用户连接仍在下方逐项验证归属和有效性。
+                result.pop("connection_ids", None)
+                result.pop("working_directory", None)
+                result["publication_children"] = {key: comparable(AgentProfile.model_validate(child)) for key, child in value.publication_children.items()}
+            return result
+        if comparable(stored) != comparable(profile):
+            raise ValueError("执行包与 Agent revision 不一致")
+        profile = provider.resolve_execution_profile(args.user_id, profile)
         profile = _prepare_worker_profile(profile)
         if profile.kind != "agent" or profile.agent_id != args.agent_id or profile.revision_id != args.revision_id:
             raise ValueError("定时任务 Agent 不存在或已归档")
-        session_id = f"sess_{uuid4().hex}"
+        progress = {"phase": "starting", "iteration": 0}
+
+        async def observe(event):
+            if event.run_id != args.run_id or event.data.get("agent_kind") == "subagent":
+                return
+            if event.event_type == "loop_iteration_started":
+                progress["iteration"] = int(event.data.get("iteration") or 0)
+                progress["phase"] = "model"
+            elif event.event_type == "tool_call_started":
+                progress["phase"] = "tool"
+            elif event.event_type == "tool_call_finished":
+                progress["phase"] = "decision"
+        runtime.event_bus.subscribe_stream(observe)
+
+        async def publish_progress():
+            while True:
+                with suppress(httpx.HTTPError, OSError):
+                    await report(args, status=ScheduleRunStatus.RUNNING, session_id=session_id,
+                                 summary=None, error=None, **progress)
+                await asyncio.sleep(3)
+        progress_task = asyncio.create_task(publish_progress())
         run_ref = RunRef(
             user_id=args.user_id,
             agent_id=profile.agent_id,
@@ -123,23 +174,38 @@ async def run_worker(args: argparse.Namespace) -> None:
             summary=_summary_from_session(finished),
             error=None if status == ScheduleRunStatus.COMPLETED else (
                 "已停止：达到轮数上限" if finished and finished.stop_reason == "max_iterations"
+                else "Hook 要求人工确认，定时执行不支持人工等待。" if finished and finished.stop_reason == "hook_requires_human"
                 else f"session 状态为 {finished.status.value if finished else 'unknown'}"
             ),
+            stop_reason=finished.stop_reason if finished else None,
+            phase="finished", iteration=progress["iteration"],
         )
+    except asyncio.CancelledError:
+        # SIGTERM 先取消模型和工具并回收其子进程，再向主进程报告；不重放未知副作用。
+        if runtime is not None:
+            await runtime.agent_backend.shutdown()
+        with suppress(httpx.HTTPError, OSError):
+            await report(args, status=ScheduleRunStatus.CANCELLED, session_id=session_id,
+                         summary=None, error="本轮执行已停止，已发出的外部操作可能仍然生效。", stop_reason="user_cancelled")
     except Exception as exc:  # noqa: BLE001
         await report(
             args,
             status=ScheduleRunStatus.FAILED,
             session_id=session_id,
             summary=None,
-            error=str(exc),
+            error="定时执行失败，请检查 Agent 依赖、连接及服务运行环境。",
         )
         raise
     finally:
+        if progress_task is not None:
+            progress_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await progress_task
         if runtime is not None:
             await runtime.agent_backend.shutdown()
             await runtime.session_runner.shutdown()
             await runtime.shutdown()
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 async def report(
@@ -149,18 +215,33 @@ async def report(
     session_id: str | None,
     summary: str | None,
     error: str | None,
+    phase: str = "",
+    iteration: int = 0,
+    stop_reason: str | None = None,
 ) -> None:
     token = Path(args.report_token_file).read_text(encoding="utf-8").strip()
-    payload: dict[str, Any] = {
+    if not hasattr(args, "report_lock"):
+        args.report_lock = asyncio.Lock()
+        args.report_seq = 0
+    async with args.report_lock:
+        args.report_seq += 1
+        payload: dict[str, Any] = {
         "run_id": args.run_id,
         "status": status.value,
         "session_id": session_id,
-        "summary": summary,
+        "summary": None,
         "error": error,
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        response = await client.post(args.report_url, json=payload, headers={"x-codepilot-schedule-token": token})
-        response.raise_for_status()
+        "user_id": args.user_id, "agent_id": args.agent_id, "revision_id": args.revision_id,
+        "report_seq": args.report_seq, "phase": phase, "iteration": iteration, "stop_reason": stop_reason,
+        }
+        async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+            try:
+                response = await client.post(args.report_url, json=payload, headers={"x-codepilot-schedule-token": token})
+                response.raise_for_status()
+            except httpx.HTTPError:
+                # 终态事实已经写入会话；父进程在退出后对账，不因上报失败改写或重跑任务。
+                if status == ScheduleRunStatus.RUNNING:
+                    raise
 
 
 def _build_worker_workspace(*, execution_dir: Path, storage_workspace_dir: Path) -> WorkspaceState:
@@ -192,9 +273,13 @@ def _read_execution_bundle(bundle_file: Path) -> tuple[str, AgentProfile]:
     except OSError:
         # runner 进程退出监控时还会兜底清理；这里优先缩短敏感内容落盘时间。
         pass
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") not in {1, 2, 3, 4, 5}:
         raise ValueError("定时任务执行包版本无效")
-    return str(payload.get("prompt") or ""), AgentProfile.model_validate(payload.get("profile"))
+    profile = dict(payload.get("profile") or {})
+    # 旧执行包只丢弃已废弃的 Skill 锁定字段，不恢复旧内容。
+    profile.pop("resolved_skill_versions", None)
+    profile.pop("resource_snapshot_version", None)
+    return str(payload.get("prompt") or ""), AgentProfile.model_validate(profile)
 
 
 def _build_worker_settings(settings: Any) -> Any:
@@ -203,7 +288,7 @@ def _build_worker_settings(settings: Any) -> Any:
 
 
 def _prepare_worker_runtime(runtime: Any) -> None:
-    """定时任务不暴露 question；需要审批的工具由无人值守策略统一阻断。"""
+    """定时任务不暴露 question；普通工具审批由会话无人值守策略自动通过。"""
     for name, profile in list(runtime.agent_profiles.items()):
         if "question" not in profile.allowed_tools:
             continue

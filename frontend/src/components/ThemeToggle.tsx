@@ -13,7 +13,7 @@ export function ThemeToggle({ theme, onToggle }: { theme: Theme; onToggle: () =>
       title={`切换为${nextLabel}`}
     >
       {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
-      <span>{theme === 'dark' ? 'LIGHT' : 'DARK'}</span>
+      <span>{theme === 'dark' ? '亮色' : '暗色'}</span>
     </button>
   );
 }

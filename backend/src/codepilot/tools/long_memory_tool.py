@@ -32,9 +32,7 @@ class LongMemoryWriteTool(BaseTool):
             requires_approval=False,
             timeout_seconds=timeout_seconds,
             side_effect="runtime_mutation",
-            assignable_to_custom_agents=False,
-            allowed_agent_names=["life"],
-            assignment_reason="仅 life Agent 可使用。",
+            assignable_to_custom_agents=True,
         )
 
     async def execute(
@@ -45,6 +43,8 @@ class LongMemoryWriteTool(BaseTool):
         try:
             if context is None:
                 raise FileToolError("long_memory_write 缺少运行上下文。", error_type="ToolContextMissing")
+            if not getattr(context.agent, "memory_enabled", True):
+                raise FileToolError("当前 Agent 已关闭长期记忆。", error_type="LongMemoryDisabled")
             user_home = getattr(context.workspace, "user_home_dir", None)
             has_capability = self.spec.name in getattr(context.agent, "allowed_tools", [])
             if not has_capability and not (user_home is None and context.agent.name == "life"):

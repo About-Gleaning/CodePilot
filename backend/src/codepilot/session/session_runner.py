@@ -23,6 +23,9 @@ from codepilot.session.inbox import SessionInbox
 from codepilot.session.state import ApprovalResult, QuestionResult, RunRef, SessionState, SessionStatus
 from codepilot.session.title import SessionTitleService
 from codepilot.tools.workspace_lease import get_workspace_write_lease_manager
+from codepilot.session.working_directory import resolve_working_directory
+from dataclasses import is_dataclass, replace
+from copy import copy
 from codepilot.utils import new_message_id, new_session_id, utc_now_iso, utc_now_millis
 
 
@@ -328,6 +331,14 @@ class SessionRunner:
         self._approval_result_holder = {"result": None}
         self._question_event = asyncio.Event()
         self._question_result_holder = {"result": None}
+        from codepilot.hooks.contracts import RootInteractionChannel
+        runtime.interaction_channel = RootInteractionChannel(
+            root_session=self._session,
+            approval_event=self._approval_event,
+            approval_result_holder=self._approval_result_holder,
+            question_event=self._question_event,
+            question_result_holder=self._question_result_holder,
+        )
         self._task = asyncio.create_task(
             self._run_loop(runtime=runtime, profile=profile),
             name=f"codepilot-session-{self._session.session_id}",
@@ -347,9 +358,18 @@ class SessionRunner:
         """执行 AgentLoop，并在异常时补发失败事件。"""
         assert self._session is not None
         try:
+            # 仅替换项目工作路径；附件、会话、日志和租约仍使用平台存储目录。
+            effective = self._workspace
+            if self._session.workspace_path != str(self._workspace.workspace_path):
+                target = resolve_working_directory(self._config, self._workspace.workspace_path, self._session.workspace_path)
+                if is_dataclass(effective):
+                    effective = replace(effective, workspace_path=target)
+                else:
+                    effective = copy(effective)
+                    effective.workspace_path = target
             session = await self._agent_loop.run(
                 session=self._session,
-                workspace=self._workspace,
+                workspace=effective,
                 agent_profile=profile,
                 runtime=runtime,
                 config=self._config,
@@ -442,6 +462,8 @@ class SessionRunner:
             raise ValueError("当前没有等待人工确认的 session")
         if self._session.metadata.get("pending_human_type") != "approval":
             raise ValueError("当前 session 等待的不是人工审批")
+        if gateway_input.approval_id != self._session.metadata.get("pending_human_interaction_id"):
+            raise ValueError("approval_id 与当前等待的审批不一致")
         self._approval_result_holder["result"] = ApprovalResult(
             approval_id=gateway_input.approval_id or "",
             approved=bool(gateway_input.approved),
@@ -508,7 +530,7 @@ class SessionRunner:
             session_id=session_id or new_session_id(),
             agent_id=agent_id,
             workspace_id=self._workspace.workspace_id,
-            workspace_path=str(self._workspace.workspace_path),
+            workspace_path=str(resolve_working_directory(self._config, self._workspace.workspace_path, profile_override.working_directory)) if profile_override and profile_override.working_directory else str(self._workspace.workspace_path),
             agent_name=profile_override.name if profile_override else gateway_input.agent_name or self._default_agent_name(),
             provider=activated_provider.provider,
             model=selected_model,

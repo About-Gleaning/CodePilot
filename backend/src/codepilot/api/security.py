@@ -36,8 +36,8 @@ class LocalAccessMiddleware(BaseHTTPMiddleware):
         context = getattr(request.app.state, "context", None)
         auth_settings = getattr(getattr(context, "settings", None), "auth", None)
         mode = getattr(auth_settings, "mode", "local_dev")
-        public_origin = getattr(auth_settings, "public_origin", None)
-        if origin and not _is_allowed_origin(origin, mode=mode, public_origin=public_origin):
+        public_origins = _public_origins(auth_settings)
+        if origin and not _is_allowed_origin(origin, mode=mode, public_origins=public_origins):
             response = JSONResponse(
                 status_code=403,
                 content={"detail": {"code": "origin_not_allowed", "message": "请求 Origin 不在本机允许范围内。"}},
@@ -84,7 +84,7 @@ class AuthenticationMiddleware(BaseHTTPMiddleware):
             if not origin or not _is_allowed_origin(
                 origin,
                 mode=context.settings.auth.mode,
-                public_origin=context.settings.auth.public_origin,
+                public_origins=_public_origins(context.settings.auth),
             ):
                 return _auth_error(403, "origin_invalid", "写请求 Origin 校验失败。")
             csrf_cookie = request.cookies.get(csrf_cookie_name(context.settings.auth.mode), "")
@@ -124,10 +124,14 @@ def _must_not_cache(path: str) -> bool:
     )
 
 
-def _is_allowed_origin(value: str, *, mode: str = "local_dev", public_origin: str | None = None) -> bool:
+def _public_origins(settings: Any) -> set[str]:
+    return {origin.rstrip("/") for origin in [getattr(settings, "public_origin", None), *getattr(settings, "public_origins", [])] if origin}
+
+
+def _is_allowed_origin(value: str, *, mode: str = "local_dev", public_origins: set[str] | None = None) -> bool:
     normalized = value.rstrip("/")
     if mode == "lan_https":
-        return bool(public_origin) and normalized == public_origin.rstrip("/")
+        return normalized in (public_origins or set())
     parsed = urlsplit(value)
     return parsed.scheme == "http" and bool(parsed.hostname) and _is_loopback_hostname(parsed.hostname)
 
@@ -148,7 +152,7 @@ def _is_public_request(request: Request) -> bool:
     path = request.url.path
     if path in {"/api/health/live", "/api/health/ready", "/api/auth/login"}:
         return True
-    return request.method == "POST" and path.startswith("/api/schedule-runs/") and path.endswith("/report")
+    return request.method == "POST" and path.startswith("/api/schedule-runs/") and path.endswith(("/report", "/tool"))
 
 
 def _validate_login_request(request: Request) -> JSONResponse | None:

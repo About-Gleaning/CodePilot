@@ -22,10 +22,8 @@ class WritePlanTool(BaseTool):
             can_parallel=False,
             requires_approval=False,
             timeout_seconds=timeout_seconds,
-            side_effect="runtime_mutation",
-            assignable_to_custom_agents=False,
-            allowed_agent_names=["plan"],
-            assignment_reason="仅内置 plan Agent 可使用。",
+            side_effect="workspace_mutation",
+            assignable_to_custom_agents=True,
         )
 
     async def execute(
@@ -36,16 +34,23 @@ class WritePlanTool(BaseTool):
         try:
             if context is None:
                 raise FileToolError("write_plan 缺少运行上下文。", error_type="ToolContextMissing")
-            if context.agent.name != "plan":
-                raise FileToolError("write_plan 只能由 plan agent 调用。", error_type="PlanToolAgentForbidden")
+            # 个人副本按能力快照授权；无能力字段的旧上下文保留 plan 限制。
+            allowed = getattr(context.agent, "allowed_tools", None)
+            if (allowed is not None and "write_plan" not in allowed) or (allowed is None and context.agent.name != "plan"):
+                raise FileToolError("当前 Agent 未获得计划写入能力。", error_type="PlanToolAgentForbidden")
 
-            plans_dir = Path(context.workspace.workspace_dir).resolve() / "plans"
+            workspace_root = Path(context.workspace.workspace_path).resolve()
+            plans_dir = workspace_root / ".codepilot" / "plans"
+            if not plans_dir.resolve().is_relative_to(workspace_root):
+                raise FileToolError("计划目录越界。", error_type="PlanPathForbidden")
             plans_dir.mkdir(parents=True, exist_ok=True)
             plan_path = (plans_dir / f"{context.session.session_id}.md").resolve()
             if not plan_path.is_relative_to(plans_dir.resolve()):
                 raise FileToolError("计划文件路径越界。", error_type="PlanPathForbidden")
 
             content = str(args.get("content", ""))
+            if len(content.encode("utf-8")) > 1024 * 1024:
+                raise FileToolError("计划正文最多 1 MiB。", error_type="PlanContentTooLarge")
             plan_path.write_text(content, encoding="utf-8")
             bytes_written = len(content.encode("utf-8"))
             return build_tool_success(

@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from codepilot.api.health_routes import register_health_routes
-from codepilot.api.security import LocalAccessMiddleware
+from codepilot.api.security import LocalAccessMiddleware, _is_allowed_origin
 from codepilot.api.session_routes import InteractionReplyRequest, StartRunRequest, _safe_replay
 from codepilot.config import load_settings
 from codepilot.gateway import GatewayInput, GatewayInputType
@@ -128,6 +128,13 @@ def test_codepilot_home_environment_override(tmp_path: Path) -> None:
     )
     assert settings.storage.codepilot_home == str(tmp_path / "isolated-home")
     assert list(settings.llm_runtime.activated_providers) == ["deepseek"]
+
+
+def test_lan_https_allows_each_configured_origin_only() -> None:
+    origins = {"https://192.168.1.8:5443", "https://10.0.0.8:5443"}
+    assert _is_allowed_origin("https://192.168.1.8:5443", mode="lan_https", public_origins=origins)
+    assert _is_allowed_origin("https://10.0.0.8:5443", mode="lan_https", public_origins=origins)
+    assert not _is_allowed_origin("https://192.168.1.9:5443", mode="lan_https", public_origins=origins)
 
 
 def test_recursive_log_redaction_hides_credentials_and_home() -> None:

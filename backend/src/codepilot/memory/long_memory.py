@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import os
+import uuid
 
 
 LONG_MEMORY_RELATIVE_PATH = Path("instructions") / "memory.instruction.md"
@@ -38,7 +43,10 @@ def user_long_memory_path(user_home: Path, agent_id: str) -> Path:
     safe_id = "_global" if agent_id == "_global" else agent_id
     if not safe_id or "/" in safe_id or "\\" in safe_id or safe_id in {".", ".."}:
         raise LongMemoryError("Agent ID 格式无效。", error_type="LongMemoryPathForbidden")
-    path = (root / "memory" / f"{safe_id}.md").resolve()
+    candidate = root / "memory" / f"{safe_id}.md"
+    if candidate.is_symlink() or candidate.parent.is_symlink():
+        raise LongMemoryError("长期记忆不能使用符号链接。", error_type="LongMemoryPathForbidden")
+    path = candidate.resolve()
     if not path.is_relative_to(root):
         raise LongMemoryError("长期记忆文件路径越界。", error_type="LongMemoryPathForbidden")
     return path
@@ -74,14 +82,17 @@ def append_long_memory(codepilot_home: Path, content: str) -> tuple[Path, int]:
 
 
 def _append_memory_file(path: Path, content: str) -> tuple[Path, int]:
+    with _memory_lock(path):
+        return _append_locked(path, content)
+
+
+def _append_locked(path: Path, content: str) -> tuple[Path, int]:
     normalized = _normalize_memory_content(content)
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = f"- {normalized}\n"
     needs_header = not path.exists() or not path.read_text(encoding="utf-8").strip()
-    with path.open("a", encoding="utf-8") as file:
-        if needs_header:
-            file.write(DEFAULT_MEMORY_HEADER + "\n")
-        file.write(entry)
+    before = path.read_text(encoding="utf-8") if path.exists() else ""
+    _atomic_memory_write(path, (DEFAULT_MEMORY_HEADER + "\n" if needs_header else before) + entry)
     bytes_written = len(entry.encode("utf-8"))
     if needs_header:
         bytes_written += len((DEFAULT_MEMORY_HEADER + "\n").encode("utf-8"))
@@ -94,6 +105,11 @@ def replace_long_memory(codepilot_home: Path, old_string: str, new_string: str) 
 
 
 def _replace_memory_file(path: Path, old_string: str, new_string: str) -> tuple[Path, str, str]:
+    with _memory_lock(path):
+        return _replace_locked(path, old_string, new_string)
+
+
+def _replace_locked(path: Path, old_string: str, new_string: str) -> tuple[Path, str, str]:
     normalized_new = _normalize_memory_content(new_string)
     if old_string == normalized_new:
         raise LongMemoryError("new_string 必须与 old_string 不同。", error_type="LongMemoryContentUnchanged")
@@ -112,8 +128,51 @@ def _replace_memory_file(path: Path, old_string: str, new_string: str) -> tuple[
         )
 
     after = before.replace(old_string, normalized_new, 1)
-    path.write_text(after, encoding="utf-8")
+    _atomic_memory_write(path, after)
     return path, before, after
+
+
+@contextmanager
+def _memory_lock(path: Path):
+    # API 编辑和运行时工具共用文件锁，避免 worker 的追加被旧版本编辑覆盖。
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = path.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _atomic_memory_write(path: Path, content: str) -> None:
+    if len(content.encode("utf-8")) > 1024 * 1024:
+        raise LongMemoryError("长期记忆总量超过限制。", error_type="LongMemoryContentTooLong")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def memory_snapshot(user_home: Path, agent_id: str) -> dict[str, str]:
+    path = user_long_memory_path(user_home, agent_id)
+    raw = path.read_text(encoding="utf-8") if path.exists() else ""
+    return {"content": _split_frontmatter(raw)[1].strip(), "revision": hashlib.sha256(raw.encode("utf-8")).hexdigest()}
+
+
+def save_memory_snapshot(user_home: Path, agent_id: str, content: str, expected_revision: str) -> dict[str, str]:
+    path = user_long_memory_path(user_home, agent_id)
+    with _memory_lock(path):
+        if memory_snapshot(user_home, agent_id)["revision"] != expected_revision:
+            raise LongMemoryError("记忆已发生变化，请重新加载后编辑。", error_type="LongMemoryRevisionConflict")
+        _atomic_memory_write(path, "---\ntype: memory_instruction\nversion: 1\n---\n" + content.strip() + "\n")
+        return memory_snapshot(user_home, agent_id)
 
 
 def _read_memory_file(path: Path, agent_name: str) -> str | None:

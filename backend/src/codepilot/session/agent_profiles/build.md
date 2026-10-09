@@ -1,6 +1,6 @@
 ---
 name: build
-kind: agent
+launch_modes: [direct]
 description: 自主完成代码开发、修复和验证任务。
 default_provider: deepseek
 default_model: deepseek-v4-pro
@@ -18,7 +18,7 @@ tools:
   - task
   - schedule_manage
 readonly: false
-can_call_subagent: true
+can_delegate: true
 ---
 你是 **Coding**，一个高度自主的代码开发 Agent。
 

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { apiJson, apiRequest } from '../../api/client';
-import type { AgentRuntime, AgentSummary, RuntimeCapacity, RuntimeOverview } from './types';
+import type { AgentRuntime, AgentSummary, RuntimeCapacity, RuntimeOverview, SessionSummary } from './types';
 
 const EMPTY_CAPACITY: RuntimeCapacity = {
   started_agents: 0,
@@ -19,6 +19,7 @@ const CONTROL_EVENTS = [
 export function useAgentCatalog() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [runtimes, setRuntimes] = useState<Record<string, AgentRuntime>>({});
+  const [recentSessions, setRecentSessions] = useState<Record<string, SessionSummary>>({});
   const [capacity, setCapacity] = useState<RuntimeCapacity>(EMPTY_CAPACITY);
   const [loading, setLoading] = useState(true);
   const [offline, setOffline] = useState(false);
@@ -49,12 +50,14 @@ export function useAgentCatalog() {
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     const generation = ++generationRef.current;
-    const [catalog, overview] = await Promise.all([
+    const [catalog, overview, recent] = await Promise.all([
       apiRequest<{ agents: AgentSummary[] }>('/api/agents?status=all', { signal }),
       apiRequest<RuntimeOverview>('/api/agent-runtimes', { signal }),
+      apiRequest<{ sessions: SessionSummary[] }>('/api/agent-sessions/recent', { signal }),
     ]);
     if (signal?.aborted || generation !== generationRef.current) return;
     setAgents(catalog.agents);
+    setRecentSessions(Object.fromEntries(recent.sessions.map((item) => [item.agent_id || '', item]).filter(([agentId]) => agentId)));
     applyOverview(overview);
     setError('');
     setOffline(false);
@@ -146,6 +149,7 @@ export function useAgentCatalog() {
     agents,
     agentsById,
     runtimes,
+    recentSessions,
     capacity,
     loading,
     offline,

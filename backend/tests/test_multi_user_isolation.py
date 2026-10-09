@@ -360,8 +360,8 @@ def test_resource_run_rejects_reserved_user_metadata(reserved: str) -> None:
         StartRunRequest(content="hello", client_request_id="request", user_metadata={reserved: "forged"})
 
 
-def test_worker_report_rejects_forged_owner() -> None:
-    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+def test_worker_report_requires_complete_execution_identity() -> None:
+    with pytest.raises(ValidationError, match="Field required"):
         ScheduleRunReportRequest(
             run_id="run",
             status="completed",

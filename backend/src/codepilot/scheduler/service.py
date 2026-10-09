@@ -41,6 +41,8 @@ def validate_schedule_task_payload(
         raise ScheduleValidationError("任务名不能为空", error_type="ScheduleNameEmpty")
     if not prompt:
         raise ScheduleValidationError("prompt 不能为空", error_type="SchedulePromptEmpty")
+    if len(name) > 200 or len(prompt) > 32000:
+        raise ScheduleValidationError("任务名称或要求超过长度限制", error_type="ScheduleInputTooLong")
 
     if profile_resolver is not None and agent_id:
         try:
@@ -52,6 +54,10 @@ def validate_schedule_task_payload(
     if profile is None or getattr(profile, "kind", "agent") != "agent":
         raise ScheduleValidationError(f"agent `{agent_id or agent_name}` 不存在或不能直接选择", error_type="ScheduleAgentInvalid")
 
+    if payload.get("follow_agent_model"):
+        provider = str(getattr(profile, "default_provider", "") or "")
+        model = str(getattr(profile, "default_model", "") or "")
+
     activated_provider = settings.llm_runtime.activated_providers.get(provider)
     if activated_provider is None:
         raise ScheduleValidationError(f"provider `{provider}` 未激活或不存在", error_type="ScheduleProviderInvalid")
@@ -59,17 +65,29 @@ def validate_schedule_task_payload(
         raise ScheduleValidationError(f"model `{model}` 不属于 provider `{provider}`", error_type="ScheduleModelInvalid")
 
     working_dir_value = str(payload.get("working_dir") or "").strip()
+    if working_dir_value == ".":
+        working_dir_value = str(getattr(getattr(profile_resolver, "__self__", None), "workspace_path", None) or working_dir_value)
+    if payload.get("follow_agent_directory"):
+        default_root = getattr(getattr(profile_resolver, "__self__", None), "workspace_path", None)
+        working_dir_value = str(getattr(profile, "working_directory", None) or default_root or "")
     if not working_dir_value:
         raise ScheduleValidationError("working_dir 不能为空", error_type="ScheduleWorkingDirInvalid")
     working_dir = Path(working_dir_value).expanduser().resolve()
     if not working_dir.exists() or not working_dir.is_dir():
-        raise ScheduleValidationError(f"working_dir `{working_dir}` 不存在或不是目录", error_type="ScheduleWorkingDirInvalid")
+        raise ScheduleValidationError("工作目录不存在或不是目录，请重新选择。", error_type="ScheduleWorkingDirInvalid")
+    default_directory = getattr(getattr(profile_resolver, "__self__", None), "workspace_path", None)
+    if default_directory is not None:
+        from codepilot.session.working_directory import resolve_working_directory
+        try:
+            working_dir = resolve_working_directory(settings, default_directory, str(working_dir))
+        except ValueError as exc:
+            raise ScheduleValidationError("工作目录不在管理员允许范围内", error_type="ScheduleWorkingDirInvalid") from exc
 
     trigger_value = payload.get("trigger")
     try:
         trigger = trigger_value if isinstance(trigger_value, ScheduleTrigger) else ScheduleTrigger.model_validate(trigger_value)
     except Exception as exc:  # noqa: BLE001
-        raise ScheduleValidationError(str(exc), error_type="ScheduleTriggerInvalid") from exc
+        raise ScheduleValidationError("触发时间格式无效，请检查时间、时区和间隔。", error_type="ScheduleTriggerInvalid") from exc
 
     if str(payload.get("isolation_mode") or "subprocess") != "subprocess":
         raise ScheduleValidationError("第一版只支持 subprocess 隔离模式", error_type="ScheduleIsolationModeInvalid")
@@ -82,6 +100,8 @@ def validate_schedule_task_payload(
         "revision_id": str(getattr(profile, "revision_id", "") or ""),
         "provider": provider,
         "model": model,
+        "follow_agent_model": bool(payload.get("follow_agent_model", False)),
+        "follow_agent_directory": bool(payload.get("follow_agent_directory", False)),
         "trigger": trigger,
         "working_dir": str(working_dir),
         "enabled": bool(payload.get("enabled", True)),
