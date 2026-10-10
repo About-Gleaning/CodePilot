@@ -6,6 +6,10 @@ backend/.env
 .idea/
 .claude/
 frontend/.vite/
+/.codepilot/
+/.playwright-cli/
+/frontend/output/
+/output/
 
 # Python
 __pycache__/
